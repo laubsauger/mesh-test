@@ -1,0 +1,21 @@
+{
+  "name": "mesh-vj-layer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "prepare:bipeds": "node scripts/prepare-bipeds.mjs",
+    "optimize:bipeds": "node scripts/optimize-bipeds.mjs"
+  },
+  "dependencies": {
+    "three": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@gltf-transform/core": "^4.4.0",
+    "@gltf-transform/functions": "^4.4.0"
+  }
+}

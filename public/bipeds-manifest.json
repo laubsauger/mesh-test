@@ -1,0 +1,72 @@
+{
+  "generatedAt": "2026-06-28T16:28:29.543Z",
+  "animations": [
+    "Walking",
+    "Running"
+  ],
+  "meshes": [
+    {
+      "id": "Meshy_AI_Crimson_Crown_biped",
+      "name": "Crimson Crown",
+      "url": "models/Meshy_AI_Crimson_Crown_biped.glb",
+      "animations": [
+        "Walking",
+        "Running"
+      ]
+    },
+    {
+      "id": "Meshy_AI_Eye_of_the_Neon_Lotus_biped",
+      "name": "Eye of the Neon Lotus",
+      "url": "models/Meshy_AI_Eye_of_the_Neon_Lotus_biped.glb",
+      "animations": [
+        "Walking",
+        "Running"
+      ]
+    },
+    {
+      "id": "Meshy_AI_Glowcap_Guardian_biped",
+      "name": "Glowcap Guardian",
+      "url": "models/Meshy_AI_Glowcap_Guardian_biped.glb",
+      "animations": [
+        "Walking",
+        "Running"
+      ]
+    },
+    {
+      "id": "Meshy_AI_Infernal_Mycelium_biped",
+      "name": "Infernal Mycelium",
+      "url": "models/Meshy_AI_Infernal_Mycelium_biped.glb",
+      "animations": [
+        "Walking",
+        "Running"
+      ]
+    },
+    {
+      "id": "Meshy_AI_Luminous_Mycelium_Mon_biped",
+      "name": "Luminous Mycelium Mon",
+      "url": "models/Meshy_AI_Luminous_Mycelium_Mon_biped.glb",
+      "animations": [
+        "Walking",
+        "Running"
+      ]
+    },
+    {
+      "id": "Meshy_AI_Mushroom_Crowned_Bein_biped",
+      "name": "Mushroom Crowned Bein",
+      "url": "models/Meshy_AI_Mushroom_Crowned_Bein_biped.glb",
+      "animations": [
+        "Walking",
+        "Running"
+      ]
+    },
+    {
+      "id": "Meshy_AI_Neon_Jellybrain_biped",
+      "name": "Neon Jellybrain",
+      "url": "models/Meshy_AI_Neon_Jellybrain_biped.glb",
+      "animations": [
+        "Walking",
+        "Running"
+      ]
+    }
+  ]
+}

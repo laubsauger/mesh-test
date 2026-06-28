@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+dist/
+
+# Source archives + unzipped intermediates — large, regenerable, never deployed.
+# The shipped assets are the merged GLBs in public/models/ (committed).
+assets/bipeds/*.zip
+public/bipeds/
