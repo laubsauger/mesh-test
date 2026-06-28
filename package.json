@@ -13,9 +13,5 @@
   "dependencies": {
     "three": "latest",
     "vite": "latest"
-  },
-  "devDependencies": {
-    "@gltf-transform/core": "^4.4.0",
-    "@gltf-transform/functions": "^4.4.0"
   }
 }

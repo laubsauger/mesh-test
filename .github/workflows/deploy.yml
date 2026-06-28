@@ -24,10 +24,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # Build only needs `vite` (a prod dependency). gltf-transform/sharp are
-      # dev-only (local asset optimization) and pull native deps that aren't in
-      # the lockfile for every platform — skip them with --omit=dev.
-      - run: npm ci --omit=dev
+      - run: npm ci
       - name: Build
         run: npm run build
         env:

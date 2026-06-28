@@ -5,11 +5,24 @@
 //
 // Reads the unzipped source under public/bipeds/, writes public/models/<id>.glb
 // and rewrites public/bipeds-manifest.json. Run: npm run optimize:bipeds
-import { NodeIO } from '@gltf-transform/core';
-import { mergeDocuments, prune, dedup } from '@gltf-transform/functions';
 import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// gltf-transform is NOT a project dependency — it pulls native deps (sharp) that
+// break cross-platform CI lockfiles, and it's only needed for this one-off asset
+// step. Install it on demand:  npm i -D @gltf-transform/core @gltf-transform/functions
+let NodeIO;
+let mergeDocuments;
+let prune;
+let dedup;
+try {
+  ({ NodeIO } = await import('@gltf-transform/core'));
+  ({ mergeDocuments, prune, dedup } = await import('@gltf-transform/functions'));
+} catch {
+  console.error('Missing optimizer deps. Run:\n  npm i -D @gltf-transform/core @gltf-transform/functions');
+  process.exit(1);
+}
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const sourceDir = join(root, 'public', 'bipeds');
