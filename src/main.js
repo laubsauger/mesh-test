@@ -95,7 +95,9 @@ scene.add(fill);
 const key = new THREE.DirectionalLight(0xb9dcff, 5.8);
 key.position.set(-7, 10, 7);
 key.castShadow = true;
-key.shadow.mapSize.set(1024, 1024);
+// 2048 so the single shadow map still resolves per-character shadows once the
+// frustum is stretched to cover a large crowd (see updateArmyBounds).
+key.shadow.mapSize.set(2048, 2048);
 key.shadow.camera.near = 0.5;
 key.shadow.camera.far = 40;
 key.shadow.camera.left = -18;
@@ -106,7 +108,9 @@ key.shadow.bias = -0.00035;
 key.shadow.normalBias = 0.035;
 scene.add(key);
 
-const rim = new THREE.DirectionalLight(0xff3f81, 8.2);
+// Pink rim — kept modest so it accents character edges without flooding the
+// whole floor (a strong non-shadow fill washes out the key light's shadows).
+const rim = new THREE.DirectionalLight(0xff3f81, 3);
 rim.position.set(8, 5.5, -8);
 scene.add(rim);
 
@@ -114,7 +118,7 @@ const crossFill = new THREE.DirectionalLight(0x8fbfff, 2.4);
 crossFill.position.set(6, 4.8, 8);
 scene.add(crossFill);
 
-const heroSpot = new THREE.SpotLight(0xe8f7ff, 24, 34, Math.PI * 0.17, 0.55, 1.25);
+const heroSpot = new THREE.SpotLight(0xe8f7ff, 24, 34, Math.PI * 0.3, 0.6, 1.25);
 heroSpot.position.set(0, 9, 9);
 heroSpot.target.position.set(0, 0.8, 0);
 heroSpot.castShadow = true;
@@ -131,15 +135,17 @@ cameraFill.castShadow = false;
 scene.add(cameraFill);
 scene.add(cameraFill.target);
 
-const floorGlow = new THREE.PointLight(0x38fff0, 12, 22, 2.15);
+// Lower decay so these roaming colored accents spread across the crowd instead
+// of lighting only a tiny sliver under themselves.
+const floorGlow = new THREE.PointLight(0x38fff0, 12, 22, 1.4);
 floorGlow.position.set(-5, 0.75, 3.2);
 scene.add(floorGlow);
 
-const backGlow = new THREE.PointLight(0x7d2dff, 16, 32, 1.9);
+const backGlow = new THREE.PointLight(0x7d2dff, 16, 32, 1.3);
 backGlow.position.set(0, 2.4, -8);
 scene.add(backGlow);
 
-const sideGlow = new THREE.PointLight(0xff315e, 14, 22, 2);
+const sideGlow = new THREE.PointLight(0xff315e, 14, 22, 1.4);
 sideGlow.position.set(5.5, 2.6, 2.5);
 scene.add(sideGlow);
 
@@ -184,7 +190,7 @@ aoPass.scale.value = 0.85;
 aoPass.samples.value = 8;
 aoPass.resolutionScale = 0.5;
 
-const bloomPass = bloom(scenePassEmissive, 0.7, 0.45, 0.2);
+const bloomPass = bloom(scenePassEmissive, 0.5, 0.45, 0.2);
 const renderPipeline = new RenderPipeline(renderer);
 renderPipeline.outputNode = scenePassColor
   .mul(vec4(vec3(aoPass.getTextureNode().r), 1))
@@ -209,6 +215,11 @@ const statsState = {
 let manifest = null;
 let rebuildId = 0;
 
+// Each "lit performer" spawns a real spotlight rig — forward rendering can't
+// scale to hundreds, so hard-cap it. The army itself is lit by the scene lights
+// regardless; these rigs are extra per-character hero lighting for a few.
+const MAX_PERFORMER_RIGS = 24;
+
 const state = {
   selectedMeshIds: [],
   animationName: 'Walking',
@@ -228,7 +239,7 @@ const state = {
   floorLightBase: 9,
   backLightBase: 12,
   keyLight: 5.8,
-  rimLight: 8.2,
+  rimLight: 3,
   crossFill: 2.4,
   cameraFill: 10,
   performerKey: 3.2,
@@ -238,11 +249,12 @@ const state = {
   exposure: 1.15,
   fog: 0.034,
   ao: 0.85,
-  bloom: 0.7,
+  bloom: 0.5,
   quality: 'performance',
-  emissiveBoost: 1.3,
+  emissiveBoost: 1,
   cameraDrift: true,
   floorGrid: true,
+  glowShadows: false,
   shufflePhase() {
     for (const walker of walkers) walker.seed = Math.random();
   },
@@ -263,6 +275,13 @@ async function init() {
   await renderer.init();
   resize();
   renderer.setAnimationLoop(render);
+
+  // Camera drift writes camera.position every frame, which fights the user's
+  // OrbitControls drag. The moment they grab the camera, yield: turn drift off
+  // (the inspector toggle reflects it via .listen(), so it's re-enableable).
+  controls.addEventListener('start', () => {
+    state.cameraDrift = false;
+  });
 
   setPreloader(0.1, 'Loading manifest…');
   const response = await fetch(assetUrl('bipeds-manifest.json'));
@@ -330,7 +349,7 @@ function buildInspectorControls() {
   performanceGroup.add(state, 'disorder', 0, 1, 0.01).name('Disorder').onChange(() => arrangeWalkers());
   performanceGroup.add(state, 'wanderRadius', 0, 40, 0.1).name('Wander Radius');
   performanceGroup.add(state, 'wanderSpeed', 0, 3, 0.01).name('Wander Speed');
-  performanceGroup.add(state, 'cameraDrift').name('Camera Drift');
+  performanceGroup.add(state, 'cameraDrift').name('Camera Drift').listen();
   performanceGroup.add(state, 'floorGrid').name('Floor Grid').onChange((value) => {
     grid.visible = value;
   });
@@ -355,31 +374,32 @@ function buildInspectorControls() {
   });
   lightingGroup.add(state, 'crossFill', 0, 8, 0.1).name('Cross Fill').onChange((value) => {
     crossFill.intensity = value;
-  });
+  }).listen();
   lightingGroup.add(state, 'cameraFill', 0, 24, 0.1).name('Camera Fill').onChange((value) => {
     cameraFill.intensity = value;
-  });
+  }).listen();
   lightingGroup.add(state, 'performerKey', 0, 10, 0.1).name('Performer Key').onChange(() => {
     for (const walker of walkers) applyPerformerLighting(walker);
-  });
+  }).listen();
   lightingGroup.add(state, 'performerFill', 0, 6, 0.05).name('Performer Fill').onChange(() => {
     for (const walker of walkers) applyPerformerLighting(walker);
-  });
+  }).listen();
   lightingGroup.add(state, 'performerRim', 0, 8, 0.05).name('Performer Rim').onChange(() => {
     for (const walker of walkers) applyPerformerLighting(walker);
-  });
-  lightingGroup.add(state, 'performerLightCount', 0, 500).name('Lit Performers').onChange((value) => {
-    state.performerLightCount = Math.round(value);
+  }).listen();
+  lightingGroup.add(state, 'performerLightCount', 0, MAX_PERFORMER_RIGS, 1).name('Lit Performers').onChange((value) => {
+    state.performerLightCount = Math.min(Math.round(value), MAX_PERFORMER_RIGS);
     rebuildWalkers();
   });
   lightingGroup.add(state, 'floorLightBase', 0, 24, 0.1).name('Floor Glow');
   lightingGroup.add(state, 'backLightBase', 0, 28, 0.1).name('Back Glow');
   lightingGroup.add(state, 'ao', 0, 3, 0.01).name('GTAO').onChange((value) => {
     aoPass.scale.value = value;
-  });
+  }).listen();
   lightingGroup.add(state, 'bloom', 0, 3, 0.01).name('Bloom').onChange((value) => {
     bloomPass.strength.value = value;
-  });
+  }).listen();
+  lightingGroup.add(state, 'glowShadows').name('Glow Shadows (slow)').onChange(applyGlowShadows);
   lightingGroup.add(state, 'emissiveBoost', 0, 5, 0.01).name('Emissive').onChange(() => {
     for (const batch of crowdBatches) applyEmissiveBoost(batch.source);
   });
@@ -407,6 +427,18 @@ function buildInspectorControls() {
   statsGroup.add(statsState, 'textures').name('Textures').listen();
 }
 
+function applyGlowShadows() {
+  // Point-light shadows are 6-face cubemaps — very expensive, especially with a
+  // large crowd. Off by default; opt-in via the inspector toggle.
+  for (const light of [floorGlow, backGlow, sideGlow]) {
+    light.castShadow = state.glowShadows;
+    light.shadow.mapSize.set(1024, 1024);
+    light.shadow.bias = -0.004;
+    light.shadow.normalBias = 0.04;
+    light.shadow.camera.near = 0.4;
+  }
+}
+
 function applyQualityPreset(preset) {
   if (preset === 'cinematic') {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -415,7 +447,7 @@ function applyQualityPreset(preset) {
     aoPass.samples.value = 24;
     aoPass.resolutionScale = 0.75;
     aoPass.scale.value = state.ao = 1.45;
-    bloomPass.strength.value = state.bloom = 0.9;
+    bloomPass.strength.value = state.bloom = 0.65;
     crossFill.intensity = state.crossFill = 3.2;
     cameraFill.intensity = state.cameraFill = 14;
     state.performerKey = 4.2;
@@ -423,12 +455,12 @@ function applyQualityPreset(preset) {
     state.performerRim = 2.2;
   } else if (preset === 'balanced') {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
-    key.shadow.mapSize.set(1024, 1024);
+    key.shadow.mapSize.set(2048, 2048);
     heroSpot.shadow.mapSize.set(1024, 1024);
     aoPass.samples.value = 12;
     aoPass.resolutionScale = 0.6;
     aoPass.scale.value = state.ao = 1.05;
-    bloomPass.strength.value = state.bloom = 0.78;
+    bloomPass.strength.value = state.bloom = 0.55;
     crossFill.intensity = state.crossFill = 2.7;
     cameraFill.intensity = state.cameraFill = 12;
     state.performerKey = 3.6;
@@ -436,12 +468,12 @@ function applyQualityPreset(preset) {
     state.performerRim = 0.8;
   } else {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1));
-    key.shadow.mapSize.set(1024, 1024);
+    key.shadow.mapSize.set(2048, 2048);
     heroSpot.shadow.mapSize.set(1024, 1024);
     aoPass.samples.value = 8;
     aoPass.resolutionScale = 0.5;
     aoPass.scale.value = state.ao = 0.85;
-    bloomPass.strength.value = state.bloom = 0.7;
+    bloomPass.strength.value = state.bloom = 0.5;
     crossFill.intensity = state.crossFill = 2.4;
     cameraFill.intensity = state.cameraFill = 10;
     state.performerKey = 3.2;
@@ -538,7 +570,7 @@ function createWalker(mesh, animationAsset, index) {
     laneOffset: 0,
     batch: null,
     batchIndex: -1,
-    lightRig: index < state.performerLightCount ? createPerformerLightRig(index) : null
+    lightRig: index < Math.min(state.performerLightCount, MAX_PERFORMER_RIGS) ? createPerformerLightRig(index) : null
   };
 }
 
@@ -1018,8 +1050,11 @@ function updateArmyBounds() {
   armyBounds.halfZ = (maxZ - minZ) * 0.5 + pad;
   armyBounds.radius = Math.hypot(armyBounds.halfX, armyBounds.halfZ);
 
-  // Resize the key + hero shadow frusta to cover the whole spread.
-  const reach = Math.max(armyBounds.halfX, armyBounds.halfZ) + 6;
+  // Size the key shadow frustum to the spread, but cap it: a single 2048 map
+  // stretched over a giant army gives sub-pixel (invisible) shadows. Capping
+  // keeps per-character + self shadows crisp around the centre; performers far
+  // past the cap still get floor contact via GTAO.
+  const reach = Math.min(Math.max(armyBounds.halfX, armyBounds.halfZ) + 6, 34);
   key.shadow.camera.left = armyBounds.centerX - reach;
   key.shadow.camera.right = armyBounds.centerX + reach;
   key.shadow.camera.top = armyBounds.centerZ + reach;
@@ -1210,7 +1245,7 @@ function render(timestamp) {
   heroSpot.target.position.x = bx + Math.sin(elapsed * 0.22) * hx * 0.5;
   heroSpot.target.position.z = bz;
   heroSpot.distance = Math.max(34, coverage * 2);
-  heroSpot.angle = Math.min(Math.PI * 0.33, Math.PI * 0.17 + armyBounds.radius * 0.012);
+  heroSpot.angle = Math.min(Math.PI * 0.48, Math.PI * 0.3 + armyBounds.radius * 0.015);
   cameraFill.position.copy(camera.position);
   cameraFill.position.y += 0.75;
   cameraFill.target.position.copy(controls.target);
