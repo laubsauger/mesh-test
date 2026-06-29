@@ -121,6 +121,27 @@ describe('Retargeter — T12: no NaN, valid bone matrices', () => {
     expect(Math.abs(la.z - ra.z), `arm z match (la ${la.z.toFixed(3)} ra ${ra.z.toFixed(3)})`).toBeLessThan(0.02);
   });
 
+  it('joint limit clamps bone rotation away from rest (T13)', () => {
+    const { skeleton } = buildMeshySkeleton();
+    const restQuats = skeleton.bones.map((b) => b.quaternion.clone());
+    const rig = resolveRigBones(skeleton);
+
+    // extreme arm pose (wrist flung far) that would over-rotate the upper arm
+    const c = synthCanonical();
+    c.joints[KPT.leftShoulder] = { x: 0.2, y: 0.5, z: 0, confidence: 0.9 };
+    c.joints[KPT.leftElbow] = { x: 0.2, y: 1.5, z: 0.0, confidence: 0.9 }; // straight up
+    c.joints[KPT.leftWrist] = { x: 0.2, y: 2.5, z: 0, confidence: 0.9 };
+
+    const angleFromRest = () => {
+      const d = restQuats[skeleton.bones.indexOf(rig.leftArm)].clone().invert().multiply(rig.leftArm.quaternion);
+      return 2 * Math.acos(Math.min(1, Math.abs(d.w)));
+    };
+
+    const tight = new Retargeter(skeleton, { restQuats });
+    tight.apply(c, { kptThresh: 0.3, mirrorX: false, jointLimitDeg: 45 });
+    expect(angleFromRest()).toBeLessThanOrEqual((45 + 1) * Math.PI / 180);
+  });
+
   it('null/low-confidence joints do not corrupt bones', () => {
     const { skeleton } = buildMeshySkeleton();
     const rt = new Retargeter(skeleton);

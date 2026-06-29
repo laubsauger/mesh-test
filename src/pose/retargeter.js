@@ -9,13 +9,16 @@
 // Rest is restored from the rest LOCAL quaternions captured at load, which live
 // in the normalized source space.
 import * as THREE from 'three';
-import { resolveRigBones, SEGMENTS, hipCenter, shoulderCenter } from './rig-map.js';
+import { resolveRigBones, SEGMENTS, hipCenter, shoulderCenter, HIPS_DEPTH } from './rig-map.js';
 
 const _boneW = new THREE.Vector3();
 const _childW = new THREE.Vector3();
 const _target = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _qParent = new THREE.Quaternion();
+const _qLocal = new THREE.Quaternion();
+const _qDelta = new THREE.Quaternion();
+const DEG2RAD = Math.PI / 180;
 
 export class Retargeter {
   constructor(skeleton, { basis = null, restQuats = null } = {}) {
@@ -46,7 +49,8 @@ export class Retargeter {
     restDirWorld.normalize();
     const bindWorldQuat = new THREE.Quaternion();
     bone.getWorldQuaternion(bindWorldQuat);
-    this.bind.set(boneKey, { restDirWorld, bindWorldQuat });
+    // rest LOCAL rotation (bones are at rest here) — reference for joint limits.
+    this.bind.set(boneKey, { restDirWorld, bindWorldQuat, restLocalQuat: bone.quaternion.clone() });
     return true;
   }
 
@@ -65,12 +69,14 @@ export class Retargeter {
   }
 
   // Aim a captured bone from world dir (to - from). from/to: {x,y,z,confidence}.
-  // Depth scaling/sign is handled upstream in the canonical adapter.
-  _aim(boneKey, from, to, kptThresh, mirrorX) {
+  // depthScale damps the noisy z per-bone (arms full, torso/legs/head low).
+  // maxAngleDeg clamps how far the bone may rotate from its rest pose (joint
+  // limit — prevents impossible flips/mangles, T13).
+  _aim(boneKey, from, to, kptThresh, mirrorX, depthScale, maxAngleDeg) {
     const bind = this.bind.get(boneKey);
     if (!bind || !from || !to || from.confidence < kptThresh || to.confidence < kptThresh) return;
 
-    _target.set(to.x - from.x, to.y - from.y, to.z - from.z);
+    _target.set(to.x - from.x, to.y - from.y, (to.z - from.z) * depthScale);
     if (_target.lengthSq() < 1e-8) return;
     _target.normalize();
     if (mirrorX) _target.x = -_target.x; // selfie video is X-mirrored
@@ -80,23 +86,38 @@ export class Retargeter {
     const bone = this.rig[boneKey];
     if (bone.parent) {
       bone.parent.getWorldQuaternion(_qParent).invert();
-      bone.quaternion.copy(_qParent.multiply(_q));
+      _qLocal.copy(_qParent.multiply(_q));
     } else {
-      bone.quaternion.copy(_q);
+      _qLocal.copy(_q);
     }
+
+    // Joint limit: clamp the rotation away from rest to maxAngleDeg.
+    if (maxAngleDeg < 180) {
+      _qDelta.copy(bind.restLocalQuat).invert().multiply(_qLocal);
+      const angle = 2 * Math.acos(Math.min(1, Math.abs(_qDelta.w)));
+      const maxRad = maxAngleDeg * DEG2RAD;
+      if (angle > maxRad && angle > 1e-4) {
+        _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, maxRad / angle);
+      }
+    }
+
+    bone.quaternion.copy(_qLocal);
     bone.updateWorldMatrix(false, false);
   }
 
   // canonical: { joints: [{x,y,z,confidence}, ...] } in canonical space.
-  apply(canonical, { kptThresh = 0.3, mirrorX = true } = {}) {
+  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180 } = {}) {
     this.restPose(); // start from rest each frame so untracked bones stay at rest
 
     // Pelvis first (root) — leans the whole body; limbs below compensate via
-    // their parent's world orientation.
-    this._aim('hips', hipCenter(canonical), shoulderCenter(canonical), kptThresh, mirrorX);
+    // their parent's world orientation. Damped depth (avoids forward droop).
+    this._aim('hips', hipCenter(canonical), shoulderCenter(canonical), kptThresh, mirrorX, depthScale * HIPS_DEPTH, jointLimitDeg);
 
     for (const seg of SEGMENTS) {
-      this._aim(seg.bone, seg.from(canonical), seg.to(canonical), kptThresh, mirrorX);
+      this._aim(
+        seg.bone, seg.from(canonical), seg.to(canonical),
+        kptThresh, mirrorX, depthScale * (seg.depth ?? 1), seg.maxAngle ?? jointLimitDeg
+      );
     }
   }
 }

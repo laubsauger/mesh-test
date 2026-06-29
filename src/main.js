@@ -265,6 +265,7 @@ const state = {
   poseSmoothing: true,
   poseSmoothMinCutoff: 2,
   poseSmoothBeta: 0.02,
+  poseJointLimit: 150,
   spacing: 2.8,
   scale: 1,
   sizeVariance: 0,
@@ -482,7 +483,9 @@ function buildInspectorControls() {
     if (on) startPose();
     else stopPose();
   });
-  poseGroup.add(state, 'posePerformerCount', 0, 8, 1).name('Pose Performers').onChange((value) => {
+  // No artificial cap — all pose performers share one retarget (O(1)), so this
+  // can match Count. 500 = the Count slider's max.
+  poseGroup.add(state, 'posePerformerCount', 0, 500, 1).name('Pose Performers').onChange((value) => {
     state.posePerformerCount = Math.round(value);
     for (const walker of walkers) walker.boneSource = boneSourceForIndex(walker.index, state.posePerformerCount);
   });
@@ -494,6 +497,7 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseSmoothing').name('Smoothing').listen();
   poseGroup.add(state, 'poseSmoothMinCutoff', 0.1, 8, 0.1).name('Smooth Min Cutoff');
   poseGroup.add(state, 'poseSmoothBeta', 0, 0.2, 0.001).name('Smooth Beta');
+  poseGroup.add(state, 'poseJointLimit', 30, 180, 1).name('Joint Limit °');
   poseGroup.add(state, 'runEpProbe').name('Probe EPs (console)');
 
   const statsGroup = renderer.inspector.createParameters('VJ Layer / Render Stats');
@@ -1251,27 +1255,27 @@ function writeClipBoneSource(walker, batch, elapsed) {
   }
 }
 
-// Pose bone source (T12/T14): retarget the latest canonical pose onto the shared
-// skeleton, then snapshot into this walker's slice — same slot as clip (V5, V20).
-// No canonical yet (no person / pose off) → rest at bind pose (V12 hold is T9).
-// Self-diagnosing: any failure logs ONCE with context and falls to bind so the
-// rest of the scene keeps rendering (a thrown error here would kill the loop).
+// Pose bone source (T12/T14): every pose performer shares ONE canonical → ONE
+// retarget. Compute the posed bone matrices once per batch, then copy into each
+// pose performer's slice (V5/V20). Cost is O(1) retarget regardless of how many
+// performers are pose-driven. No canonical (no person / pose off) → rest pose.
+// Self-diagnosing: failure logs ONCE and holds rest so the loop survives.
 let _poseWriteErr = false;
-function writePoseBoneSource(walker, batch) {
+function computePoseMatrices(batch) {
   const skeleton = batch.skeletonStates[0]?.skeleton;
   if (!skeleton) {
     if (!_poseWriteErr) { console.error('[pose] batch has no skeleton:', batch.mesh?.name); _poseWriteErr = true; }
-    return;
+    return null;
   }
 
   try {
     if (!batch.retargeter) batch.retargeter = new Retargeter(skeleton, { restQuats: batch.restQuats });
-    // poseRetarget off → rest pose only (isolation: does the mesh survive the
-    // pose snapshot path itself, independent of the retarget math?).
     if (state.poseRetarget && latestCanonical) {
       batch.retargeter.apply(latestCanonical, {
         kptThresh: state.poseKptThresh,
-        mirrorX: state.poseMirrorX
+        mirrorX: state.poseMirrorX,
+        depthScale: state.poseDepthScale,
+        jointLimitDeg: state.poseJointLimit
       });
     } else {
       batch.retargeter.restPose();
@@ -1282,28 +1286,40 @@ function writePoseBoneSource(walker, batch) {
   }
 
   batch.source.updateMatrixWorld(true);
-  for (const skeletonState of batch.skeletonStates) {
-    skeletonState.skeleton.update();
-    const src = skeletonState.skeleton.boneMatrices;
+  // Copy each skeleton's matrices (clip walkers re-pose the shared skeleton later
+  // in the loop, so snapshot now into stable buffers).
+  return batch.skeletonStates.map((ss) => {
+    ss.skeleton.update();
+    const src = ss.skeleton.boneMatrices;
     if (!batch._poseLogged) {
       batch._poseLogged = true;
       console.log('[pose] driving', batch.mesh?.name, {
-        bones: skeletonState.skeleton.bones.length,
+        bones: ss.skeleton.bones.length,
         retarget: state.poseRetarget,
         hasCanonical: !!latestCanonical,
-        allFinite: src.every(Number.isFinite),
-        m0: Array.from(src.slice(0, 16))
+        allFinite: src.every(Number.isFinite)
       });
     }
-    skeletonState.boneMatrices.array.set(src, walker.batchIndex * skeletonState.boneCount * 16);
-  }
+    return Float32Array.from(src);
+  });
+}
+
+function writePoseSlices(walker, batch, posed) {
+  if (!posed) return;
+  batch.skeletonStates.forEach((ss, i) => {
+    ss.boneMatrices.array.set(posed[i], walker.batchIndex * ss.boneCount * 16);
+  });
 }
 
 function updateCrowdBatches(elapsed) {
   for (const batch of crowdBatches) {
+    // One retarget per batch, shared by all pose performers.
+    const hasPose = batch.walkers.some((w) => w.boneSource === 'pose');
+    const posedMatrices = hasPose ? computePoseMatrices(batch) : null;
+
     for (const walker of batch.walkers) {
       if (walker.boneSource === 'pose') {
-        writePoseBoneSource(walker, batch, elapsed);
+        writePoseSlices(walker, batch, posedMatrices);
       } else {
         writeClipBoneSource(walker, batch, elapsed);
       }
@@ -1389,7 +1405,7 @@ function frameCoreConfident(canon) {
 }
 
 function updateCanonical(frame) {
-  let canon = frame ? toCanonical(frame, { depthScale: state.poseDepthScale }) : null;
+  let canon = frame ? toCanonical(frame) : null;
   if (canon && state.poseSmoothing) {
     poseSmoother.setParams({ minCutoff: state.poseSmoothMinCutoff, beta: state.poseSmoothBeta });
     canon = poseSmoother.smooth(canon);

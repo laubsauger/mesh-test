@@ -11,7 +11,7 @@ function mid(a, b) {
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 };
 }
 
-export function toCanonical(frame, { depthScale = 1 } = {}) {
+export function toCanonical(frame) {
   const k = frame.keypoints3D;
   const lh = k[KPT.leftHip];
   const rh = k[KPT.rightHip];
@@ -20,16 +20,16 @@ export function toCanonical(frame, { depthScale = 1 } = {}) {
   const pelvis = mid(lh, rh);
 
   // Canonical frame matched to the Meshy rig (measured): +x = image-right =
-  // performer's anatomical LEFT = rig left (+x); +y = up (image y is down → flip);
-  // +z = depth as-is. Pelvis-centered. This makes retargeting puppet-correct with
-  // NO extra mirror (the old all-axes negate was copied from the reference VIEWER
-  // and caused a double-flip → crossed arms, see §B). confidence carried through.
-  // depthScale: reference viewer uses 1.5 (pose3d.js). <1 damps noisy depth, >1
-  // exaggerates. Sign is flipped — RTMW depth runs opposite the rig's +z forward.
+  // performer's anatomical LEFT = rig left (+x); +y = up (image y is down → flip).
+  // Pelvis-centered. Puppet-correct with NO extra mirror (the old all-axes negate
+  // was copied from the reference VIEWER → double-flip → crossed arms, see §B).
+  // Depth (z) sign flipped (RTMW depth opposes rig +z). Depth SCALING is applied
+  // per-segment in the retargeter — arms need depth; torso/head/legs de-emphasize
+  // it to avoid droop / knee back-fold from noisy monocular depth.
   const joints = k.map((p) => ({
     x: p.x - pelvis.x,
     y: -(p.y - pelvis.y),
-    z: -(p.z - pelvis.z) * depthScale,
+    z: -(p.z - pelvis.z),
     confidence: p.confidence
   }));
 

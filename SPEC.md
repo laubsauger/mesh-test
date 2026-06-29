@@ -71,7 +71,7 @@ T9|.|robustness: outlier reject, last-known-good, depth-flip, L-R swap, predict/
 T10|~|temporal filter (One Euro pos, slerp rot, per-part groups) after rejection|V10,V16
 T11|x|HumanoidRigDefinition + bone map `CanonicalJointName`→Meshy biped bone (? per-rig calibration)|V9,I.canonical
 T12|~|HumanoidRetargeter: segment-dir + swing-twist → bone rotations onto shared skeleton; pose writer snapshots performer slice (M4)|V5,V9,V20
-T13|.|direct3D + direct3DConstrained modes; `PoseDriveConfig` + constraint presets|V9,I.poseMode,I.poseConfig
+T13|~|joint limits (clamp bone rotation from rest, §23) done; direct3D modes + `PoseDriveConfig` presets pending|V9,I.poseMode,I.poseConfig
 T14|~|**APEX**: drive ≥1 crowd rig live from webcam; mixed clip+pose crowd renders one frame|V12,V18,V20,I.boneSource
 T15|.|anchoredSolved: fixed StageRoot, bounded BodyRoot, squat/one-leg/lunge/kneeRaise/kick (M5)|V9,V13,I.poseMode
 T16|.|calibration UI: manual floor + markers, floor grid, boundary, quality, drift detect, save/load (M6)|V14
