@@ -42,6 +42,27 @@ const mid = (a, b) => ({
 export const hipCenter = (c) => mid(c.joints[KPT.leftHip], c.joints[KPT.rightHip]);
 export const shoulderCenter = (c) => mid(c.joints[KPT.leftShoulder], c.joints[KPT.rightShoulder]);
 
+// Head target from the centroid of all face points (nose + eyes + ears), not one
+// noisy nose point — averaging 5 keypoints is far steadier for head direction.
+const HEAD_POINTS = [KPT.nose, KPT.leftEye, KPT.rightEye, KPT.leftEar, KPT.rightEar];
+export const headCenter = (c) => {
+  let x = 0;
+  let y = 0;
+  let z = 0;
+  let conf = 1;
+  let n = 0;
+  for (const i of HEAD_POINTS) {
+    const j = c.joints[i];
+    if (!j) continue;
+    x += j.x;
+    y += j.y;
+    z += j.z;
+    conf = Math.min(conf, j.confidence);
+    n += 1;
+  }
+  return n ? { x: x / n, y: y / n, z: z / n, confidence: conf } : { x: 0, y: 0, z: 0, confidence: 0 };
+};
+
 // Directional bones: rig bone aimed from `from(canonical)` toward `to(canonical)`.
 // `depth` scales how much the (noisy) monocular z contributes for that bone:
 // arms need it (reach forward/back); legs/torso/head damp it (else knees fold
@@ -60,9 +81,9 @@ export const SEGMENTS = [
   // NOTE: no 'spine' segment — the Meshy 'Spine' bone's child sits BELOW it
   // (Spine→Spine01 = -y), so aiming it up is a ~180° flip → degenerate chest roll
   // (one shoulder up/down, see §B). Torso lean is driven via Hips instead.
-  // neck keeps most depth so head pitch (look up/down) registers; the earlier
-  // droop was the Hips over-leaning, not the neck.
-  { bone: 'neck', from: shoulderCenter, to: kpt(KPT.nose), depth: 0.85 }
+  // neck aimed at the face centroid (steadier than the lone nose). Keeps most
+  // depth so head pitch (look up/down) registers; earlier droop was Hips, not neck.
+  { bone: 'neck', from: shoulderCenter, to: headCenter, depth: 0.85 }
 ];
 
 // Pelvis (Hips) torso-lean uses damped depth too (avoids forward droop).

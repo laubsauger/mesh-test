@@ -266,6 +266,7 @@ const state = {
   poseSmoothMinCutoff: 2,
   poseSmoothBeta: 0.02,
   poseJointLimit: 150,
+  poseFollow: 0.3,
   spacing: 2.8,
   scale: 1,
   sizeVariance: 0,

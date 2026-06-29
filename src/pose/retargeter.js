@@ -26,7 +26,8 @@ export class Retargeter {
     this.rig = resolveRigBones(skeleton);
     this.basis = basis; // optional THREE.Quaternion: canonical-space → rig-space
     this.restQuats = restQuats; // rest LOCAL quats (normalized source space), per bone
-    this.bind = new Map(); // boneKey → { restDirWorld, bindWorldQuat }
+    this.bind = new Map(); // boneKey → { restDirWorld, bindWorldQuat, restLocalQuat }
+    this.smoothed = new Map(); // boneKey → persistent slerped local quat (T10·2)
     this._captureBind();
   }
 
@@ -70,9 +71,10 @@ export class Retargeter {
 
   // Aim a captured bone from world dir (to - from). from/to: {x,y,z,confidence}.
   // depthScale damps the noisy z per-bone (arms full, torso/legs/head low).
-  // maxAngleDeg clamps how far the bone may rotate from its rest pose (joint
-  // limit — prevents impossible flips/mangles, T13).
-  _aim(boneKey, from, to, kptThresh, mirrorX, depthScale, maxAngleDeg) {
+  // maxAngleDeg clamps rotation from rest (joint limit, T13). follow is the
+  // per-render-frame slerp rate toward the target (T10·2) — decouples render
+  // smoothness from the slow pose-fps (no stop-motion) and damps jitter.
+  _aim(boneKey, from, to, kptThresh, mirrorX, depthScale, maxAngleDeg, follow) {
     const bind = this.bind.get(boneKey);
     if (!bind || !from || !to || from.confidence < kptThresh || to.confidence < kptThresh) return;
 
@@ -101,22 +103,29 @@ export class Retargeter {
       }
     }
 
-    bone.quaternion.copy(_qLocal);
+    // Render-rate interpolation: slerp persistent state toward the target.
+    let cur = this.smoothed.get(boneKey);
+    if (!cur) {
+      cur = bind.restLocalQuat.clone();
+      this.smoothed.set(boneKey, cur);
+    }
+    cur.slerp(_qLocal, follow >= 1 ? 1 : follow);
+    bone.quaternion.copy(cur);
     bone.updateWorldMatrix(false, false);
   }
 
   // canonical: { joints: [{x,y,z,confidence}, ...] } in canonical space.
-  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180 } = {}) {
+  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, follow = 1 } = {}) {
     this.restPose(); // start from rest each frame so untracked bones stay at rest
 
     // Pelvis first (root) — leans the whole body; limbs below compensate via
     // their parent's world orientation. Damped depth (avoids forward droop).
-    this._aim('hips', hipCenter(canonical), shoulderCenter(canonical), kptThresh, mirrorX, depthScale * HIPS_DEPTH, jointLimitDeg);
+    this._aim('hips', hipCenter(canonical), shoulderCenter(canonical), kptThresh, mirrorX, depthScale * HIPS_DEPTH, jointLimitDeg, follow);
 
     for (const seg of SEGMENTS) {
       this._aim(
         seg.bone, seg.from(canonical), seg.to(canonical),
-        kptThresh, mirrorX, depthScale * (seg.depth ?? 1), seg.maxAngle ?? jointLimitDeg
+        kptThresh, mirrorX, depthScale * (seg.depth ?? 1), seg.maxAngle ?? jointLimitDeg, follow
       );
     }
   }
