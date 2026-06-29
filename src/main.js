@@ -6,7 +6,9 @@ import {
   add,
   attributeArray,
   emissive,
+  float,
   instanceIndex,
+  mix,
   mrt,
   normalView,
   output,
@@ -26,14 +28,24 @@ import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { Inspector } from 'three/addons/inspector/Inspector.js';
+import { CHOREOGRAPHIES, computeWalkerPhase } from './choreography.js';
+import { boneSourceForIndex } from './bone-source.js';
+import { assetUrl } from './asset-url.js';
+import { POSE_EPS } from './pose/ep.js';
+import { probeEPs } from './pose/ep-probe.js';
+import { RTMWPoseProvider } from './pose/rtmw-provider.js';
+import { drawOverlay } from './pose/overlay-2d.js';
+import { toCanonical } from './pose/observation-adapter.js';
+import { Retargeter } from './pose/retargeter.js';
+import { KPT, NUM_KPTS } from './pose/rtmw-constants.js';
+import { CanonicalSmoother } from './pose/one-euro.js';
 
 const canvas = document.querySelector('#scene');
 const statusEl = document.querySelector('#status');
-
-// Resolve manifest/model URLs against Vite's base so the app works both at the
-// dev root and under a GitHub Pages project subpath (e.g. /mesh-test/).
-const BASE_URL = import.meta.env.BASE_URL;
-const assetUrl = (path) => `${BASE_URL}${String(path).replace(/^\//, '')}`;
+const posePipEl = document.querySelector('#pose-pip');
+const poseVideoEl = document.querySelector('#pose-video');
+const poseOverlayEl = document.querySelector('#pose-overlay');
+const posePipLabel = document.querySelector('#pose-pip-label');
 
 const preloaderEl = document.querySelector('#preloader');
 const preloaderBar = document.querySelector('#preloader-bar');
@@ -192,8 +204,12 @@ aoPass.resolutionScale = 0.5;
 
 const bloomPass = bloom(scenePassEmissive, 0.5, 0.45, 0.2);
 const renderPipeline = new RenderPipeline(renderer);
+// AO toggle: mix the AO term toward 1.0 (no darkening) via a uniform, so the
+// checkbox is a real on/off — not just the intensity slider near zero.
+const aoFactor = uniform(1);
+const aoTerm = mix(float(1), aoPass.getTextureNode().r, aoFactor);
 renderPipeline.outputNode = scenePassColor
-  .mul(vec4(vec3(aoPass.getTextureNode().r), 1))
+  .mul(vec4(vec3(aoTerm), 1))
   .add(bloomPass);
 
 const loader = new GLTFLoader();
@@ -220,6 +236,12 @@ let rebuildId = 0;
 // regardless; these rigs are extra per-character hero lighting for a few.
 const MAX_PERFORMER_RIGS = 24;
 
+// "idle" animation = load geometry/skeleton but play no clip → the rig rests at
+// its bind pose. This is the base for pose mode: with no mixer advancing, the
+// clip never fights the pose writer. (A proper blendable idle clip is future
+// work — see SPEC.) Lives alongside the real clip names in the Animation list.
+const ANIM_IDLE = 'idle';
+
 const state = {
   selectedMeshIds: [],
   animationName: 'Walking',
@@ -227,7 +249,22 @@ const state = {
   movement: 'in place',
   count: 7,
   speed: 1,
-  animDesync: 0.6,
+  choreography: 'desync',
+  choreoDelay: 0.6,
+  posePerformerCount: 0,
+  // webgpu EP: works here and is fast; wasm EP currently freezes the main thread
+  // (heavy 369MB model, single inference loop) until the worker offload (T20).
+  // webgpu shares the renderer's GPU (V23 risk) — wasm-in-worker is the robust
+  // long-term path. Switch via the EP selector / probe.
+  poseEP: 'webgpu',
+  poseEnabled: false,
+  poseKptThresh: 0.3,
+  poseRetarget: true,
+  poseMirrorX: false,
+  poseDepthScale: 1.5,
+  poseSmoothing: true,
+  poseSmoothMinCutoff: 2,
+  poseSmoothBeta: 0.02,
   spacing: 2.8,
   scale: 1,
   sizeVariance: 0,
@@ -249,7 +286,10 @@ const state = {
   exposure: 1.15,
   fog: 0.034,
   ao: 0.85,
+  aoEnabled: true,
   bloom: 0.5,
+  lightMotion: true,
+  glowLights: true,
   quality: 'performance',
   emissiveBoost: 1,
   cameraDrift: true,
@@ -260,6 +300,20 @@ const state = {
   },
   applyQualityPreset() {
     applyQualityPreset(state.quality);
+  },
+  runEpProbe() {
+    statusEl.textContent = 'EP probe running… (console for detail)';
+    probeEPs(POSE_EPS, { runs: 20 })
+      .then(({ results, winner }) => {
+        const summary = results
+          .map((r) => (r.ok ? `${r.ep} ${r.median.toFixed(0)}ms` : `${r.ep} FAIL`))
+          .join(' · ');
+        statusEl.textContent = `EP probe: ${summary}${winner ? ` → win ${winner}` : ''}`;
+      })
+      .catch((error) => {
+        statusEl.textContent = `EP probe failed: ${error.message}`;
+        console.error(error);
+      });
   }
 };
 
@@ -338,7 +392,8 @@ function buildInspectorControls() {
   });
   performanceGroup.add(state, 'movement', ['in place', 'lane loop', 'local wander', 'space wander', 'orbit drift']).name('Movement').onChange(() => arrangeWalkers());
   performanceGroup.add(state, 'speed', 0, 3, 0.01).name('Speed');
-  performanceGroup.add(state, 'animDesync', 0, 1, 0.01).name('Anim Desync');
+  performanceGroup.add(state, 'choreography', CHOREOGRAPHIES).name('Choreography');
+  performanceGroup.add(state, 'choreoDelay', 0, 1, 0.01).name('Choreo Delay');
   performanceGroup.add(state, 'spacing', 0.2, 24, 0.05).name('Spacing').onChange(() => arrangeWalkers());
   performanceGroup.add(state, 'scale', 0.3, 2.5, 0.01).name('Scale').onChange(() => {
     arrangeWalkers();
@@ -391,8 +446,13 @@ function buildInspectorControls() {
     state.performerLightCount = Math.min(Math.round(value), MAX_PERFORMER_RIGS);
     rebuildWalkers();
   });
+  lightingGroup.add(state, 'glowLights').name('Glow Lights').listen();
+  lightingGroup.add(state, 'lightMotion').name('Light Motion').listen();
   lightingGroup.add(state, 'floorLightBase', 0, 24, 0.1).name('Floor Glow');
   lightingGroup.add(state, 'backLightBase', 0, 28, 0.1).name('Back Glow');
+  lightingGroup.add(state, 'aoEnabled').name('AO Enabled').listen().onChange((on) => {
+    aoFactor.value = on ? 1 : 0;
+  });
   lightingGroup.add(state, 'ao', 0, 3, 0.01).name('GTAO').onChange((value) => {
     aoPass.scale.value = value;
   }).listen();
@@ -416,6 +476,25 @@ function buildInspectorControls() {
       rebuildWalkers();
     });
   }
+
+  const poseGroup = renderer.inspector.createParameters('VJ Layer / Pose');
+  poseGroup.add(state, 'poseEnabled').name('Webcam Pose').listen().onChange((on) => {
+    if (on) startPose();
+    else stopPose();
+  });
+  poseGroup.add(state, 'posePerformerCount', 0, 8, 1).name('Pose Performers').onChange((value) => {
+    state.posePerformerCount = Math.round(value);
+    for (const walker of walkers) walker.boneSource = boneSourceForIndex(walker.index, state.posePerformerCount);
+  });
+  poseGroup.add(state, 'poseEP', POSE_EPS).name('Pose EP');
+  poseGroup.add(state, 'poseKptThresh', 0, 1, 0.01).name('Kpt Threshold');
+  poseGroup.add(state, 'poseRetarget').name('Pose Retarget').listen();
+  poseGroup.add(state, 'poseMirrorX').name('Mirror X').listen();
+  poseGroup.add(state, 'poseDepthScale', 0, 3, 0.01).name('Depth Scale');
+  poseGroup.add(state, 'poseSmoothing').name('Smoothing').listen();
+  poseGroup.add(state, 'poseSmoothMinCutoff', 0.1, 8, 0.1).name('Smooth Min Cutoff');
+  poseGroup.add(state, 'poseSmoothBeta', 0, 0.2, 0.001).name('Smooth Beta');
+  poseGroup.add(state, 'runEpProbe').name('Probe EPs (console)');
 
   const statsGroup = renderer.inspector.createParameters('VJ Layer / Render Stats');
   statsGroup.add(statsState, 'fps').name('FPS').listen();
@@ -503,7 +582,8 @@ function animationNames() {
     if (b === 'Running') return 1;
     return a.localeCompare(b);
   });
-  return preferred;
+  // idle is always available (no clip needed) — base pose for pose mode.
+  return [ANIM_IDLE, ...preferred];
 }
 
 async function rebuildWalkers() {
@@ -547,6 +627,7 @@ function activeMeshes() {
 function selectAnimation(mesh, name) {
   // Each character is now a single GLB carrying every kept clip; the animation
   // is selected by clip name at load time, not by a separate URL.
+  if (name === ANIM_IDLE) return { name: ANIM_IDLE, url: mesh.url, idle: true };
   if (mesh.animations.includes(name)) return { name, url: mesh.url };
 
   throw new Error(`${mesh.name} does not include ${name}. Select meshes with a shared animation.`);
@@ -558,6 +639,7 @@ function createWalker(mesh, animationAsset, index) {
     mesh,
     animationAsset,
     batchKey: `${mesh.id}:${animationAsset.name}`,
+    boneSource: boneSourceForIndex(index, state.posePerformerCount),
     basePosition: new THREE.Vector3(),
     position: new THREE.Vector3(),
     rotationY: 0,
@@ -576,9 +658,12 @@ function createWalker(mesh, animationAsset, index) {
 
 async function loadCrowdBatch(mesh, animationAsset, batchWalkers) {
   const gltf = await loadGltf(animationAsset.url);
-  const clip = gltf.animations.find((candidate) => candidate.name === animationAsset.name) ?? gltf.animations[0];
+  const isIdle = animationAsset.idle === true;
+  const clip = isIdle
+    ? null
+    : (gltf.animations.find((candidate) => candidate.name === animationAsset.name) ?? gltf.animations[0]);
 
-  if (!clip) {
+  if (!isIdle && !clip) {
     throw new Error(`${mesh.name} / ${animationAsset.name} has no animation clip.`);
   }
 
@@ -606,9 +691,10 @@ async function loadCrowdBatch(mesh, animationAsset, batchWalkers) {
   normalizeModel(source);
   applyEmissiveBoost(source);
 
-  const mixer = new THREE.AnimationMixer(source);
-  const action = mixer.clipAction(clip);
-  action.play();
+  // idle: no mixer/action — the rig stays at its bind pose (won't fight pose).
+  const mixer = isIdle ? null : new THREE.AnimationMixer(source);
+  const action = isIdle ? null : mixer.clipAction(clip);
+  if (action) action.play();
 
   const batch = {
     mesh,
@@ -619,7 +705,8 @@ async function loadCrowdBatch(mesh, animationAsset, batchWalkers) {
     walkers: batchWalkers,
     mixer,
     action,
-    duration: clip.duration,
+    idle: isIdle,
+    duration: clip ? clip.duration : 1,
     instanceMatrices: new StorageBufferAttribute(batchWalkers.length, 16),
     instanceMatricesNode: null,
     computeNodes: [],
@@ -632,11 +719,18 @@ async function loadCrowdBatch(mesh, animationAsset, batchWalkers) {
     const walker = batchWalkers[i];
     walker.batch = batch;
     walker.batchIndex = i;
-    walker.duration = clip.duration;
+    walker.duration = batch.duration;
   }
 
   source.updateMatrixWorld(true);
   for (const skinnedMesh of skinnedMeshes) createComputedSkinnedMesh(skinnedMesh, batch);
+
+  // Rest LOCAL quats in the NORMALIZED source space — bones are still at GLB rest
+  // here (no mixer.setTime yet). The retargeter restores from these instead of
+  // skeleton.pose() (which would inject the normalization scale → vanish, §B).
+  const restSkeleton = batch.skeletonStates[0]?.skeleton;
+  batch.restQuats = restSkeleton ? restSkeleton.bones.map((b) => b.quaternion.clone()) : null;
+
   source.traverse((child) => {
     if ((child.isMesh || child.isSkinnedMesh) && !child.name.endsWith('-gpu-instances')) {
       child.visible = false;
@@ -1129,23 +1223,90 @@ function updateWalkerInstanceMatrix(walker) {
   transformMatrix.toArray(walker.batch.instanceMatrices.array, walker.batchIndex * 16);
 }
 
+function choreoOpts() {
+  return {
+    choreography: state.choreography,
+    choreoDelay: state.choreoDelay,
+    count: walkers.length,
+    bounds: armyBounds
+  };
+}
+
+// Clip bone source: advance the shared mixer to this walker's choreographed
+// clip time, then snapshot the re-posed skeleton into the walker's slice (V5).
+function writeClipBoneSource(walker, batch, elapsed) {
+  // idle batch: no mixer — leave the rig at its bind pose (constant rest matrices).
+  if (!batch.idle) {
+    const animOffset = computeWalkerPhase(walker, batch.duration, choreoOpts());
+    batch.mixer.setTime((elapsed * state.speed + animOffset) % batch.duration);
+  }
+  batch.source.updateMatrixWorld(true);
+
+  for (const skeletonState of batch.skeletonStates) {
+    skeletonState.skeleton.update();
+    skeletonState.boneMatrices.array.set(
+      skeletonState.skeleton.boneMatrices,
+      walker.batchIndex * skeletonState.boneCount * 16
+    );
+  }
+}
+
+// Pose bone source (T12/T14): retarget the latest canonical pose onto the shared
+// skeleton, then snapshot into this walker's slice — same slot as clip (V5, V20).
+// No canonical yet (no person / pose off) → rest at bind pose (V12 hold is T9).
+// Self-diagnosing: any failure logs ONCE with context and falls to bind so the
+// rest of the scene keeps rendering (a thrown error here would kill the loop).
+let _poseWriteErr = false;
+function writePoseBoneSource(walker, batch) {
+  const skeleton = batch.skeletonStates[0]?.skeleton;
+  if (!skeleton) {
+    if (!_poseWriteErr) { console.error('[pose] batch has no skeleton:', batch.mesh?.name); _poseWriteErr = true; }
+    return;
+  }
+
+  try {
+    if (!batch.retargeter) batch.retargeter = new Retargeter(skeleton, { restQuats: batch.restQuats });
+    // poseRetarget off → rest pose only (isolation: does the mesh survive the
+    // pose snapshot path itself, independent of the retarget math?).
+    if (state.poseRetarget && latestCanonical) {
+      batch.retargeter.apply(latestCanonical, {
+        kptThresh: state.poseKptThresh,
+        mirrorX: state.poseMirrorX
+      });
+    } else {
+      batch.retargeter.restPose();
+    }
+  } catch (error) {
+    if (!_poseWriteErr) { console.error('[pose] retarget threw — holding rest pose:', error); _poseWriteErr = true; }
+    batch.retargeter?.restPose();
+  }
+
+  batch.source.updateMatrixWorld(true);
+  for (const skeletonState of batch.skeletonStates) {
+    skeletonState.skeleton.update();
+    const src = skeletonState.skeleton.boneMatrices;
+    if (!batch._poseLogged) {
+      batch._poseLogged = true;
+      console.log('[pose] driving', batch.mesh?.name, {
+        bones: skeletonState.skeleton.bones.length,
+        retarget: state.poseRetarget,
+        hasCanonical: !!latestCanonical,
+        allFinite: src.every(Number.isFinite),
+        m0: Array.from(src.slice(0, 16))
+      });
+    }
+    skeletonState.boneMatrices.array.set(src, walker.batchIndex * skeletonState.boneCount * 16);
+  }
+}
+
 function updateCrowdBatches(elapsed) {
   for (const batch of crowdBatches) {
     for (const walker of batch.walkers) {
-      // animDesync offsets each instance's clip time by its own seed so the
-      // crowd doesn't march in lockstep (0 = synced, 1 = fully independent).
-      const animOffset = walker.seed * batch.duration * state.animDesync;
-      batch.mixer.setTime((elapsed * state.speed + animOffset) % batch.duration);
-      batch.source.updateMatrixWorld(true);
-
-      for (const skeletonState of batch.skeletonStates) {
-        skeletonState.skeleton.update();
-        skeletonState.boneMatrices.array.set(
-          skeletonState.skeleton.boneMatrices,
-          walker.batchIndex * skeletonState.boneCount * 16
-        );
+      if (walker.boneSource === 'pose') {
+        writePoseBoneSource(walker, batch, elapsed);
+      } else {
+        writeClipBoneSource(walker, batch, elapsed);
       }
-
       updateWalkerInstanceMatrix(walker);
     }
 
@@ -1166,7 +1327,7 @@ function clearWalkers() {
   }
   for (const batch of crowdBatches) {
     scene.remove(batch.source);
-    batch.mixer.stopAllAction();
+    batch.mixer?.stopAllAction();
   }
   skeletonStates.clear();
   crowdBatches.length = 0;
@@ -1206,6 +1367,106 @@ function reportAssetProgress() {
   onAssetProgress(loaded, total);
 }
 
+let poseProvider = null;
+let poseOverlayCtx = null;
+let poseLoopActive = false;
+let latestCanonical = null;
+let lastGoodPoseAt = 0;
+const poseSmoother = new CanonicalSmoother(NUM_KPTS, {
+  minCutoff: 2,
+  beta: 0.02
+});
+
+// Minimal robustness gate (V11/V12, ahead of full T9): only drive from a frame
+// whose CORE joints (hips + shoulders) are confident — a garbage/partial frame
+// would otherwise fling the rig and the mesh vanishes. Brief dropout → hold last
+// good; sustained loss (>500ms) → release to bind. A real outlier/teleport layer
+// (T9) replaces this.
+const POSE_CORE_JOINTS = [KPT.leftHip, KPT.rightHip, KPT.leftShoulder, KPT.rightShoulder];
+
+function frameCoreConfident(canon) {
+  return POSE_CORE_JOINTS.every((i) => canon.joints[i] && canon.joints[i].confidence >= state.poseKptThresh);
+}
+
+function updateCanonical(frame) {
+  let canon = frame ? toCanonical(frame, { depthScale: state.poseDepthScale }) : null;
+  if (canon && state.poseSmoothing) {
+    poseSmoother.setParams({ minCutoff: state.poseSmoothMinCutoff, beta: state.poseSmoothBeta });
+    canon = poseSmoother.smooth(canon);
+  }
+  if (canon && frameCoreConfident(canon)) {
+    latestCanonical = canon;
+    lastGoodPoseAt = performance.now();
+  } else if (performance.now() - lastGoodPoseAt > 500) {
+    latestCanonical = null; // sustained loss → bind
+  }
+  // else: brief dropout → keep holding the last good pose
+}
+
+async function startPose() {
+  if (poseProvider) return;
+  posePipEl.hidden = false;
+  posePipLabel.textContent = 'pose: starting…';
+  try {
+    poseSmoother.reset();
+    poseProvider = new RTMWPoseProvider({ ep: state.poseEP, kptThresh: state.poseKptThresh });
+    await poseProvider.start();
+    poseVideoEl.srcObject = poseProvider.stream;
+    await poseVideoEl.play();
+    poseOverlayEl.width = poseProvider.video.videoWidth || 1280;
+    poseOverlayEl.height = poseProvider.video.videoHeight || 720;
+    poseOverlayCtx = poseOverlayEl.getContext('2d');
+    poseLoopActive = true;
+    posePipLabel.textContent = `pose: ${state.poseEP}`;
+    poseLoop();
+  } catch (error) {
+    console.error('pose start failed:', error);
+    posePipLabel.textContent = `pose: ${error.message}`;
+    statusEl.textContent = `Pose start failed: ${error.message}`;
+    state.poseEnabled = false;
+    poseProvider = null;
+  }
+}
+
+// Latest-frame loop: always infers the current video frame, so no backlog builds
+// (V17 worker offload comes in T20; this keeps it newest-only on the main thread).
+async function poseLoop() {
+  while (poseLoopActive && poseProvider) {
+    try {
+      const frame = await poseProvider.infer();
+      const vw = poseProvider.video?.videoWidth;
+      const vh = poseProvider.video?.videoHeight;
+      if (vw && poseOverlayEl.width !== vw) {
+        poseOverlayEl.width = vw;
+        poseOverlayEl.height = vh;
+      }
+      drawOverlay(poseOverlayCtx, frame, poseOverlayEl.width, poseOverlayEl.height, {
+        kptThresh: state.poseKptThresh,
+        mirror: true
+      });
+      updateCanonical(frame);
+      window.__poseCanonical = latestCanonical;
+    } catch (error) {
+      console.error('pose loop error:', error);
+      poseLoopActive = false;
+      posePipLabel.textContent = `pose err: ${error.message}`;
+    }
+  }
+}
+
+function stopPose() {
+  poseLoopActive = false;
+  if (poseProvider) {
+    poseProvider.stop();
+    poseProvider = null;
+  }
+  poseVideoEl.srcObject = null;
+  if (poseOverlayCtx) poseOverlayCtx.clearRect(0, 0, poseOverlayEl.width, poseOverlayEl.height);
+  posePipEl.hidden = true;
+  posePipLabel.textContent = 'pose: off';
+  latestCanonical = null;
+}
+
 function render(timestamp) {
   timer.update(timestamp);
   const delta = Math.min(timer.getDelta(), 0.05);
@@ -1228,21 +1489,28 @@ function render(timestamp) {
   const hz = armyBounds.halfZ;
   const coverage = armyBounds.radius + 10;
 
-  floorGlow.intensity = state.floorLightBase + Math.sin(elapsed * 1.7) * state.floorLightBase * 0.16;
-  floorGlow.position.x = bx + Math.sin(elapsed * 0.55) * hx;
-  floorGlow.position.z = bz + Math.cos(elapsed * 0.43) * hz;
-  floorGlow.distance = coverage;
-  backGlow.position.x = bx + Math.sin(elapsed * 0.4) * hx;
-  backGlow.position.z = bz - hz - 2;
-  backGlow.intensity = state.backLightBase;
-  backGlow.distance = coverage * 1.25;
-  sideGlow.position.x = bx + Math.cos(elapsed * 0.31) * hx;
-  sideGlow.position.z = bz + Math.sin(elapsed * 0.29) * hz;
-  sideGlow.distance = coverage;
-  heroSpot.position.x = bx + Math.sin(elapsed * 0.18) * hx;
+  // lightMotion=false zeroes the oscillation so lights freeze in place but stay
+  // lit; glowLights toggles the decorative point glows entirely.
+  const m = state.lightMotion ? 1 : 0;
+
+  floorGlow.visible = backGlow.visible = sideGlow.visible = state.glowLights;
+  if (state.glowLights) {
+    floorGlow.intensity = state.floorLightBase + Math.sin(elapsed * 1.7) * state.floorLightBase * 0.16 * m;
+    floorGlow.position.x = bx + Math.sin(elapsed * 0.55) * hx * m;
+    floorGlow.position.z = bz + Math.cos(elapsed * 0.43) * hz * m;
+    floorGlow.distance = coverage;
+    backGlow.position.x = bx + Math.sin(elapsed * 0.4) * hx * m;
+    backGlow.position.z = bz - hz - 2;
+    backGlow.intensity = state.backLightBase;
+    backGlow.distance = coverage * 1.25;
+    sideGlow.position.x = bx + Math.cos(elapsed * 0.31) * hx * m;
+    sideGlow.position.z = bz + Math.sin(elapsed * 0.29) * hz * m;
+    sideGlow.distance = coverage;
+  }
+  heroSpot.position.x = bx + Math.sin(elapsed * 0.18) * hx * m;
   heroSpot.position.y = 9 + armyBounds.radius * 0.35;
   heroSpot.position.z = bz + hz + 6;
-  heroSpot.target.position.x = bx + Math.sin(elapsed * 0.22) * hx * 0.5;
+  heroSpot.target.position.x = bx + Math.sin(elapsed * 0.22) * hx * 0.5 * m;
   heroSpot.target.position.z = bz;
   heroSpot.distance = Math.max(34, coverage * 2);
   heroSpot.angle = Math.min(Math.PI * 0.48, Math.PI * 0.3 + armyBounds.radius * 0.015);

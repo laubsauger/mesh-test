@@ -8,6 +8,11 @@
   <body>
     <div id="app">
       <canvas id="scene"></canvas>
+      <div id="pose-pip" class="pose-pip" hidden>
+        <video id="pose-video" class="pose-video" playsinline muted></video>
+        <canvas id="pose-overlay" class="pose-overlay"></canvas>
+        <div id="pose-pip-label" class="pose-pip-label">pose: off</div>
+      </div>
       <p id="status" class="status">Loading manifest...</p>
       <div id="preloader" class="preloader">
         <div class="preloader-panel">

@@ -48,6 +48,52 @@ body,
   backdrop-filter: blur(12px);
 }
 
+/* Pose PiP: webcam + 2D skeleton overlay, bottom-right. Selfie-mirrored video;
+   the overlay mirrors x in JS to match (drawOverlay { mirror:true }). */
+.pose-pip {
+  position: fixed;
+  left: 14px;
+  top: 14px;
+  z-index: 3;
+  width: 320px;
+  aspect-ratio: 16 / 9;
+  border: 1px solid rgb(56 255 240 / 0.3);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #02040a;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.5);
+}
+
+.pose-pip[hidden] {
+  display: none;
+}
+
+.pose-video,
+.pose-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.pose-video {
+  transform: scaleX(-1); /* selfie mirror */
+}
+
+.pose-pip-label {
+  position: absolute;
+  left: 6px;
+  top: 5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgb(2 4 10 / 0.6);
+  color: #7df9ee;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
 .preloader {
   position: fixed;
   inset: 0;

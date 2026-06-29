@@ -6,3 +6,7 @@ dist/
 # The shipped assets are the merged GLBs in public/models/ (committed).
 assets/bipeds/*.zip
 public/bipeds/
+
+# Pose ONNX models — large (rtmw3d ~369MB > GitHub 100MB limit), regenerable
+# from object-detect/export_onnx.py. Committed GLB characters (*.glb) stay.
+public/models/**/*.onnx
