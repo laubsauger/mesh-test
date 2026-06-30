@@ -48,15 +48,19 @@ function basisQuat(a1, a2, b1, b2, out) {
 // Singularity-safe smoothing of a persistent unit axis toward a new candidate.
 // `last.lerp(candidate).normalize()` SNAPS when candidate ≈ -last: the lerp
 // passes through ~zero magnitude and normalize() amplifies noise into a random
-// direction (the 90/180° flip). Guard it: hold the previous axis when the blend
-// collapses, instead of exploding. `lock` hemisphere-aligns candidate to last
-// first — correct for axes whose SIGN carries no meaning (bend-plane normals),
-// wrong for axes where sign IS the signal (facing/yaw → leave lock=false).
+// direction (the 90/180° flip). Mode picks the sign policy:
+//   'align' — SIGN-AGNOSTIC axis (bend-plane normals): hemisphere-align candidate
+//             (negate if backward) so it never collapses; sign is meaningless.
+//   'hold'  — SIGN-IS-THE-SIGNAL axis (body facing/yaw): a backward candidate is a
+//             monocular depth-sign FLIP, not a real turn. REJECT it (hold last) so
+//             noise can't sweep the body 180°. Only same-hemisphere candidates blend.
 const _blend = new THREE.Vector3();
-function smoothAxis(last, candidate, follow, lock) {
-  if (lock && candidate.dot(last) < 0) candidate.negate();
+function smoothAxis(last, candidate, follow, mode) {
+  const backward = candidate.dot(last) < 0;
+  if (mode === 'align' && backward) candidate.negate();
+  else if (mode === 'hold' && backward) return last; // depth-sign flip → hold facing
   _blend.copy(last).lerp(candidate, follow);
-  if (_blend.lengthSq() < 1e-4) return last; // collapsed (sign flip) → hold, no snap
+  if (_blend.lengthSq() < 1e-4) return last; // collapsed → hold, no snap
   return last.copy(_blend).normalize();
 }
 
@@ -275,7 +279,7 @@ export class Retargeter {
           last = _planeN.clone();
           this.lastPlaneN.set(limb.upper, last);
         } else {
-          smoothAxis(last, _planeN, opts.planeFollow, true); // bend-plane sign carries no info
+          smoothAxis(last, _planeN, opts.planeFollow, 'align'); // bend-plane sign carries no info
         }
         plane = last;
       } else {
@@ -319,7 +323,7 @@ export class Retargeter {
           _planeN.divideScalar(len);
           let last = this.lastPlaneN.get(fa.bone);
           if (!last) { last = _planeN.clone(); this.lastPlaneN.set(fa.bone, last); }
-          else smoothAxis(last, _planeN, opts.planeFollow, true); // forearm-roll plane sign carries no info
+          else smoothAxis(last, _planeN, opts.planeFollow, 'align'); // forearm-roll plane sign carries no info
           basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
           _q.multiply(bind.bindWorldQuat);
           this._setBoneFromWorld(fa.bone, bind, _q, opts.maxAngleDeg, opts.follow);
@@ -362,11 +366,17 @@ export class Retargeter {
         _planeN.divideScalar(len);
         let last = this.lastPlaneN.get('hips');
         if (!last) { last = _planeN.clone(); this.lastPlaneN.set('hips', last); }
-        else smoothAxis(last, _planeN, Math.max(opts.planeFollow, 0.3), false); // sign = facing; hold on flip, never snap
-        basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
-        _q.multiply(bind.bindWorldQuat);
-        this._setBoneFromWorld('hips', bind, _q, opts.maxAngleDeg, opts.follow);
-        return;
+        else smoothAxis(last, _planeN, Math.max(opts.planeFollow, 0.3), 'hold'); // sign = facing; reject depth-sign flips
+        // Degeneracy guard: if the (held) across axis is near-parallel to torso-up,
+        // basisQuat's orthogonalization is unstable → random/180° spin. Skip yaw and
+        // fall through to lean-only below (a defined no-yaw orientation, still slerp-
+        // smoothed by _setBoneFromWorld — no snap).
+        if (Math.abs(last.dot(_dir)) < 0.94) {
+          basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
+          _q.multiply(bind.bindWorldQuat);
+          this._setBoneFromWorld('hips', bind, _q, opts.maxAngleDeg, opts.follow);
+          return;
+        }
       }
     }
     _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat); // lean only
