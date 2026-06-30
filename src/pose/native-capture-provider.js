@@ -33,8 +33,8 @@ export class NativeCapturePoseProvider {
     };
     this.stats = { sent: 0, recv: 0, dropped: 0, stale: 0, timedOut: 0, sendHz: 0 };
     this.debug = false;
-    this._waiter = null; // resolve for an infer() awaiting the next push
-    this._fresh = false; // an unconsumed pushed frame is waiting
+    this._waiter = null; // resolve for an infer() awaiting the requested frame
+    this._waitTimer = null;
     this._lastPushAt = 0;
   }
 
@@ -105,17 +105,22 @@ export class NativeCapturePoseProvider {
     if (!on) { this.preview?.close?.(); this.preview = null; }
   }
 
-  // Resolve an awaiting infer() with the freshest frame; else mark one pending.
+  // Resolve the infer() waiting for the requested frame.
   _wake(frame) {
-    if (this._waiter) { const w = this._waiter; this._waiter = null; this._fresh = false; w(frame); }
-    else { this._fresh = true; }
+    if (this._waitTimer) { clearTimeout(this._waitTimer); this._waitTimer = null; }
+    const w = this._waiter; this._waiter = null; w?.(frame);
   }
 
-  // Push-driven: return the latest unconsumed frame, or await the next push.
+  // Browser-PACED pull: request one frame (the sidecar reads the freshest camera frame
+  // and pushes it), then await it. Strictly one-in-flight → the sidecar never floods
+  // the WS (the Windows disconnect bug). Timeout so a dead sidecar can't hang the loop.
   async infer() {
-    if (!this.running) return null;
-    if (this._fresh) { this._fresh = false; return this.latestFrame; }
-    return new Promise((resolve) => { this._waiter = resolve; });
+    if (!this.running || this.ws?.readyState !== WebSocket.OPEN) return null;
+    this.ws.send(JSON.stringify({ type: 'ready' }));
+    return new Promise((resolve) => {
+      this._waiter = resolve;
+      this._waitTimer = setTimeout(() => { if (this._waiter === resolve) { this.stats.timedOut += 1; this._waiter = null; resolve(null); } }, 2000);
+    });
   }
 
   stop() {

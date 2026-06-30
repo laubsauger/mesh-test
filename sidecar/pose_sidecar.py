@@ -317,6 +317,18 @@ class PosePipeline:
 ZERO_TIMINGS = {"detect": 0, "preprocess": 0, "inference": 0, "decode": 0, "total": 0}
 
 
+def select_box(boxes, last):
+    """Temporal person tracking: pick the confident box CLOSEST to last frame's box
+    (not just top score), so a transient background false-positive can't hijack the
+    crop for a frame → the periodic 'trash pose' pulse. Falls back to top score."""
+    if not boxes:
+        return None
+    if last is None:
+        return boxes[0]
+    lcx, lcy = last[0] + last[2] / 2, last[1] + last[3] / 2
+    return min(boxes, key=lambda b: (b[0] + b[2] / 2 - lcx) ** 2 + (b[1] + b[3] / 2 - lcy) ** 2)
+
+
 async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, preview_w):
     """BACKEND-OWNED capture: the sidecar opens the webcam ITSELF, runs det→crop→pose
     →decode natively, and PUSHES only keypoints to the browser. No camera frame ever
@@ -340,12 +352,15 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
     await ws.send(json.dumps({"type": "native", "ep": pipe.active_ep}))
 
     cfg = {"preview": preview, "thresh": thresh}
+    ready = asyncio.Event()  # browser-paced: one frame per request (one-in-flight, latest-wins)
 
-    async def reader():  # live config: toggle preview / kptThresh without a restart
+    async def reader():  # browser requests frames (ready) + toggles preview/kptThresh live
         try:
             async for m in ws:
                 if isinstance(m, str):
                     c = json.loads(m)
+                    if c.get("type") == "ready":
+                        ready.set()
                     if "preview" in c:
                         cfg["preview"] = bool(c["preview"])
                     if "kptThresh" in c:
@@ -354,35 +369,53 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
             pass
 
     reader_task = asyncio.create_task(reader())
+    last_box = None
     pushed = 0
     try:
         while True:
+            # Block until the browser asks for the next frame — NO flooding (the push
+            # path is now strictly one-in-flight, latest-wins; fixes the Windows WS
+            # backpressure disconnects where TRT pushed far faster than rAF consumed).
+            await ready.wait()
+            ready.clear()
             ok, bgr = await loop.run_in_executor(None, cap.read)
             if not ok:
+                ready.set()
                 await asyncio.sleep(0.005)
                 continue
             t0 = time.perf_counter()
-            rgb = np.ascontiguousarray(bgr[:, :, ::-1])  # BGR→RGB
+            rgb = np.ascontiguousarray(bgr[:, :, ::-1])  # BGR→RGB (latest frame, BUFFERSIZE=1)
             td = time.perf_counter()
             boxes = pipe.detect(rgb, cfg["thresh"])
             detect_ms = (time.perf_counter() - td) * 1000
-            frame, timings = pipe.infer(rgb, cfg["thresh"], boxes)
+            box = select_box(boxes, last_box)  # track the person → no transient-box trash
+            last_box = box
+            frame, timings = pipe.infer(rgb, cfg["thresh"], [box] if box else [])
             timings["detect"] = detect_ms
-            timings["frameW"] = int(rgb.shape[1])
-            timings["frameH"] = int(rgb.shape[0])
 
+            # Send ONLY THE CROP (the person bbox = exactly what rtmw sees), never the full
+            # webcam frame → far less data + the most useful debug view. keypoints2D are
+            # remapped to crop-relative px and frameW/H = the crop preview dims so the
+            # overlay aligns. The JPEG encode is skipped entirely when preview is OFF.
             jpg = None
             timings["previewEncode"] = 0.0
             timings["previewBytes"] = 0
-            if cfg["preview"]:
-                pe0 = time.perf_counter()
-                ph = max(1, int(preview_w * bgr.shape[0] / bgr.shape[1]))
-                small = cv2.resize(bgr, (preview_w, ph), interpolation=cv2.INTER_AREA)
-                okj, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                if okj:
-                    jpg = buf.tobytes()
-                    timings["previewEncode"] = (time.perf_counter() - pe0) * 1000
-                    timings["previewBytes"] = len(jpg)
+            ph = max(1, round(preview_w * pipe.res_h / pipe.res_w))  # crop aspect = model input aspect
+            timings["frameW"] = preview_w
+            timings["frameH"] = ph
+            if frame is not None and box is not None:
+                sx, sy, sw, sh = bbox_to_rect(box[:4], pipe.res_w, pipe.res_h)
+                for p in frame["keypoints2D"]:  # full-frame px → crop px
+                    p["x"] = (p["x"] - sx) / sw * preview_w
+                    p["y"] = (p["y"] - sy) / sh * ph
+                if cfg["preview"]:
+                    pe0 = time.perf_counter()
+                    crop_img = crop_affine(bgr, (sx, sy, sw, sh), preview_w, ph)  # BGR person crop
+                    okj, buf = cv2.imencode(".jpg", crop_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    if okj:
+                        jpg = buf.tobytes()
+                        timings["previewEncode"] = (time.perf_counter() - pe0) * 1000
+                        timings["previewBytes"] = len(jpg)
 
             timings["serverTotal"] = timings["total"] = (time.perf_counter() - t0) * 1000
             pushed += 1
@@ -403,6 +436,7 @@ async def handle(ws, pipe):
     thresh = 0.3
     frame_count = 0
     last_boxes = None
+    last_sel_box = None
     frame_errs = 0
     try:
         async for msg in ws:
@@ -436,7 +470,8 @@ async def handle(ws, pipe):
                 if every_n <= 1 or last_boxes is None or frame_count % every_n == 0:
                     last_boxes = pipe.detect(frame_rgb, thresh)
                 detect_ms = (time.perf_counter() - td) * 1000
-                frame, timings = pipe.infer(frame_rgb, thresh, last_boxes)
+                last_sel_box = select_box(last_boxes, last_sel_box)  # track person → kill transient-box trash
+                frame, timings = pipe.infer(frame_rgb, thresh, [last_sel_box] if last_sel_box else [])
                 timings["detect"] = detect_ms
                 timings["total"] += detect_ms
                 # serverDecode = numpy frame decode; serverTotal = whole handler (recv→
