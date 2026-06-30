@@ -69,6 +69,7 @@ export class Retargeter {
     this.smoothed = new Map(); // boneKey → persistent slerped local quat (T10·2)
     this.lastPlaneN = new Map(); // limb → last good bend-plane normal (pole stability)
     this.clampStats = new Map(); // V19: boneKey → { raw°, max°, clamped } last frame
+    this.clampPeak = new Map(); // V19: boneKey → worst { raw°, max°, over° } since reset
     this._captureBind();
   }
 
@@ -197,7 +198,15 @@ export class Retargeter {
       const clamped = angle > maxRad && angle > 1e-4;
       if (clamped) _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, maxRad / angle);
       // V19: how far this bone WANTED to rotate vs the cap it hit (deg).
-      this.clampStats.set(boneKey, { raw: angle / DEG2RAD, max: maxAngleDeg, clamped });
+      const rawDeg = angle / DEG2RAD;
+      this.clampStats.set(boneKey, { raw: rawDeg, max: maxAngleDeg, clamped });
+      // Peak-hold: the live per-frame value flickers too fast to read, so keep the
+      // worst overflow per bone until reset — a momentary face-touch stays legible.
+      if (clamped) {
+        const p = this.clampPeak.get(boneKey);
+        const over = rawDeg - maxAngleDeg;
+        if (!p || over > p.over) this.clampPeak.set(boneKey, { raw: rawDeg, max: maxAngleDeg, over });
+      }
     }
 
     let cur = this.smoothed.get(boneKey);
@@ -210,16 +219,16 @@ export class Retargeter {
     bone.updateWorldMatrix(false, false);
   }
 
-  // V19: bones whose target rotation was throttled by the joint-limit clamp this
-  // frame, worst overflow first. Row: { bone, raw°, max°, over° }.
+  // V19: peak-held clamp overflow per bone since last reset, worst first. Row:
+  // { bone, raw°, max°, over° }. Peak-held so a brief gesture stays readable.
   clampReport() {
     const rows = [];
-    for (const [bone, s] of this.clampStats) {
-      if (s.clamped) rows.push({ bone, raw: s.raw, max: s.max, over: s.raw - s.max });
-    }
+    for (const [bone, s] of this.clampPeak) rows.push({ bone, raw: s.raw, max: s.max, over: s.over });
     rows.sort((a, b) => b.over - a.over);
     return rows;
   }
+
+  resetClampPeak() { this.clampPeak.clear(); }
 
   // Direction-only (swing) aim. from/to: {x,y,z,confidence}.
   _aim(boneKey, from, to, opts) {
@@ -431,11 +440,10 @@ export class Retargeter {
       _childW.setFromMatrixPosition(this.rig.rightFoot.matrixWorld);
       const lowestFootY = Math.min(_boneW.y, _childW.y);
       const targetDelta = this.restFootMinY - lowestFootY; // + to lift body so foot sits on floor
-      this.groundOffsetY += (targetDelta - this.groundOffsetY) * groundFollow; // smooth the bob
-      // Hard floor invariant: lowest foot may never sink below rest floor. The EMA
-      // lags on the lift direction (foot dropped → needs raising NOW) → clamp up so
-      // lifting is instant; lowering (squat, offset > target) stays smoothed.
-      if (this.groundOffsetY < targetDelta) this.groundOffsetY = targetDelta;
+      // Symmetric low-pass both directions. (An earlier asymmetric "instant lift"
+      // clamp guaranteed no floor-clip but turned monocular foot-Y noise into a
+      // sawtooth bob — the cure was worse. Smooth evenly; tune via groundFollow.)
+      this.groundOffsetY += (targetDelta - this.groundOffsetY) * groundFollow;
       this.rig.hips.position.y = this.hipsRestPosY + this.groundOffsetY / this.hipsParentScaleY; // world→local
     } else {
       this.groundOffsetY = 0;

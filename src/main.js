@@ -316,9 +316,10 @@ const state = {
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
   poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS
   poseSidecarDebug: false, // sidecar: console per-frame timing/flow trace
-  poseSendMaxSide: 1280, // sidecar: longest edge shipped over the wire. Default = webcam res
-  // (no downscale) so the sidecar's detect+crop match the WORKER's full-res input → identical
-  // pose quality. Lower it only to trade pose quality for wire bandwidth (loopback rarely needs it).
+  poseSendMaxSide: 640, // sidecar: longest edge shipped over the wire. The models only need
+  // yolo@320 + a 384×288 crop, so full-res (1280 = 3.6MB/frame) just bloats readback+transport
+  // (~19ms + ~27ms) for no accuracy gain. 640 = 0.9MB → ~4× less data. Bump if a DISTANT
+  // subject's crop gets too soft; watch Readback + Transport in Pose Stats for the sweet spot.
   poseRtmwVariant: 'l', // rtmw3d size: l(faster, 219MB) | x(largest, 352MB). Both 3D, 384×288, 3-axis.
   // NOTE: rtmw3d only ships as l and x — there is NO 3D "m" (the "m" upstream is 2D rtmw, no depth).
   poseYoloRes: 320, // yolo detector input res: 320/384/512 (files committed)
@@ -398,6 +399,15 @@ const state = {
   calibratePose() {
     calibPhase = 'ready';
     calibPhaseStart = performance.now();
+  },
+  // V19: dump the peak-held joint-limit clamp overflow (worst since last reset) as
+  // a copyable console table, then reset peaks so the next gesture starts clean.
+  dumpClamps() {
+    if (!lastPoseRetargeter) { console.warn('[clamp] no pose retargeter active'); return; }
+    const rows = lastPoseRetargeter.clampReport();
+    if (!rows.length) { console.log('[clamp] nothing clamped since reset'); }
+    else console.table(rows.map((r) => ({ bone: r.bone, 'wanted°': Math.round(r.raw), 'cap°': r.max, 'over°': Math.round(r.over) })));
+    lastPoseRetargeter.resetClampPeak();
   },
   savePoseRecording() {
     if (!poseRecorder.length) { statusEl.textContent = 'Nothing recorded.'; return; }
@@ -641,9 +651,10 @@ function buildInspectorControls() {
     // the chosen backend (onnxruntime-web worker vs the native TRT/CUDA sidecar).
     if (poseProvider) { stopPose(); if (state.poseEnabled) startPose(); }
   });
-  // NOT a model resolution — this is the downscaled webcam frame shipped over the
-  // wire to the sidecar (transport only; it letterboxes→yolo and crops→rtmw from it).
-  poseGroup.add(state, 'poseSendMaxSide', 256, 1280, 32).name('Sidecar Wire Frame px').onChange((v) => {
+  // NOT a model resolution — the downscaled webcam frame shipped to the sidecar
+  // (transport only; it letterboxes→yolo@≤640 and crops→rtmw 384×288 from it). Nothing
+  // consumes >640, so the slider caps there +headroom (768) for distant subjects only.
+  poseGroup.add(state, 'poseSendMaxSide', 320, 768, 32).name('Sidecar Wire Frame px').onChange((v) => {
     if (poseProvider instanceof SidecarPoseProvider) poseProvider.sendMaxSide = Math.round(v);
   });
   poseGroup.add(state, 'poseSidecarDebug').name('Sidecar Debug (console)').onChange((on) => {
@@ -678,6 +689,7 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseMaxJump', 0.1, 1.5, 0.01).name('Max Jump');
   poseGroup.add(state, 'poseHoldMs', 200, 6000, 50).name('Hold Last (ms)');
   poseGroup.add(state, 'calibratePose').name('Calibrate (hold A-pose)');
+  poseGroup.add(state, 'dumpClamps').name('Dump Clamps → console');
   poseGroup.add(state, 'poseBoneGate').name('Bone-Length Gate').listen();
   poseGroup.add(state, 'poseGrounding').name('Grounding (feet)').listen();
   poseGroup.add(state, 'poseGroundFollow', 0.05, 1, 0.01).name('Ground Smooth');
@@ -1511,7 +1523,9 @@ function computePoseMatrices(batch) {
         yawGain: state.poseYawGain
       });
       // V19: surface which bones the joint-limit clamp throttled (e.g. face-touch
-      // → forearm wanted 148° capped 110°). Top 3 by overflow into the HUD.
+      // → forearm wanted 148° capped 110°). Peak-held top 3 into the HUD (stable);
+      // 'Dump Clamps' button prints the full table + resets.
+      lastPoseRetargeter = batch.retargeter;
       const rep = batch.retargeter.clampReport();
       poseStats.clamp = rep.length
         ? rep.slice(0, 3).map((r) => `${r.bone} ${Math.round(r.raw)}→${r.max}`).join('  ')
@@ -1640,6 +1654,7 @@ let poseLoopActive = false;
 let poseLoopId = 0; // generation guard — only the latest loop runs (no stacking)
 let latestCanonical = null;
 let lastGoodPoseAt = 0;
+let lastPoseRetargeter = null; // V19: active pose retargeter, for the clamp dump button
 const poseSmoother = new CanonicalSmoother(NUM_KPTS, {
   minCutoff: 2,
   beta: 0.02

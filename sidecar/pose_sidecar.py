@@ -80,6 +80,32 @@ def select_providers(ep):
     return [want, "CPUExecutionProvider"] if want != "CPUExecutionProvider" else [want]
 
 
+TRT_CACHE = REPO / "sidecar" / ".trt-cache"
+
+
+def trt_options():
+    """TensorRT EP options. Engine cache = the SLOW first-run engine build is saved
+    to disk and reused (otherwise every launch rebuilds → looks 'stuck' for minutes).
+    fp16 = ~2x faster on the 4090's tensor cores (rtmw3d tolerates it well)."""
+    TRT_CACHE.mkdir(parents=True, exist_ok=True)
+    return {
+        "trt_engine_cache_enable": True,
+        "trt_engine_cache_path": str(TRT_CACHE),
+        "trt_timing_cache_enable": True,
+        "trt_fp16_enable": True,
+    }
+
+
+def providers_for(ep):
+    """EP name → ORT providers list (with options). TRT gets engine caching + fp16,
+    and falls back to CUDA (not CPU) for any ops TensorRT can't take."""
+    if ep == "TensorrtExecutionProvider":
+        return [(ep, trt_options()), "CUDAExecutionProvider", "CPUExecutionProvider"]
+    if ep == "CPUExecutionProvider":
+        return [ep]
+    return [ep, "CPUExecutionProvider"]
+
+
 def probe_ep(test_path, candidates):
     """Return the first GPU EP that ACTUALLY activates, probed on the small yolo
     model. Why not just pass the whole ordered list to InferenceSession? ORT has a
@@ -91,9 +117,12 @@ def probe_ep(test_path, candidates):
         if ep == "CPUExecutionProvider":
             return "CPUExecutionProvider"
         try:
+            if ep == "TensorrtExecutionProvider":
+                print("[sidecar] probing TensorRT — building/loading engine (FIRST run can take "
+                      "several MINUTES, not frozen; cached to .trt-cache after)…", flush=True)
             so = ort.SessionOptions()
             so.log_severity_level = 3
-            s = ort.InferenceSession(str(test_path), sess_options=so, providers=[ep, "CPUExecutionProvider"])
+            s = ort.InferenceSession(str(test_path), sess_options=so, providers=providers_for(ep))
             active = s.get_providers()[0]
             if active == ep:
                 return ep
@@ -392,12 +421,15 @@ async def main():
     # AUTO: probe each candidate (on the small yolo model) and pin the one that
     # actually activates — so a broken/absent TensorRT can't drag us to CPU past a
     # working CUDA EP (ORT's TRT-fail→CPU quirk). Explicit --ep stays strict.
+    winner = probe_ep(yolo_path(args.yolo_res), providers) if args.ep == "auto" else providers[0]
     if args.ep == "auto":
-        winner = probe_ep(yolo_path(args.yolo_res), providers)
-        providers = [winner] if winner == "CPUExecutionProvider" else [winner, "CPUExecutionProvider"]
         print(f"[sidecar] auto-EP probe → {winner}")
+    providers = providers_for(winner)  # TRT gets engine-cache + fp16 options
+    if winner == "TensorrtExecutionProvider":
+        print(f"[sidecar] building TensorRT engine for rtmw3d-{args.rtmw_variant} — FIRST run takes "
+              f"MINUTES (cached to {TRT_CACHE.name}/, instant after). Not frozen…", flush=True)
     rtmw_out = tuple(args.rtmw_out.split(",")) if args.rtmw_out else None
-    print(f"[sidecar] requested EP={args.ep} variant={args.rtmw_variant} yolo={args.yolo_res} → providers {providers}")
+    print(f"[sidecar] requested EP={args.ep} variant={args.rtmw_variant} yolo={args.yolo_res} → providers {[p[0] if isinstance(p, tuple) else p for p in providers]}")
     pipe = PosePipeline(providers, variant=args.rtmw_variant, yolo_res=args.yolo_res,
                         rtmw_out=rtmw_out, allow_cpu=(args.allow_cpu or args.ep == "cpu"))
 

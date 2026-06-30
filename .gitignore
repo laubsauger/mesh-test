@@ -4,6 +4,7 @@ dist/
 
 # uv-managed sidecar virtualenv + caches — never global, never committed.
 sidecar/.venv/
+sidecar/.trt-cache/
 **/__pycache__/
 
 # Source archives + unzipped intermediates — large, regenerable, never deployed.
