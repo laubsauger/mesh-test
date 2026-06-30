@@ -201,11 +201,14 @@ class PosePipeline:
             if registered_gpu:
                 raise SystemExit(
                     f"[sidecar] GPU EP(s) {registered_gpu} are registered but FAILED to load → ORT fell back to "
-                    "CPU. Almost always the CUDA/cuDNN/TensorRT runtime libs (e.g. cublas64_*.dll) aren't found.\n"
-                    "  Fix (keeps it in the uv venv, no global install):\n"
-                    "    npm run sidecar:cuda        # pulls nvidia-* + tensorrt wheels into .venv; sidecar preloads them\n"
-                    "  Or install CUDA 13.x + cuDNN 9.x (+ TensorRT for --ep trt) system-wide and put them on PATH.\n"
-                    "  Or run on CPU anyway:  npm run sidecar -- --allow-cpu")
+                    "CPU. The CUDA/cuDNN runtime libs (e.g. cublas64_*.dll) aren't loaded.\n"
+                    "  The pyproject now pins onnxruntime-gpu[cuda,cudnn] on the CUDA-12 line, which pulls the\n"
+                    "  matching nvidia wheels INTO the venv. If you're seeing this, your venv is STALE (built\n"
+                    "  before that change) — force a clean re-resolve:\n"
+                    "    rmdir /s /q sidecar\\.venv   (Windows)   |   rm -rf sidecar/.venv   (Linux)\n"
+                    "    npm run sidecar              # CUDA EP\n"
+                    "    npm run sidecar:cuda         # + TensorRT EP\n"
+                    "  Last resort — system CUDA 12 + cuDNN 9 on PATH, or run CPU: npm run sidecar -- --allow-cpu")
             raise SystemExit(
                 "[sidecar] no GPU EP available on this box (only CPU). Pass --allow-cpu to run on CPU, "
                 "or install onnxruntime-gpu (nvidia) / use Mac CoreML.")

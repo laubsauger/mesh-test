@@ -7,45 +7,29 @@ dependencies = [
     "numpy>=1.26",
     "opencv-python-headless>=4.9",
     "websockets>=12",
-    # Platform-split: the 4090 box (Linux/Windows) gets onnxruntime-gpu, which
-    # carries the CUDA + TensorRT EPs. This Mac dev box gets plain onnxruntime
-    # (CPU/CoreML) for protocol smoke-testing — TRT numbers come from the 4090 box.
-    "onnxruntime-gpu>=1.18 ; platform_system != 'Darwin'",
+    # GPU box (Linux/Windows): onnxruntime-gpu with the `[cuda,cudnn]` EXTRA — ORT
+    # declares + pulls its OWN matching CUDA + cuDNN nvidia wheels into the venv (no
+    # global install, no guessing package names). Pinned to the CUDA-12 line (the
+    # OFFICIALLY tested config: CUDA 12.x + cuDNN 9, default on PyPI since 1.19) —
+    # the cu13 builds (>=1.23) have broken/inconsistent nvidia pip packaging.
+    # ⇒ plain `npm run sidecar` gives the CUDA EP on the GPU box. `sidecar:cuda` adds
+    #   TensorRT on top (the `trt` extra). preload_dlls() loads them from site-packages.
+    "onnxruntime-gpu[cuda,cudnn]>=1.20,<1.23 ; platform_system != 'Darwin'",
+    # Mac dev box: plain onnxruntime (CPU/CoreML) for protocol work.
     "onnxruntime>=1.18 ; platform_system == 'Darwin'",
 ]
 
-# CUDA/cuDNN/TensorRT runtime as pip wheels INTO the uv venv (no global install),
-# so onnxruntime-gpu finds them via ort.preload_dlls(). Enable with:
-#   npm run sidecar:cuda     (= uv run --extra cuda ...)
-#
-# We install ONLY `tensorrt-cu13`, which transitively pulls a COHERENT CUDA-13 set
-# (cudart/cublas/cudnn) with Windows wheels — instead of us pinning each nvidia lib
-# (their PyPI naming is wildly inconsistent: cufft wants unsuffixed, cudnn-unsuffixed
-# is an ancient Linux-only stub, etc.). This covers the TensorRT EP (--ep trt) and
-# the cublas/cudnn that the CUDA EP also needs.
-#
-# If this still mismatches your onnxruntime-gpu build, the RELIABLE path is a
-# system install of CUDA 13.x + cuDNN 9.x + TensorRT on PATH — then plain
-# `npm run sidecar` works (preload finds them). See the sidecar's refusal message.
 [project.optional-dependencies]
-# Explicit nvidia runtime libs matching the DLL versions onnxruntime-gpu (cu13) asks
-# for: cublas64_13/cublasLt64_13, cudart64_13, cudnn64_9, cufft64_12. The `-cu13`
-# wheels install on Windows EXCEPT cufft (whose `-cu13` is deprecated → unsuffixed).
-# tensorrt-cu13 alone does NOT pull these. If this STILL fails on some package's
-# Windows wheel, use the system install instead (CUDA 13 + cuDNN 9 + TensorRT on
-# PATH) — that's the reliable path; plain `npm run sidecar` then finds them.
-cuda = [
-    "nvidia-cuda-runtime-cu13 ; platform_system != 'Darwin'",
-    "nvidia-cublas-cu13 ; platform_system != 'Darwin'",
-    "nvidia-cudnn-cu13 ; platform_system != 'Darwin'",
-    "nvidia-curand-cu13 ; platform_system != 'Darwin'",
-    "nvidia-cufft ; platform_system != 'Darwin'",
-    "tensorrt-cu13 ; platform_system != 'Darwin'",
+# TensorRT EP on top of the CUDA base. `tensorrt-cu12` matches the CUDA-12 ORT build
+# above and pulls TensorRT 10.x + its CUDA deps. Enable with `npm run sidecar:cuda`.
+# (CUDA EP alone — base install — already gives full GPU; TRT is the extra speedup.)
+trt = [
+    "tensorrt-cu12 ; platform_system != 'Darwin'",
 ]
 
 # Managed entirely by uv — `uv run` creates/locks .venv/ here, never touches global.
 #   cd sidecar && uv run python pose_sidecar.py          (or: npm run sidecar)
 [tool.uv]
 package = false
-# tensorrt / some nvidia wheels live on NVIDIA's index, not plain PyPI.
+# TensorRT wheels live on NVIDIA's index, not plain PyPI.
 extra-index-url = ["https://pypi.nvidia.com"]

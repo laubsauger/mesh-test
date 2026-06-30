@@ -701,6 +701,7 @@ function buildInspectorControls() {
   poseStatsGroup.add(poseStats, 'frames').name('Frames sent/recv').listen();
   poseStatsGroup.add(poseStats, 'overlayMs').name('Overlay Draw').listen();
   poseStatsGroup.add(poseStats, 'retargetMs').name('Retarget/frame').listen();
+  poseStatsGroup.add(poseStats, 'clamp').name('Clamp (want→cap)').listen();
   poseGroup.add(state, 'poseRecording').name('Record').listen().onChange((on) => {
     if (on) {
       poseRecorder.start({
@@ -1509,6 +1510,12 @@ function computePoseMatrices(batch) {
         bodyYaw: state.poseBodyYaw,
         yawGain: state.poseYawGain
       });
+      // V19: surface which bones the joint-limit clamp throttled (e.g. face-touch
+      // → forearm wanted 148° capped 110°). Top 3 by overflow into the HUD.
+      const rep = batch.retargeter.clampReport();
+      poseStats.clamp = rep.length
+        ? rep.slice(0, 3).map((r) => `${r.bone} ${Math.round(r.raw)}→${r.max}`).join('  ')
+        : 'none';
     } else {
       batch.retargeter.restPose();
     }
@@ -1657,7 +1664,8 @@ const poseStats = {
   wireMs: 0, // alias of transport
   frames: '—', // sidecar flow counters: sent/recv drop/stale/timeout @ Hz
   overlayMs: 0,
-  retargetMs: 0
+  retargetMs: 0,
+  clamp: '—' // V19: bones the joint-limit clamp throttled this frame (wanted°→cap°)
 };
 const ema = (prev, next, a = 0.2) => prev + a * (next - prev);
 
@@ -1715,12 +1723,19 @@ function boneLengthBad(canon) {
 
 // Outlier reject (§14): did a core joint teleport vs the last accepted frame?
 let lastAcceptedRaw = null;
+let lastAcceptedAt = 0;
 let consecutiveRejects = 0;
 const MAX_REJECTS = 6; // after this many, accept (genuine fast motion, not a glitch)
 
-function coreJumped(raw) {
+function coreJumped(raw, now) {
   if (!lastAcceptedRaw) return false;
-  const max2 = state.poseMaxJump * state.poseMaxJump;
+  // VELOCITY-based, not per-frame displacement: scale the jump budget by elapsed
+  // time so a low pose-fps backend (sidecar at ~7fps) doesn't false-reject normal
+  // motion (big between sparse frames) → that was the periodic "glitch". 33ms ≈ the
+  // 30fps reference at which poseMaxJump was tuned; clamp so a long stall still gates.
+  const dt = lastAcceptedAt ? Math.max(16, now - lastAcceptedAt) : 33;
+  const budget = state.poseMaxJump * Math.min(6, dt / 33);
+  const max2 = budget * budget;
   for (const i of POSE_CORE_JOINTS) {
     const a = raw.joints[i];
     const b = lastAcceptedRaw.joints[i];
@@ -1742,13 +1757,14 @@ function updateCanonical(frame) {
     // joints' confidence in the retargeter; un-tracked regions rest, tracked drive.
     // Reject before smooth (§54): a sudden teleport OR an implausible bone length
     // is an outlier → hold the last good pose (unless it persists = real motion).
-    const outlier = coreJumped(raw) || (state.poseBoneGate && boneLengthBad(raw));
+    const outlier = coreJumped(raw, now) || (state.poseBoneGate && boneLengthBad(raw));
     if (state.poseRejectOutliers && outlier && consecutiveRejects < MAX_REJECTS) {
       consecutiveRejects += 1;
       return;
     }
     consecutiveRejects = 0;
     lastAcceptedRaw = raw;
+    lastAcceptedAt = now;
     let canon = raw;
     if (state.poseSmoothing) {
       poseSmoother.setParams({ minCutoff: state.poseSmoothMinCutoff, beta: state.poseSmoothBeta });

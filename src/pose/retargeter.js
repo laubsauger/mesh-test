@@ -68,6 +68,7 @@ export class Retargeter {
     this.bind = new Map(); // boneKey → { restDirWorld, bindWorldQuat, restLocalQuat, bindPlaneN? }
     this.smoothed = new Map(); // boneKey → persistent slerped local quat (T10·2)
     this.lastPlaneN = new Map(); // limb → last good bend-plane normal (pole stability)
+    this.clampStats = new Map(); // V19: boneKey → { raw°, max°, clamped } last frame
     this._captureBind();
   }
 
@@ -193,7 +194,10 @@ export class Retargeter {
       _qDelta.copy(bind.restLocalQuat).invert().multiply(_qLocal);
       const angle = 2 * Math.acos(Math.min(1, Math.abs(_qDelta.w)));
       const maxRad = maxAngleDeg * DEG2RAD;
-      if (angle > maxRad && angle > 1e-4) _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, maxRad / angle);
+      const clamped = angle > maxRad && angle > 1e-4;
+      if (clamped) _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, maxRad / angle);
+      // V19: how far this bone WANTED to rotate vs the cap it hit (deg).
+      this.clampStats.set(boneKey, { raw: angle / DEG2RAD, max: maxAngleDeg, clamped });
     }
 
     let cur = this.smoothed.get(boneKey);
@@ -204,6 +208,17 @@ export class Retargeter {
     cur.slerp(_qLocal, follow >= 1 ? 1 : follow);
     bone.quaternion.copy(cur);
     bone.updateWorldMatrix(false, false);
+  }
+
+  // V19: bones whose target rotation was throttled by the joint-limit clamp this
+  // frame, worst overflow first. Row: { bone, raw°, max°, over° }.
+  clampReport() {
+    const rows = [];
+    for (const [bone, s] of this.clampStats) {
+      if (s.clamped) rows.push({ bone, raw: s.raw, max: s.max, over: s.raw - s.max });
+    }
+    rows.sort((a, b) => b.over - a.over);
+    return rows;
   }
 
   // Direction-only (swing) aim. from/to: {x,y,z,confidence}.
@@ -381,6 +396,7 @@ export class Retargeter {
   apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, yawGain = 2.5 } = {}) {
     this.restPose();
     this.rig.hips.position.y = this.hipsRestPosY; // reset (restPose only touches rotations)
+    this.clampStats.clear(); // V19: only THIS frame's aimed bones report clamps
     const base = { kptThresh, mirrorX, follow, maxAngleDeg: jointLimitDeg, swingTwist, planeFollow };
 
     // Pelvis rotation (leans whole body); upper limbs next (children compensate);
