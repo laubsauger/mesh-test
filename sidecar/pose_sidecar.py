@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import struct
+import sys
 import time
 from pathlib import Path
 
@@ -83,22 +84,34 @@ def select_providers(ep):
 TRT_CACHE = REPO / "sidecar" / ".trt-cache"
 
 
+FP16 = True  # set from --no-fp16; fp16 flips SimCC argmax on uncertain frames → trash pulse
+
+
 def trt_options():
     """TensorRT EP options. Engine cache = the SLOW first-run engine build is saved
     to disk and reused (otherwise every launch rebuilds → looks 'stuck' for minutes).
-    fp16 = ~2x faster on the 4090's tensor cores (rtmw3d tolerates it well)."""
+    fp16 = ~2x faster on the 4090's tensor cores BUT lower precision can flip the SimCC
+    argmax on low-confidence frames → the intermittent trash (the worker runs fp32).
+    Disable with --no-fp16 to test. NOTE: a TRT engine is cached per precision, so the
+    first --no-fp16 run rebuilds (minutes)."""
     TRT_CACHE.mkdir(parents=True, exist_ok=True)
     return {
         "trt_engine_cache_enable": True,
         "trt_engine_cache_path": str(TRT_CACHE),
         "trt_timing_cache_enable": True,
-        "trt_fp16_enable": True,
+        "trt_fp16_enable": FP16,
     }
 
 
+COREML_UNITS = "CPUAndGPU"  # set from --coreml-units. Excludes the ANE by default — its
+# reduced precision flips SimCC argmax on this model → the Mac-only trash pulse.
+
+
 def providers_for(ep):
-    """EP name → ORT providers list (with options). TRT gets engine caching + fp16,
-    and falls back to CUDA (not CPU) for any ops TensorRT can't take."""
+    """EP name → ORT providers list (with options). TRT gets engine caching + fp16;
+    CoreML gets MLComputeUnits (default CPU+GPU, no ANE → fixes the Mac trash)."""
+    if ep == "CoreMLExecutionProvider":
+        return [(ep, {"MLComputeUnits": COREML_UNITS}), "CPUExecutionProvider"]
     if ep == "TensorrtExecutionProvider":
         opts = trt_options()
         n = len([f for f in TRT_CACHE.glob("*") if f.is_file()]) if TRT_CACHE.exists() else 0
@@ -317,6 +330,37 @@ class PosePipeline:
 ZERO_TIMINGS = {"detect": 0, "preprocess": 0, "inference": 0, "decode": 0, "total": 0}
 
 
+def pose_conf(frame):
+    """Mean SimCC peak (=confidence) over the 17 COCO body joints. LOW = the model is
+    uncertain → the crop it was fed is bad (wrong/partial person box). The proof lever:
+    if trash frames show LOW conf, it's the detection/crop; if HIGH conf but wrong, it's
+    decode. (score = 0.5*(xPeak+yPeak), same metric as decode3d.)"""
+    if not frame:
+        return 0.0
+    body = frame["keypoints3D"][:17]
+    return sum(p["confidence"] for p in body) / max(1, len(body))
+
+
+_diag = {"n": 0}
+
+
+def annotate(timings, frame, box):
+    timings["poseConf"] = round(pose_conf(frame), 3)
+    timings["box"] = [round(box[0]), round(box[1]), round(box[2]), round(box[3]), round(box[4], 2)] if box else None
+    # k3d spread: a SANE body ~ x∈[0,1.5] y∈[0,2] (span ~2). Wildly off span OR collapsed
+    # span = the model output is garbage. Logged server-side so the trash is visible in
+    # the sidecar console (watch poseConf + span dip when the visual trash pulses).
+    span = 0.0
+    if frame:
+        xs = [p["x"] for p in frame["keypoints3D"][:23]]
+        ys = [p["y"] for p in frame["keypoints3D"][:23]]
+        span = round(max(max(xs) - min(xs), max(ys) - min(ys)), 2)
+    timings["kpSpan"] = span
+    _diag["n"] += 1
+    if _diag["n"] % 15 == 0:  # ~twice/sec — frequent enough to catch the ~1Hz pulse
+        print(f"[sidecar] f{_diag['n']} conf={timings['poseConf']} span={span} box={timings['box']}")
+
+
 def select_box(boxes, last):
     """Temporal person tracking: pick the confident box CLOSEST to last frame's box
     (not just top score), so a transient background false-positive can't hijack the
@@ -337,7 +381,10 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
     Optional: a LOW-RES JPEG preview (so the frontend's debug overlay isn't blind) is
     encoded + pushed as a separate binary message — toggleable live, instrumented."""
     loop = asyncio.get_event_loop()
-    cap = await loop.run_in_executor(None, lambda: cv2.VideoCapture(device))
+    # Windows: force DirectShow. The default MSMF backend frequently opens the cam but
+    # delivers BLACK frames (→ yolo detects nothing → endless frame:null, no error).
+    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+    cap = await loop.run_in_executor(None, lambda: cv2.VideoCapture(device, backend))
     if not cap.isOpened():
         await ws.send(json.dumps({"type": "error",
                                   "message": f"sidecar can't open camera {device} — in use by the browser/another app? "
@@ -371,6 +418,8 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
     reader_task = asyncio.create_task(reader())
     last_box = None
     pushed = 0
+    logged_first = False
+    no_det = 0
     try:
         while True:
             # Block until the browser asks for the next frame — NO flooding (the push
@@ -383,15 +432,28 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
                 ready.set()
                 await asyncio.sleep(0.005)
                 continue
+            if not logged_first:
+                logged_first = True
+                m = float(bgr.mean())
+                print(f"[sidecar] first camera frame {bgr.shape} mean={m:.1f}"
+                      + ("  ⚠ NEAR-BLACK → camera not delivering pixels (wrong device/backend, or held by the browser)" if m < 5 else " (looks live)"))
             t0 = time.perf_counter()
             rgb = np.ascontiguousarray(bgr[:, :, ::-1])  # BGR→RGB (latest frame, BUFFERSIZE=1)
             td = time.perf_counter()
             boxes = pipe.detect(rgb, cfg["thresh"])
             detect_ms = (time.perf_counter() - td) * 1000
+            if boxes:
+                no_det = 0
+            else:
+                no_det += 1
+                if no_det == 30:
+                    print(f"[sidecar] 30 frames, NO person detected (frame mean={float(bgr.mean()):.1f}) — "
+                          "black camera, or person out of view, or kptThresh too high")
             box = select_box(boxes, last_box)  # track the person → no transient-box trash
             last_box = box
             frame, timings = pipe.infer(rgb, cfg["thresh"], [box] if box else [])
             timings["detect"] = detect_ms
+            annotate(timings, frame, box)  # box + poseConf → flows to the browser debug trace
 
             # Send ONLY THE CROP (the person bbox = exactly what rtmw sees), never the full
             # webcam frame → far less data + the most useful debug view. keypoints2D are
@@ -474,6 +536,8 @@ async def handle(ws, pipe):
                 frame, timings = pipe.infer(frame_rgb, thresh, [last_sel_box] if last_sel_box else [])
                 timings["detect"] = detect_ms
                 timings["total"] += detect_ms
+                timings["boxN"] = len(last_boxes) if last_boxes else 0  # how many people yolo saw
+                annotate(timings, frame, last_sel_box)  # box + poseConf → browser debug trace
                 # serverDecode = numpy frame decode; serverTotal = whole handler (recv→
                 # reply-build) so the browser can split round-trip into server vs wire.
                 timings["serverDecode"] = (td - t_recv) * 1000
@@ -537,9 +601,16 @@ async def main():
     ap.add_argument("--rtmw-variant", choices=["l", "x"], default="l", help="rtmw3d 3D size: l=faster(219MB), x=largest(352MB)")
     ap.add_argument("--yolo-res", type=int, choices=[320, 384, 512], default=320)
     ap.add_argument("--allow-cpu", action="store_true", help="permit CPU fallback instead of refusing")
+    ap.add_argument("--no-fp16", action="store_true", help="TRT: fp32 engine (Windows is fine on fp16; rarely needed)")
+    ap.add_argument("--coreml-units", choices=["CPUAndGPU", "ALL", "CPUAndNeuralEngine", "CPUOnly"],
+                    default="CPUAndGPU", help="Mac CoreML compute units. Default excludes the ANE (fixes the trash); ALL = old behaviour")
     ap.add_argument("--rtmw-out", help="comma-sep X,Y,Z output names (else auto-read from the model)")
     args = ap.parse_args()
 
+    global FP16, COREML_UNITS
+    FP16 = not args.no_fp16
+    COREML_UNITS = args.coreml_units
+    print(f"[sidecar] TRT fp16={FP16} | CoreML units={COREML_UNITS}")
     ort.set_default_logger_severity(3)  # hide WARNING-level EP partition spam (errors still print)
     preload_gpu_dlls()
     providers = select_providers(args.ep)

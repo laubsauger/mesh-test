@@ -89,7 +89,7 @@ export class SidecarPoseProvider {
       if (msg.frame) this.stats.recv += 1; else this.stats.dropped += 1;
       if (this.debug) {
         const t = msg.timings;
-        console.log(`[sidecar] f#${this.stats.sent} ${msg.frame ? 'pose' : 'NULL'} ${this.readback} | capture ${t.capture.toFixed(1)} readback ${t.readback.toFixed(1)} → wire ${t.transport.toFixed(1)} → server ${t.serverTotal.toFixed(1)} (decode ${t.serverDecode.toFixed(1)} det ${t.detect.toFixed(1)} inf ${t.inference.toFixed(1)}) | round ${t.round.toFixed(1)}ms | ${(t.bytes / 1024) | 0}KB | sent ${this.stats.sent} recv ${this.stats.recv} drop ${this.stats.dropped} stale ${this.stats.stale} TO ${this.stats.timedOut}`);
+        console.log(`[sidecar] f#${this.stats.sent} ${msg.frame ? 'pose' : 'NULL'} | conf ${t.poseConf ?? '-'} boxN ${t.boxN ?? '-'} box ${JSON.stringify(t.box ?? null)} | det ${t.detect.toFixed(1)} inf ${t.inference.toFixed(1)} | round ${t.round.toFixed(1)}ms | sent ${this.stats.sent} recv ${this.stats.recv} drop ${this.stats.dropped}`);
       }
       this._settle(msg.frame);
     }

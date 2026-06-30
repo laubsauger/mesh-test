@@ -97,8 +97,32 @@ export const SEGMENTS = [
   // for head yaw/roll), not a plain direction aim.
 ];
 
-// Pelvis (Hips) torso-lean uses damped depth too (avoids forward droop).
-export const HIPS_DEPTH = 0.3;
+// Torso-lean depth: z (monocular fwd/back) is the noisy axis and on the long
+// hip→shoulder baseline a little z-jitter tilts the whole upper body. Keep it low
+// — vertical + side lean stay responsive, fwd/back is damped (raise via depthScale).
+export const HIPS_DEPTH = 0.12;
+// Neck-pitch depth: short shoulder→head baseline amplifies z-noise → bobbing head.
+export const NECK_DEPTH = 0.3;
+
+// Torso bend is distributed across the spine as a fractional WORLD rotation per
+// bone (NOT per-bone direction-aim — Spine's child is -y, that path 180°-flips,
+// §B3). Weights are cumulative to 1 at the top, so the upper body fully follows
+// the target while each vertebra shares the bend. Hips takes a small share so the
+// pelvis barely tilts (legs stay grounded); the curl lives in the spine.
+export const SPINE_CHAIN = [
+  { key: 'hips', weight: 0.15 },
+  { key: 'spine', weight: 0.28 },
+  { key: 'spine01', weight: 0.28 },
+  { key: 'spine02', weight: 0.29 }
+];
+
+// Clavicles: aim each shoulder bone from its rest (clavicle) direction toward the
+// observed shoulder joint relative to the shoulder-center → shrug (Y) + slight
+// protraction. Subtle — driven at reduced gain. z damped (monocular).
+export const CLAVICLES = [
+  { bone: 'leftShoulder', joint: KPT.leftShoulder, depth: 0.2 },
+  { bone: 'rightShoulder', joint: KPT.rightShoulder, depth: 0.2 }
+];
 
 // Resolve logical key → THREE.Bone from a skeleton. Throws on any missing bone —
 // a rig lacking a mapped bone is a real error, not something to paper over.

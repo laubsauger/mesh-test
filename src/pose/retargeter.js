@@ -8,7 +8,7 @@
 // source it injects a residual scale (mesh shrinks ~0.01 → vanishes, see §B).
 // Rest is restored from rest LOCAL quaternions captured at load.
 import * as THREE from 'three';
-import { resolveRigBones, SEGMENTS, LIMBS, FOREARMS, hipCenter, shoulderCenter, headCenter, HIPS_DEPTH } from './rig-map.js';
+import { resolveRigBones, SEGMENTS, LIMBS, FOREARMS, CLAVICLES, SPINE_CHAIN, hipCenter, shoulderCenter, headCenter, HIPS_DEPTH, NECK_DEPTH } from './rig-map.js';
 import { KPT } from './rtmw-constants.js';
 
 const _xAxis = new THREE.Vector3(1, 0, 0);
@@ -26,6 +26,10 @@ const _q = new THREE.Quaternion();
 const _qParent = new THREE.Quaternion();
 const _qLocal = new THREE.Quaternion();
 const _qDelta = new THREE.Quaternion();
+const _qFrac = new THREE.Quaternion(); // torso: fractional world bend Q^f per spine bone
+const _qWorldT = new THREE.Quaternion(); // torso: per-bone target world quat
+const _qId = new THREE.Quaternion(); // identity (slerp start for Q^f)
+const _qTorso = new THREE.Quaternion(); // torso: full world delta Q (rest frame→target)
 const _mBind = new THREE.Matrix4();
 const _mTarget = new THREE.Matrix4();
 const DEG2RAD = Math.PI / 180;
@@ -54,6 +58,16 @@ function basisQuat(a1, a2, b1, b2, out) {
 //   'hold'  — SIGN-IS-THE-SIGNAL axis (body facing/yaw): a backward candidate is a
 //             monocular depth-sign FLIP, not a real turn. REJECT it (hold last) so
 //             noise can't sweep the body 180°. Only same-hemisphere candidates blend.
+// Soft confidence gate: 0 at thresh → 1 at thresh+band (smoothstep). A bone whose
+// joints dip in confidence is driven toward REST by this weight (gain), not frozen
+// at its last pose — so it eases out and back instead of freezing then POPPING on
+// reacquire (the binary `conf < thresh → return` did the latter). Returns 0 below
+// thresh (full rest), so callers can still skip the direction math when it's 0.
+function confGate(conf, thresh, band = 0.15) {
+  const t = (conf - thresh) / band;
+  return t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t);
+}
+
 const _blend = new THREE.Vector3();
 function smoothAxis(last, candidate, follow, mode) {
   const backward = candidate.dot(last) < 0;
@@ -144,6 +158,25 @@ export class Retargeter {
       if (_endP.lengthSq() > 1e-8) neckEntry.bindAcross = _endP.clone().normalize();
     }
 
+    // Spine chain: torso bend distributes a world-space rotation across these, so
+    // they need only their REST world quat + rest local (no rest dir — Spine's -y
+    // child would 180°-flip a direction aim, §B3). hips bind (captured above) is
+    // the chain's rest frame reference (restDirWorld = up, bindAcross = right).
+    for (const { key } of SPINE_CHAIN) {
+      if (key === 'hips') continue; // already captured with dir + across
+      const bone = this.rig[key];
+      if (!bone) continue;
+      const bindWorldQuat = new THREE.Quaternion();
+      bone.getWorldQuaternion(bindWorldQuat);
+      this.bind.set(key, { bindWorldQuat, restLocalQuat: bone.quaternion.clone() });
+    }
+
+    // Clavicles: rest dir = shoulder→arm (the bone's outward axis); aimed toward
+    // the observed shoulder joint for shrug/protraction.
+    for (const clav of CLAVICLES) {
+      this._captureBone(clav.bone, this.rig[clav.bone]?.children.find((c) => c.isBone));
+    }
+
     // Hands are leaf bones (no child) — derive rest direction from forearm→hand
     // (the hand's extension axis), aimed at wrist→middle-finger.
     for (const handKey of ['leftHand', 'rightHand']) {
@@ -204,12 +237,15 @@ export class Retargeter {
       // V19: how far this bone WANTED to rotate vs the cap it hit (deg).
       const rawDeg = angle / DEG2RAD;
       this.clampStats.set(boneKey, { raw: rawDeg, max: maxAngleDeg, clamped });
-      // Peak-hold: the live per-frame value flickers too fast to read, so keep the
-      // worst overflow per bone until reset — a momentary face-touch stays legible.
+      // Peak-hold + hit-count: live value flickers too fast to read, so keep the
+      // worst overflow per bone until reset. `hits` (clamped frames) vs the apply
+      // count tells a SUSTAINED reach (clamps most frames) from a one-frame
+      // inversion spike (peak 180° but hits≈1).
       if (clamped) {
         const p = this.clampPeak.get(boneKey);
         const over = rawDeg - maxAngleDeg;
-        if (!p || over > p.over) this.clampPeak.set(boneKey, { raw: rawDeg, max: maxAngleDeg, over });
+        if (!p) this.clampPeak.set(boneKey, { raw: rawDeg, max: maxAngleDeg, over, hits: 1 });
+        else { p.hits += 1; if (over > p.over) { p.over = over; p.raw = rawDeg; } }
       }
     }
 
@@ -224,36 +260,44 @@ export class Retargeter {
   }
 
   // V19: peak-held clamp overflow per bone since last reset, worst first. Row:
-  // { bone, raw°, max°, over° }. Peak-held so a brief gesture stays readable.
+  // { bone, raw°, max°, over°, hits, frames, pct }. `pct` = clamped frames / total
+  // → distinguishes a sustained reach (high pct) from a 1-frame inversion spike.
   clampReport() {
+    const frames = this.applyCount || 0;
     const rows = [];
-    for (const [bone, s] of this.clampPeak) rows.push({ bone, raw: s.raw, max: s.max, over: s.over });
+    for (const [bone, s] of this.clampPeak) {
+      rows.push({ bone, raw: s.raw, max: s.max, over: s.over, hits: s.hits, frames, pct: frames ? s.hits / frames : 0 });
+    }
     rows.sort((a, b) => b.over - a.over);
     return rows;
   }
 
-  resetClampPeak() { this.clampPeak.clear(); }
+  resetClampPeak() { this.clampPeak.clear(); this.applyCount = 0; }
 
-  // Direction-only (swing) aim. from/to: {x,y,z,confidence}.
+  // Direction-only (swing) aim. from/to: {x,y,z,confidence}. Soft-gated: low joint
+  // confidence eases the bone toward rest (gain→0), not freeze→pop.
   _aim(boneKey, from, to, opts) {
     const bind = this.bind.get(boneKey);
-    if (!bind || !from || !to || from.confidence < opts.kptThresh || to.confidence < opts.kptThresh) return;
+    if (!bind || !from || !to) return;
+    const gate = confGate(Math.min(from.confidence, to.confidence), opts.kptThresh) * (opts.gain ?? 1);
     _target.set(to.x - from.x, to.y - from.y, (to.z - from.z) * opts.depth);
     if (_target.lengthSq() < 1e-8) return;
     _target.normalize();
     if (opts.mirrorX) _target.x = -_target.x;
     _q.setFromUnitVectors(bind.restDirWorld, _target).multiply(bind.bindWorldQuat);
-    this._setBoneFromWorld(boneKey, bind, _q, opts.maxAngleDeg, opts.follow, opts.gain ?? 1);
+    this._setBoneFromWorld(boneKey, bind, _q, opts.maxAngleDeg, opts.follow, gate);
   }
 
   // Upper-limb aim with swing-twist: orient by bone direction AND bend-plane.
+  // Soft-gated on the root/mid joints (low conf → ease toward rest, no pop).
   _aimLimb(limb, canonical, opts) {
     const bind = this.bind.get(limb.upper);
     if (!bind) return;
     const r = canonical.joints[limb.root];
     const m = canonical.joints[limb.mid];
     const e = canonical.joints[limb.end];
-    if (!r || !m || r.confidence < opts.kptThresh || m.confidence < opts.kptThresh) return;
+    if (!r || !m) return;
+    const gate = confGate(Math.min(r.confidence, m.confidence), opts.kptThresh);
 
     const sx = opts.mirrorX ? -1 : 1;
     _rootP.set(r.x * sx, r.y, r.z * limb.depth);
@@ -288,13 +332,13 @@ export class Retargeter {
       if (plane) {
         basisQuat(bind.restDirWorld, bind.bindPlaneN, _dir, plane, _q);
         _q.multiply(bind.bindWorldQuat);
-        this._setBoneFromWorld(limb.upper, bind, _q, opts.maxAngleDeg, opts.follow);
+        this._setBoneFromWorld(limb.upper, bind, _q, opts.maxAngleDeg, opts.follow, gate);
         return;
       }
     }
     // fallback: swing only
     _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat);
-    this._setBoneFromWorld(limb.upper, bind, _q, opts.maxAngleDeg, opts.follow);
+    this._setBoneFromWorld(limb.upper, bind, _q, opts.maxAngleDeg, opts.follow, gate);
   }
 
   // Forearm: aim elbow→wrist (swing) + optional axial twist from the hand knuckle
@@ -304,7 +348,8 @@ export class Retargeter {
     if (!bind) return;
     const r = canonical.joints[fa.root];
     const m = canonical.joints[fa.mid];
-    if (!r || !m || r.confidence < opts.kptThresh || m.confidence < opts.kptThresh) return;
+    if (!r || !m) return;
+    const gate = confGate(Math.min(r.confidence, m.confidence), opts.kptThresh);
     const sx = opts.mirrorX ? -1 : 1;
     _rootP.set(r.x * sx, r.y, r.z * opts.depth);
     _midP.set(m.x * sx, m.y, m.z * opts.depth);
@@ -326,36 +371,41 @@ export class Retargeter {
           else smoothAxis(last, _planeN, opts.planeFollow, 'align'); // forearm-roll plane sign carries no info
           basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
           _q.multiply(bind.bindWorldQuat);
-          this._setBoneFromWorld(fa.bone, bind, _q, opts.maxAngleDeg, opts.follow);
+          this._setBoneFromWorld(fa.bone, bind, _q, opts.maxAngleDeg, opts.follow, gate);
           return;
         }
       }
     }
     _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat);
-    this._setBoneFromWorld(fa.bone, bind, _q, opts.maxAngleDeg, opts.follow);
+    this._setBoneFromWorld(fa.bone, bind, _q, opts.maxAngleDeg, opts.follow, gate);
   }
 
-  // Pelvis with optional YAW: up→torso-up (lean) + right→hip-axis (turning), so
-  // the whole upper body rotates when you turn. Falls back to lean-only.
-  _aimHips(canonical, opts) {
-    const bind = this.bind.get('hips');
-    if (!bind) return;
+  // Torso: build ONE world rotation Q (rest torso frame → target), then distribute
+  // it across the spine chain (hips→spine→spine01→spine02) by cumulative weight so
+  // the bend spreads instead of snapping one rigid hips bone. Target frame: up =
+  // hip→shoulder (lean, z-damped), across = hip axis (turn, depth-sign-held). Q is
+  // applied as a world delta (Q^f ∘ bindWorld) so each bone's arbitrary rest dir is
+  // irrelevant — avoids the Spine -y 180°-flip (§B3).
+  _aimTorso(canonical, opts) {
+    const hipsBind = this.bind.get('hips');
+    if (!hipsBind) return;
     const hc = hipCenter(canonical);
     const sc = shoulderCenter(canonical);
     const lh = canonical.joints[KPT.leftHip];
     const rh = canonical.joints[KPT.rightHip];
-    if (hc.confidence < opts.kptThresh || sc.confidence < opts.kptThresh || !lh || !rh) return;
     const sx = opts.mirrorX ? -1 : 1;
     _dir.set((sc.x - hc.x) * sx, sc.y - hc.y, (sc.z - hc.z) * opts.depth); // torso up (lean)
     if (_dir.lengthSq() < 1e-8) return;
     _dir.normalize();
+    // Soft gate: low torso confidence → drive the chain toward REST (gain→0), not
+    // freeze — eases out/in without a pop.
+    const gate = confGate(Math.min(hc.confidence, sc.confidence), opts.kptThresh);
 
-    if (opts.yaw && bind.bindAcross && lh.confidence >= opts.kptThresh && rh.confidence >= opts.kptThresh) {
+    let haveYaw = false;
+    if (opts.yaw && hipsBind.bindAcross && lh.confidence >= opts.kptThresh && rh.confidence >= opts.kptThresh) {
       // hip axis (right). Turning lives in the z-separation, which monocular depth
-      // under-reads → amplify z by yawGain so turns register. But near frontal that
-      // z is mostly NOISE: amplified, it flips the axis sign frame-to-frame → the
-      // whole body snaps 180°. Deadzone it: ignore depth separation smaller than a
-      // fraction of the (reliable) horizontal hip width, so frontal pose stays put.
+      // under-reads → amplify z by yawGain. Near frontal that z is NOISE → deadzone
+      // it (ignore depth sep < a fraction of the reliable horizontal hip width).
       const rxw = (rh.x - lh.x) * sx;
       const rzAmp = (rh.z - lh.z) * opts.yawGain;
       const rz = Math.abs(rzAmp) < Math.abs(rxw) * 0.18 ? 0 : rzAmp;
@@ -366,21 +416,46 @@ export class Retargeter {
         _planeN.divideScalar(len);
         let last = this.lastPlaneN.get('hips');
         if (!last) { last = _planeN.clone(); this.lastPlaneN.set('hips', last); }
-        else smoothAxis(last, _planeN, Math.max(opts.planeFollow, 0.3), 'hold'); // sign = facing; reject depth-sign flips
-        // Degeneracy guard: if the (held) across axis is near-parallel to torso-up,
-        // basisQuat's orthogonalization is unstable → random/180° spin. Skip yaw and
-        // fall through to lean-only below (a defined no-yaw orientation, still slerp-
-        // smoothed by _setBoneFromWorld — no snap).
+        else smoothAxis(last, _planeN, Math.max(opts.planeFollow, 0.3), 'hold'); // sign=facing; reject depth-sign flips
+        // Degeneracy guard: across near-parallel to up → basisQuat unstable (180°
+        // spin). Skip yaw → lean-only Q below.
         if (Math.abs(last.dot(_dir)) < 0.94) {
-          basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
-          _q.multiply(bind.bindWorldQuat);
-          this._setBoneFromWorld('hips', bind, _q, opts.maxAngleDeg, opts.follow);
-          return;
+          basisQuat(hipsBind.restDirWorld, hipsBind.bindAcross, _dir, last, _qTorso); // Q = world delta
+          haveYaw = true;
         }
       }
     }
-    _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat); // lean only
-    this._setBoneFromWorld('hips', bind, _q, opts.maxAngleDeg, opts.follow);
+    if (!haveYaw) _qTorso.setFromUnitVectors(hipsBind.restDirWorld, _dir); // lean only
+
+    // Distribute: cumulative weight f → Q^f at each bone (full Q at the top).
+    let f = 0;
+    for (const seg of SPINE_CHAIN) {
+      f += seg.weight;
+      const b = this.bind.get(seg.key);
+      if (!b) continue;
+      _qFrac.copy(_qId).slerp(_qTorso, Math.min(1, f)); // Q^f
+      _qWorldT.copy(_qFrac).multiply(b.bindWorldQuat);
+      this._setBoneFromWorld(seg.key, b, _qWorldT, opts.maxAngleDeg, opts.follow, gate);
+    }
+  }
+
+  // Clavicles: aim each shoulder bone from its rest (shoulder→arm) direction toward
+  // the observed shoulder joint relative to the shoulder-center → shrug + slight
+  // protraction. Reduced gain (subtle); soft-gated on shoulder confidence.
+  _aimClavicles(canonical, opts) {
+    const sc = shoulderCenter(canonical);
+    const sx = opts.mirrorX ? -1 : 1;
+    for (const clav of CLAVICLES) {
+      const bind = this.bind.get(clav.bone);
+      const j = canonical.joints[clav.joint];
+      if (!bind || !j) continue;
+      const gate = confGate(Math.min(j.confidence, sc.confidence), opts.kptThresh);
+      _dir.set((j.x - sc.x) * sx, j.y - sc.y, (j.z - sc.z) * clav.depth);
+      if (_dir.lengthSq() < 1e-8) continue;
+      _dir.normalize();
+      _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat);
+      this._setBoneFromWorld(clav.bone, bind, _q, opts.maxAngleDeg, opts.follow, gate * (opts.gain ?? 1));
+    }
   }
 
   // Head/neck: pitch from head-up direction, + YAW from the nose's horizontal
@@ -391,7 +466,7 @@ export class Retargeter {
     if (!bind) return;
     const sc = shoulderCenter(canonical);
     const hcen = headCenter(canonical);
-    if (sc.confidence < opts.kptThresh || hcen.confidence < opts.kptThresh) return;
+    const gate = confGate(Math.min(sc.confidence, hcen.confidence), opts.kptThresh);
     const sx = opts.mirrorX ? -1 : 1;
     _dir.set((hcen.x - sc.x) * sx, hcen.y - sc.y, (hcen.z - sc.z) * opts.depth);
     if (_dir.lengthSq() < 1e-8) return;
@@ -409,25 +484,28 @@ export class Retargeter {
       _qParent.setFromAxisAngle(_dir, yawA); // yaw about the head's up axis
       _q.premultiply(_qParent);
     }
-    this._setBoneFromWorld('neck', bind, _q, opts.maxAngleDeg, opts.follow, opts.gain);
+    this._setBoneFromWorld('neck', bind, _q, opts.maxAngleDeg, opts.follow, gate * (opts.gain ?? 1));
   }
 
   apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, yawGain = 2.5 } = {}) {
     this.restPose();
     this.rig.hips.position.y = this.hipsRestPosY; // reset (restPose only touches rotations)
     this.clampStats.clear(); // V19: only THIS frame's aimed bones report clamps
+    this.applyCount = (this.applyCount || 0) + 1; // V19: frames since last clamp reset
     const base = { kptThresh, mirrorX, follow, maxAngleDeg: jointLimitDeg, swingTwist, planeFollow };
 
-    // Pelvis rotation (leans whole body); upper limbs next (children compensate);
-    // forearms (with optional twist); then lower bones / feet / hands / neck. Arms
-    // use a tighter limit (over-rotation guard).
-    this._aimHips(canonical, { ...base, depth: depthScale * HIPS_DEPTH, yaw: bodyYaw, yawGain });
+    // Torso (distributed across the spine chain); clavicles; upper limbs (children
+    // compensate); forearms (with optional twist); then lower bones / feet / hands /
+    // neck. Arms use a tighter limit (over-rotation guard). Torso first so the spine
+    // is posed before its children (arms/neck) read updated parent world matrices.
+    this._aimTorso(canonical, { ...base, depth: depthScale * HIPS_DEPTH, yaw: bodyYaw, yawGain });
+    this._aimClavicles(canonical, { ...base, gain: 0.6 });
     for (const limb of LIMBS) {
       const isArm = limb.upper.includes('Arm');
       this._aimLimb(limb, canonical, { ...base, depth: depthScale * limb.depth, maxAngleDeg: isArm ? armLimit : jointLimitDeg });
     }
     for (const fa of FOREARMS) this._aimForeArm(fa, canonical, { ...base, depth: depthScale * fa.depth, wristTwist, maxAngleDeg: armLimit });
-    this._aimHead(canonical, { ...base, depth: depthScale * 0.85, yawGain, gain: headGain });
+    this._aimHead(canonical, { ...base, depth: depthScale * NECK_DEPTH, yawGain, gain: headGain });
     for (const seg of SEGMENTS) {
       this._aim(seg.bone, seg.from(canonical), seg.to(canonical), {
         ...base,

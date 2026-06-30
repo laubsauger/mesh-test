@@ -80,7 +80,7 @@ export class NativeCapturePoseProvider {
       this.latestFrame = msg.frame;
       if (msg.frame) this.stats.recv += 1; else this.stats.dropped += 1;
       if (this.debug) {
-        console.log(`[native] ${msg.frame ? 'pose' : 'NULL'} | det ${(t.detect ?? 0).toFixed(1)} inf ${(t.inference ?? 0).toFixed(1)} server ${(t.serverTotal ?? 0).toFixed(1)}ms @ ${(this.stats.sendHz || 0).toFixed(0)}Hz | recv ${this.stats.recv}`);
+        console.log(`[native] ${msg.frame ? 'pose' : 'NULL'} | conf ${t.poseConf ?? '-'} box ${JSON.stringify(t.box ?? null)} | det ${(t.detect ?? 0).toFixed(1)} inf ${(t.inference ?? 0).toFixed(1)} server ${(t.serverTotal ?? 0).toFixed(1)}ms @ ${(this.stats.sendHz || 0).toFixed(0)}Hz | recv ${this.stats.recv}`);
       }
       this._wake(msg.frame);
     }

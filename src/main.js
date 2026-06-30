@@ -409,7 +409,10 @@ const state = {
     if (!lastPoseRetargeter) { console.warn('[clamp] no pose retargeter active'); return; }
     const rows = lastPoseRetargeter.clampReport();
     if (!rows.length) { console.log('[clamp] nothing clamped since reset'); }
-    else console.table(rows.map((r) => ({ bone: r.bone, 'wanted°': Math.round(r.raw), 'cap°': r.max, 'over°': Math.round(r.over) })));
+    else console.table(rows.map((r) => ({
+      bone: r.bone, 'wanted°': Math.round(r.raw), 'cap°': r.max, 'over°': Math.round(r.over),
+      hits: r.hits, frames: r.frames, '%': Math.round(r.pct * 100)
+    })));
     lastPoseRetargeter.resetClampPeak();
   },
   savePoseRecording() {
