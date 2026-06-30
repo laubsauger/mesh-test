@@ -103,6 +103,7 @@ def trt_options():
     }
 
 
+NATIVE_DEVICE = -1  # set from --device; >=0 OVERRIDES the browser's native camera index
 COREML_UNITS = "CPUAndGPU"  # set from --coreml-units. Excludes the ANE by default — its
 # reduced precision flips SimCC argmax on this model → the Mac-only trash pulse.
 
@@ -547,8 +548,13 @@ async def handle(ws, pipe):
             if isinstance(msg, str):  # config (text)
                 cfg = json.loads(msg)
                 thresh = float(cfg.get("kptThresh", thresh))
+                if cfg.get("mode") == "scan":  # enumerate cameras for the UI dropdown, then done
+                    cams = await asyncio.get_event_loop().run_in_executor(None, enumerate_cameras)
+                    await ws.send(json.dumps({"type": "cameras", "list": cams}))
+                    return
                 if cfg.get("mode") == "native":  # backend owns the camera, pushes results
-                    await native_capture_loop(ws, pipe, thresh, int(cfg.get("device", 0)),
+                    device = NATIVE_DEVICE if NATIVE_DEVICE >= 0 else int(cfg.get("device", 0))
+                    await native_capture_loop(ws, pipe, thresh, device,
                                               int(cfg.get("width", 640)), int(cfg.get("height", 480)),
                                               bool(cfg.get("preview", True)), int(cfg.get("previewW", 320)))
                     return
@@ -648,7 +654,11 @@ async def main():
                     default="CPUAndGPU", help="Mac CoreML compute units. Default excludes the ANE (fixes the trash); ALL = old behaviour")
     ap.add_argument("--rtmw-out", help="comma-sep X,Y,Z output names (else auto-read from the model)")
     ap.add_argument("--list-cameras", action="store_true", help="probe + print camera indices (find your OBS/real cam), then exit")
+    ap.add_argument("--device", type=int, default=-1, help="native camera index — OVERRIDES the UI 'Native Device'. e.g. -- --device 5")
     args = ap.parse_args()
+
+    global NATIVE_DEVICE
+    NATIVE_DEVICE = args.device
 
     if args.list_cameras:  # discovery — no model load, no server
         print("[sidecar] scanning cameras (this opens each index briefly)…")

@@ -342,6 +342,8 @@ const state = {
   poseSidecarDebug: false, // sidecar: console per-frame timing/flow trace
   poseReadback: 'bitmap', // sidecar frame snapshot: 'bitmap'(createImageBitmap) | 'videoframe'(WebCodecs)
   posePreview: true, // sidecar-native: push a low-res webcam JPEG so the overlay isn't blind
+  poseNativeDevice: 0, // sidecar-native: camera index the sidecar opens (use Scan Cameras to find it)
+  scanCameras: () => scanCameras(), // button: ask the sidecar which camera indices are live
   poseSendMaxSide: 640, // sidecar: longest edge shipped over the wire. The models only need
   // yolo@320 + a 384×288 crop, so full-res (1280 = 3.6MB/frame) just bloats readback+transport
   // (~19ms + ~27ms) for no accuracy gain. 640 = 0.9MB → ~4× less data. Bump if a DISTANT
@@ -698,6 +700,10 @@ function buildInspectorControls() {
   // blind is a low-res preview pushed back. Toggle live; cost shows in Pose Stats.
   poseGroup.add(state, 'posePreview').name('Native Preview Feed').onChange((on) => {
     if (poseProvider instanceof NativeCapturePoseProvider) poseProvider.setPreview(on);
+  });
+  poseGroup.add(state, 'scanCameras').name('Scan Cameras (find index)');
+  poseGroup.add(state, 'poseNativeDevice', 0, 8, 1).name('Native Device').onChange(() => {
+    if (poseProvider instanceof NativeCapturePoseProvider) { stopPose(); if (state.poseEnabled) startPose(); }
   });
   // Model selection — a reload (swaps the .onnx), so restart pose. Variant applies
   // to the worker backend here; the sidecar picks its model via launch flags.
@@ -1870,6 +1876,28 @@ function updateCanonical(frame) {
   // else: brief dropout → keep holding the last good pose
 }
 
+// Ask the sidecar which camera indices are live (separate one-shot WS). Best run
+// while NOT in native mode (enumerating opens cameras → would clash with an active
+// native capture). Logs the full list; shows live indices in the status line.
+function scanCameras() {
+  statusEl.textContent = 'Scanning cameras…';
+  let ws;
+  try { ws = new WebSocket('ws://127.0.0.1:8787'); } catch { statusEl.textContent = 'Scan failed (no sidecar?)'; return; }
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'config', mode: 'scan' }));
+  ws.onerror = () => { statusEl.textContent = 'Scan failed — is `npm run sidecar` running?'; };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type !== 'cameras') return;
+    const rows = msg.list.map((c) => `  device ${c.index} (${c.backend}): ${c.live ? 'LIVE ✓' : 'black/none ✗'}  ${c.w}x${c.h}`);
+    console.log('[cameras]\n' + rows.join('\n'));
+    const live = msg.list.filter((c) => c.live).map((c) => c.index);
+    statusEl.textContent = live.length
+      ? `Cameras — LIVE indices: [${live.join(', ')}] (full list in console). Set "Native Device".`
+      : 'No live cameras found — check the device is free + privacy settings (full list in console).';
+    try { ws.close(); } catch { /* already closing */ }
+  };
+}
+
 async function startPose() {
   if (poseProvider) return;
   posePipEl.hidden = false;
@@ -1882,7 +1910,7 @@ async function startPose() {
       poseProvider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide, readback: state.poseReadback });
       poseProvider.debug = state.poseSidecarDebug;
     } else if (state.poseBackend === 'sidecar-native') {
-      poseProvider = new NativeCapturePoseProvider({ kptThresh: state.poseKptThresh, width: 640, height: 480, preview: state.posePreview });
+      poseProvider = new NativeCapturePoseProvider({ kptThresh: state.poseKptThresh, width: 640, height: 480, preview: state.posePreview, device: state.poseNativeDevice });
       poseProvider.debug = state.poseSidecarDebug;
     } else {
       const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
