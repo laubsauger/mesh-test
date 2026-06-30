@@ -347,10 +347,28 @@ def preload_gpu_dlls():
     if not hasattr(ort, "preload_dlls"):
         return
     import importlib.util
+    import os
     have_wheels = (importlib.util.find_spec("nvidia") is not None
-                   or importlib.util.find_spec("tensorrt") is not None)
+                   or importlib.util.find_spec("tensorrt") is not None
+                   or importlib.util.find_spec("tensorrt_libs") is not None)
     if not have_wheels:
         return  # no nvidia runtime wheels → don't probe (avoids the DLL-load spam)
+
+    # preload_dlls() reliably loads the nvidia-* CUDA/cuDNN wheels but NOT the TensorRT
+    # libs (the `tensorrt_libs` package, where nvinfer_10.dll lives) — so ORT's TRT
+    # provider DLL can't find nvinfer_10.dll. Put that dir on the DLL search path
+    # explicitly (Windows: add_dll_directory; also PATH for good measure).
+    spec = importlib.util.find_spec("tensorrt_libs")
+    if spec and spec.submodule_search_locations:
+        trt_dir = list(spec.submodule_search_locations)[0]
+        if hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(trt_dir)
+            except OSError:
+                pass
+        os.environ["PATH"] = trt_dir + os.pathsep + os.environ.get("PATH", "")
+        print(f"[sidecar] TensorRT libs on DLL path: {trt_dir}")
+
     try:
         ort.preload_dlls()  # cuda=True, cudnn=True, tensorrt=True by default
         print("[sidecar] ort.preload_dlls() loaded CUDA/cuDNN/TRT from venv wheels")
