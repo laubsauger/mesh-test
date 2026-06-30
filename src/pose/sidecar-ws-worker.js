@@ -54,8 +54,9 @@ function onWsMessage(data) {
 }
 
 function processFrame(bitmap, seq) {
-  const vidW = bitmap.width;
-  const vidH = bitmap.height;
+  // ImageBitmap exposes .width/.height; WebCodecs VideoFrame exposes .displayWidth/Height.
+  const vidW = bitmap.width ?? bitmap.displayWidth;
+  const vidH = bitmap.height ?? bitmap.displayHeight;
   const scale = Math.min(1, sendMaxSide / Math.max(vidW, vidH));
   const w = Math.round(vidW * scale);
   const h = Math.round(vidH * scale);

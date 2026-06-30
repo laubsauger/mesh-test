@@ -316,6 +316,7 @@ const state = {
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
   poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS
   poseSidecarDebug: false, // sidecar: console per-frame timing/flow trace
+  poseReadback: 'bitmap', // sidecar frame snapshot: 'bitmap'(createImageBitmap) | 'videoframe'(WebCodecs)
   poseSendMaxSide: 640, // sidecar: longest edge shipped over the wire. The models only need
   // yolo@320 + a 384×288 crop, so full-res (1280 = 3.6MB/frame) just bloats readback+transport
   // (~19ms + ~27ms) for no accuracy gain. 640 = 0.9MB → ~4× less data. Bump if a DISTANT
@@ -660,6 +661,11 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseSidecarDebug').name('Sidecar Debug (console)').onChange((on) => {
     if (poseProvider instanceof SidecarPoseProvider) poseProvider.debug = on;
   });
+  // A/B the frame-snapshot method live — watch 'Capture' in Pose Stats. videoframe =
+  // WebCodecs new VideoFrame(video) (sync, no decode/copy); bitmap = createImageBitmap.
+  poseGroup.add(state, 'poseReadback', ['bitmap', 'videoframe']).name('Sidecar Capture').onChange((v) => {
+    if (poseProvider instanceof SidecarPoseProvider) poseProvider.readback = v;
+  });
   // Model selection — a reload (swaps the .onnx), so restart pose. Variant applies
   // to the worker backend here; the sidecar picks its model via launch flags.
   poseGroup.add(state, 'poseRtmwVariant', RTMW_VARIANTS).name('RTMW Variant').onChange(() => {
@@ -706,6 +712,7 @@ function buildInspectorControls() {
   poseStatsGroup.add(poseStats, 'preprocessMs').name('Preprocess').listen();
   poseStatsGroup.add(poseStats, 'inferenceMs').name('RTMW Inference').listen();
   poseStatsGroup.add(poseStats, 'decodeMs').name('Decode').listen();
+  poseStatsGroup.add(poseStats, 'captureMs').name('Capture (sidecar)').listen();
   poseStatsGroup.add(poseStats, 'readbackMs').name('Readback (sidecar)').listen();
   poseStatsGroup.add(poseStats, 'serverMs').name('Server total (sidecar)').listen();
   poseStatsGroup.add(poseStats, 'transportMs').name('Transport/wire (sidecar)').listen();
@@ -1672,6 +1679,7 @@ const poseStats = {
   preprocessMs: 0,
   inferenceMs: 0,
   decodeMs: 0,
+  captureMs: 0, // sidecar: main-thread frame snapshot (createImageBitmap vs WebCodecs VideoFrame)
   readbackMs: 0, // sidecar: GPU→CPU frame readback (browser side)
   serverMs: 0, // sidecar: full server handler (recv→reply); serverMs−inference = numpy/json overhead
   transportMs: 0, // sidecar: round−server = WS + browser scheduling lag (this is "wire")
@@ -1815,7 +1823,7 @@ async function startPose() {
   try {
     poseSmoother.reset();
     if (state.poseBackend === 'sidecar') {
-      poseProvider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide });
+      poseProvider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide, readback: state.poseReadback });
       poseProvider.debug = state.poseSidecarDebug;
     } else {
       const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
@@ -1883,6 +1891,7 @@ async function poseLoop(myId) {
       poseStats.preprocessMs = ema(poseStats.preprocessMs, tm.preprocess);
       poseStats.inferenceMs = ema(poseStats.inferenceMs, tm.inference);
       poseStats.decodeMs = ema(poseStats.decodeMs, tm.decode);
+      poseStats.captureMs = ema(poseStats.captureMs, tm.capture ?? 0);
       poseStats.readbackMs = ema(poseStats.readbackMs, tm.readback ?? 0);
       poseStats.serverMs = ema(poseStats.serverMs, tm.serverTotal ?? 0);
       poseStats.transportMs = ema(poseStats.transportMs, tm.transport ?? tm.wire ?? 0);
