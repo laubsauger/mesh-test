@@ -361,6 +361,58 @@ def annotate(timings, frame, box):
         print(f"[sidecar] f{_diag['n']} conf={timings['poseConf']} span={span} box={timings['box']}")
 
 
+def enumerate_cameras(max_n=8):
+    """Probe indices 0..max_n: which OPEN + deliver LIVE (non-black) frames, at what res.
+    Index-based (OpenCV can't read device names portably) — find your OBS/real cam here."""
+    out = []
+    backends = ([(cv2.CAP_DSHOW, "DShow"), (cv2.CAP_MSMF, "MSMF")]
+                if sys.platform == "win32" else [(cv2.CAP_ANY, "default")])
+    for i in range(max_n):
+        for be, name in backends:
+            cap = cv2.VideoCapture(i, be)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            live, w, h = False, 0, 0
+            for _ in range(6):
+                ok, f = cap.read()
+                if ok and f is not None:
+                    h, w = f.shape[:2]
+                    if float(f.mean()) > 5:
+                        live = True
+                        break
+                time.sleep(0.03)
+            cap.release()
+            out.append({"index": i, "backend": name, "live": live, "w": w, "h": h})
+            break  # one working backend per index is enough to report
+    return out
+
+
+def open_camera(device, width, height):
+    """Open the webcam robustly. Tries both Windows backends and REJECTS black frames
+    (the cam opens but feeds 0s). Warms up ~0.75s/backend to outlast a lagging browser
+    camera release. Returns the VideoCapture, or None if every attempt was black."""
+    backends = ([(cv2.CAP_DSHOW, "DShow"), (cv2.CAP_MSMF, "MSMF")]
+                if sys.platform == "win32" else [(cv2.CAP_ANY, "default")])
+    for be, name in backends:
+        cap = cv2.VideoCapture(device, be)
+        if not cap.isOpened():
+            continue
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 60)
+        for _ in range(15):  # warm up + wait out a lagging browser release; require non-black
+            ok, f = cap.read()
+            if ok and float(f.mean()) > 5:
+                print(f"[sidecar] camera {device} via {name}: LIVE {f.shape} mean={float(f.mean()):.0f}")
+                return cap
+            time.sleep(0.05)
+        cap.release()
+        print(f"[sidecar] camera {device} via {name}: opened but BLACK frames — trying next backend")
+    return None
+
+
 def select_box(boxes, last):
     """Temporal person tracking: pick the confident box CLOSEST to last frame's box
     (not just top score), so a transient background false-positive can't hijack the
@@ -381,20 +433,16 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
     Optional: a LOW-RES JPEG preview (so the frontend's debug overlay isn't blind) is
     encoded + pushed as a separate binary message — toggleable live, instrumented."""
     loop = asyncio.get_event_loop()
-    # Windows: force DirectShow. The default MSMF backend frequently opens the cam but
-    # delivers BLACK frames (→ yolo detects nothing → endless frame:null, no error).
-    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-    cap = await loop.run_in_executor(None, lambda: cv2.VideoCapture(device, backend))
-    if not cap.isOpened():
-        await ws.send(json.dumps({"type": "error",
-                                  "message": f"sidecar can't open camera {device} — in use by the browser/another app? "
-                                             "Native mode needs the camera free (close other camera tabs/apps)."}))
+    cap = await loop.run_in_executor(None, lambda: open_camera(device, width, height))
+    if cap is None:
+        await ws.send(json.dumps({"type": "error", "message":
+            f"Camera {device} opens but delivers BLACK frames on every backend — the browser uses "
+            "it fine, so it's NOT the hardware. On Windows this is almost always: (1) Settings → "
+            "Privacy & security → Camera → turn ON 'Let desktop apps access your camera' (the "
+            "browser is allowed, but this Python sidecar is a desktop app Windows silently blacks "
+            "out); or (2) a browser tab/app still holds the cam. Or try a different --device index."}))
         return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # latest-frame-wins (no stale backlog)
-    cap.set(cv2.CAP_PROP_FPS, 60)  # best-effort; falls back to the cam's max
-    print(f"[sidecar] NATIVE capture: camera {device} @ {width}x{height} — keypoints + "
+    print(f"[sidecar] NATIVE capture: camera {device} — keypoints + "
           f"{'low-res preview' if preview else 'NO preview'}")
     await ws.send(json.dumps({"type": "native", "ep": pipe.active_ep}))
 
@@ -418,7 +466,6 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
     reader_task = asyncio.create_task(reader())
     last_box = None
     pushed = 0
-    logged_first = False
     no_det = 0
     try:
         while True:
@@ -432,11 +479,6 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
                 ready.set()
                 await asyncio.sleep(0.005)
                 continue
-            if not logged_first:
-                logged_first = True
-                m = float(bgr.mean())
-                print(f"[sidecar] first camera frame {bgr.shape} mean={m:.1f}"
-                      + ("  ⚠ NEAR-BLACK → camera not delivering pixels (wrong device/backend, or held by the browser)" if m < 5 else " (looks live)"))
             t0 = time.perf_counter()
             rgb = np.ascontiguousarray(bgr[:, :, ::-1])  # BGR→RGB (latest frame, BUFFERSIZE=1)
             td = time.perf_counter()
@@ -605,7 +647,15 @@ async def main():
     ap.add_argument("--coreml-units", choices=["CPUAndGPU", "ALL", "CPUAndNeuralEngine", "CPUOnly"],
                     default="CPUAndGPU", help="Mac CoreML compute units. Default excludes the ANE (fixes the trash); ALL = old behaviour")
     ap.add_argument("--rtmw-out", help="comma-sep X,Y,Z output names (else auto-read from the model)")
+    ap.add_argument("--list-cameras", action="store_true", help="probe + print camera indices (find your OBS/real cam), then exit")
     args = ap.parse_args()
+
+    if args.list_cameras:  # discovery — no model load, no server
+        print("[sidecar] scanning cameras (this opens each index briefly)…")
+        for c in enumerate_cameras():
+            print(f"  device {c['index']} ({c['backend']}): {'LIVE ✓' if c['live'] else 'black/none ✗'}  {c['w']}x{c['h']}")
+        print("[sidecar] pick a LIVE index → set it as the Native Device in the UI (or pass via the browser).")
+        return
 
     global FP16, COREML_UNITS
     FP16 = not args.no_fp16

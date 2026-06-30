@@ -59,10 +59,33 @@ const preloaderBar = document.querySelector('#preloader-bar');
 const preloaderLabel = document.querySelector('#preloader-label');
 const preloaderPct = document.querySelector('#preloader-pct');
 
+// Crowd GPU-skinning packs EVERY instance's skinned vertices into ONE storage
+// buffer (walkers × vertexCount × 2 vec4 = ×32 bytes). WebGPURenderer requests a
+// 'compatibility' adapter, which caps maxStorageBufferBindingSize at 128 MiB → a
+// HARD freeze just past ~418 of a ~10k-vert mesh (the binding overflows, the device
+// rejects it, the loop hangs). Request a CORE adapter at its max binding/buffer size
+// and hand the device to the renderer — pushes the wall out to the adapter's real
+// limit (GiB-scale on desktop). No WebGPU → throw (no WebGL fallback exists anyway).
+async function createHighLimitDevice() {
+  if (!navigator.gpu) throw new Error('WebGPU unavailable (no navigator.gpu)');
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) throw new Error('WebGPU: no GPU adapter');
+  const lim = adapter.limits;
+  return adapter.requestDevice({
+    requiredFeatures: [...adapter.features], // mirror the renderer: enable all the adapter has
+    requiredLimits: {
+      maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+      maxBufferSize: lim.maxBufferSize
+    }
+  });
+}
+const device = await createHighLimitDevice();
+
 const renderer = new WebGPURenderer({
   canvas,
   antialias: true,
-  alpha: true
+  alpha: true,
+  device
 });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -1106,6 +1129,18 @@ function createComputedSkinnedMesh(sourceMesh, batch) {
   const bindMatrix = uniform(sourceMesh.bindMatrix, 'mat4');
   const bindMatrixInverse = uniform(sourceMesh.bindMatrixInverse, 'mat4');
   const sourceMatrix = uniform(sourceMesh.matrixWorld, 'mat4');
+  // Fail loud, not freeze: the skinned-vertex storage buffer must fit the device's
+  // storage-binding cap. Past it the device silently rejects the binding and the
+  // render loop hangs (the old ~418 freeze). Throw a clear, actionable error instead.
+  const vertBytes = batch.walkers.length * vertexCount * 2 * 16; // 2 vec4 × 16B
+  const bindCap = device.limits.maxStorageBufferBindingSize;
+  if (vertBytes > bindCap) {
+    throw new Error(
+      `[crowd] ${batch.mesh.name}: skinned-vertex buffer ${(vertBytes / 2 ** 20).toFixed(0)}MiB ` +
+      `exceeds device storage-binding cap ${(bindCap / 2 ** 20).toFixed(0)}MiB at count ` +
+      `${batch.walkers.length} (${vertexCount} verts/mesh). Lower count or split the mesh into sub-batches.`
+    );
+  }
   const vertices = attributeArray(batch.walkers.length * vertexCount * 2, 'vec4');
 
   const computeNode = Fn(() => {
