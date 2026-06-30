@@ -56,6 +56,8 @@ Pose (`docs/pose-driver.md` §54):
 - V21: adapter bridges `I.reference` → canonical: `score`→confidence, COCO-WholeBody idx (hips 11/12), Y-down→up, X un-mirror, normalized→canonical scale; ⊥ raw decode coords to rig. Single concrete index/field map module (V15-feed).
 - V22: RTMW 3D space = root-relative normalized (z×`Z_RANGE`), ⊥ metric/world translation. World placement via root estimator + calibration only (reinforces V13).
 - V23: RTMW ONNX EP runtime-switchable `{wasm, webgpu}` (`state.poseEP`); both impl'd, A/B measured (inference ms + render fps + contention) → pick default. ⊥ assume one wins.
+- V24: drive bones from robust AGGREGATE targets (head = face-point centroid nose+eyes+ears), ⊥ single noisy keypoint. Per-region depth weight (arms full, torso/legs/head damped) — noisy monocular z ⊥ over-drive torso/knees.
+- V25: visual smoothness decoupled from pose-fps via render-rate bone interpolation (slerp toward target each render frame); ⊥ snap at inference rate (stop-motion). Two layers: One Euro on canonical (pose-rate) + bone slerp (render-rate).
 
 ## §T TASKS
 id|status|task|cites
@@ -64,9 +66,9 @@ T2|x|impl patterns synced/desync/ripple(radial inside→out via armyBounds cente
 T3|x|Inspector controls for choreography + delay; fold existing animDesync into it|V7,I.choreo,I.inspector
 T4|x|abstract BoneSource: clip writer (current mixer→snapshot path) vs pose writer; per-walker source select|V5,V20,I.boneSource
 T5|~|RTMWPoseProvider (after T22): port `I.reference` in-browser inference (onnxruntime-web, yolo26n detect → affine crop → RTMW → `decode3d`); emit RTMWPoseFrame; raw 2D+3D overlay, conf display, axis/mirror verify (M1)|V15,V21,V22,I.poseInput,I.reference
-T6|.|PoseRecorder + deterministic replay (`RecordedPoseSession`)|I.recording
+T6|x|PoseRecorder + deterministic replay (`RecordedPoseSession`)|I.recording
 T7|~|PoseObservationAdapter: bridge `I.reference` `decode3d` normalized space → canonical (score→conf, Y-flip, X un-mirror, pelvis-recenter mid(11,12)), L-R correct (M2)|V13,V21,V22,I.canonical,I.reference
-T8|.|PerformerCalibration: neutral pose → median bone lengths; BoneLengthNormalizer|V16,I.canonical
+T8|~|Calibration: guided neutral-hold (~2s) → median bone lengths → bone-length plausibility GATE (reject bad joints, §16→§14). Note: direction-based retarget needs no length-normalize. Pending: scale/floor capture for future|V16,I.canonical
 T9|.|robustness: outlier reject, last-known-good, depth-flip, L-R swap, predict/hold/recover, hard teleport barrier, diagnostics (M3)|V10,V11,V12,V15
 T10|~|temporal filter (One Euro pos, slerp rot, per-part groups) after rejection|V10,V16
 T11|x|HumanoidRigDefinition + bone map `CanonicalJointName`→Meshy biped bone (? per-rig calibration)|V9,I.canonical
@@ -76,11 +78,14 @@ T14|~|**APEX**: drive ≥1 crowd rig live from webcam; mixed clip+pose crowd ren
 T15|.|anchoredSolved: fixed StageRoot, bounded BodyRoot, squat/one-leg/lunge/kneeRaise/kick (M5)|V9,V13,I.poseMode
 T16|.|calibration UI: manual floor + markers, floor grid, boundary, quality, drift detect, save/load (M6)|V14
 T17|.|root translation: estimator iface, floor-based root, anti-teleport state machine, recenter, free-roam (M7)|V12,V13,V14
-T18|.|grounding: contact classify, floor collision, soft/locked foot, leg IK, root correction (M8)|V13
+T18|~|grounding: vertical foot-anchor done (offset Hips so lowest foot stays at rest floor → squats lower body, feet planted). Pending: contact hysteresis, horizontal lock, leg IK (M8)|V13
 T19|.|hybrid mode: per-region strategy, runtime switch (M9)|V9,I.poseMode
-T20|~|perf: move RTMW off main thread (worker), newest-frame schedule, pose interpolation, latency report (M10)|V17,V23
+T20|x|perf: RTMW in a Worker (own GPUDevice → no renderer contention; inference stable 71ms vs climbing 182), newest-frame, render-rate interpolation, stage-timing panel (M10)|V17,V23
 T21|.|synthetic corruption + validation-motion tests (`docs/pose-driver.md` §48,§49)|V10,V11,V12
 T22|~|**EP probe (before T5)**: impl both onnxruntime-web EPs (wasm + webgpu) behind `state.poseEP` selector; bench inference ms + render fps + contention w/ three WebGPU renderer; set winning default|V23,I.inspector,I.reference
+T23|.|correction-measurement + diagnostics debug (§45, §2488): per-stage deltas (filter/clamp/depth/smooth changed-vs-source), `TrackingDiagnosticEvent` log, optional 3D debug skeleton|V19
+T24|.|tracking-quality modes (§44): fullBody|upperBodyOnly|holdLastPose|recovering|lost; degrade region ⊥ whole avatar|V18
+T25|.|pose families (§28): neutral/squat/single-support/lunge/kneeRaise → adjust solver weights, ⊥ canned anim (anchored/hybrid only)|V9
 
 ## §B BUGS
 id|date|cause|fix
@@ -88,3 +93,5 @@ B1|2026-06-29|ONNX webgpu EP (jsep) contends w/ three WebGPU renderer device →
 B2|2026-06-29|`skeleton.pose()` rebuilds bind from boneInverses in pre-`normalizeModel` space → residual ~0.01 scale on normalized source → pose-driven mesh collapses to a point (vanishes). Clip path unaffected (no pose())|retargeter restores rest from load-captured normalized rest quats; ⊥ `skeleton.pose()` in driving path
 B3|2026-06-29|Meshy `Spine` bone child sits below it (`Spine→Spine01 = -y`); aiming Spine up = ~180° flip → degenerate shortest-arc → constant dramatic chest roll (one shoulder up, one down)|drop `spine` segment; drive torso lean via `Hips` (`Hips→Spine = +y`). symmetry guard test
 B4|2026-06-29|adapter copied reference VIEWER's all-axes negate (point reflection) → with `mirrorX` = double-flip → crossed/side-swapped arms|clean canonical frame matched to measured rig (+x image-right=rig left, +y up, +z depth); mirrorX default off
+B6|2026-06-30|grounding wrote world-space foot delta onto Hips LOCAL position under normalizeModel's ~0.01 scale → ~100× too small → squat didn't lower body (legs raised instead)|convert world delta → hips-local via parent world scale (`/hipsParentScaleY`)
+B5|2026-06-30|wasm EP OOM-crashes tab: app holds ~206MB GLB chars in renderer + wasm loads 369MB rtmw3d into wasm heap (+ArrayBuffer copy) → memory blowout. Ref ran wasm OK (no heavy scene)|wasm not viable for this model here → webgpu EP only; ease its renderer-GPU contention via per-inference rAF yield; real fix = worker (T20)

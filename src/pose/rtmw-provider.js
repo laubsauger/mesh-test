@@ -24,6 +24,10 @@ export class RTMWPoseProvider {
     this.ctx = null;
     this.latestFrame = null;
     this.running = false;
+    this.timings = { detect: 0, preprocess: 0, inference: 0, decode: 0, total: 0 };
+    this.detectEveryN = 1; // run yolo every N frames; reuse last box between (person barely moves)
+    this._frameCount = 0;
+    this._lastBoxes = null;
   }
 
   async start() {
@@ -50,8 +54,18 @@ export class RTMWPoseProvider {
     const vidH = this.video.videoHeight;
     if (!vidW || !vidH) return null;
 
-    const boxes = await this.detector.detect(this.video, vidW, vidH);
+    const t0 = performance.now();
+    this._frameCount += 1;
+    let boxes;
+    if (this.detectEveryN <= 1 || !this._lastBoxes || this._frameCount % this.detectEveryN === 0) {
+      boxes = await this.detector.detect(this.video, vidW, vidH);
+      this._lastBoxes = boxes;
+    } else {
+      boxes = this._lastBoxes; // reuse last box (padding 1.25 absorbs small motion)
+    }
+    const t1 = performance.now();
     if (boxes.length === 0) {
+      this.timings = { detect: t1 - t0, preprocess: 0, inference: 0, decode: 0, total: t1 - t0 };
       this.latestFrame = null;
       return null;
     }
@@ -67,12 +81,16 @@ export class RTMWPoseProvider {
       this.inputBuf[hw + i] = (d[i * 4 + 1] - POSE_MEAN[1]) / POSE_STD[1];
       this.inputBuf[2 * hw + i] = (d[i * 4 + 2] - POSE_MEAN[2]) / POSE_STD[2];
     }
+    const t2 = performance.now();
 
     const tensor = new ort.Tensor('float32', this.inputBuf, [1, 3, this.resH, this.resW]);
     const out = await this.session.run({ [RTMW3D_MODEL.inputName]: tensor });
     tensor.dispose();
+    const t3 = performance.now();
     const { k2d, k3d } = decode3d(out, rect, this.resW, this.resH);
     for (const key in out) out[key].dispose();
+    const t4 = performance.now();
+    this.timings = { detect: t1 - t0, preprocess: t2 - t1, inference: t3 - t2, decode: t4 - t3, total: t4 - t0 };
 
     const frame = {
       timestampMs: performance.now(),

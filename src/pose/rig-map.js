@@ -63,27 +63,38 @@ export const headCenter = (c) => {
   return n ? { x: x / n, y: y / n, z: z / n, confidence: conf } : { x: 0, y: 0, z: 0, confidence: 0 };
 };
 
-// Directional bones: rig bone aimed from `from(canonical)` toward `to(canonical)`.
-// `depth` scales how much the (noisy) monocular z contributes for that bone:
-// arms need it (reach forward/back); legs/torso/head damp it (else knees fold
-// back + head/torso droop from depth noise).
+// Upper limb bones get full swing-TWIST (direction + bend-plane) so the arm/leg
+// roll is determined, not left to bind roll (§22). root/mid/end = the 3 canonical
+// joints; midBone/endBone give the bind bend-plane from the rig.
+export const LIMBS = [
+  { upper: 'leftArm', midBone: 'leftForeArm', endBone: 'leftHand', root: KPT.leftShoulder, mid: KPT.leftElbow, end: KPT.leftWrist, depth: 1 },
+  { upper: 'rightArm', midBone: 'rightForeArm', endBone: 'rightHand', root: KPT.rightShoulder, mid: KPT.rightElbow, end: KPT.rightWrist, depth: 1 },
+  { upper: 'leftUpLeg', midBone: 'leftLeg', endBone: 'leftFoot', root: KPT.leftHip, mid: KPT.leftKnee, end: KPT.leftAnkle, depth: 0.35 },
+  { upper: 'rightUpLeg', midBone: 'rightLeg', endBone: 'rightFoot', root: KPT.rightHip, mid: KPT.rightKnee, end: KPT.rightAnkle, depth: 0.35 }
+];
+
+// Forearms: direction (elbow→wrist) + optional axial TWIST from the hand knuckle
+// line (indexMCP→pinkyMCP rotates with pronation/supination).
+export const FOREARMS = [
+  { bone: 'leftForeArm', root: KPT.leftElbow, mid: KPT.leftWrist, rollA: KPT.leftIndexBase, rollB: KPT.leftPinkyBase, depth: 1 },
+  { bone: 'rightForeArm', root: KPT.rightElbow, mid: KPT.rightWrist, rollA: KPT.rightIndexBase, rollB: KPT.rightPinkyBase, depth: 1 }
+];
+
+// Direction-only bones (swing). `depth` damps noisy monocular z per-bone.
 export const SEGMENTS = [
-  { bone: 'leftArm', from: kpt(KPT.leftShoulder), to: kpt(KPT.leftElbow), depth: 1 },
-  { bone: 'leftForeArm', from: kpt(KPT.leftElbow), to: kpt(KPT.leftWrist), depth: 1 },
-  { bone: 'rightArm', from: kpt(KPT.rightShoulder), to: kpt(KPT.rightElbow), depth: 1 },
-  { bone: 'rightForeArm', from: kpt(KPT.rightElbow), to: kpt(KPT.rightWrist), depth: 1 },
-  { bone: 'leftUpLeg', from: kpt(KPT.leftHip), to: kpt(KPT.leftKnee), depth: 0.35 },
   { bone: 'leftLeg', from: kpt(KPT.leftKnee), to: kpt(KPT.leftAnkle), depth: 0.35 },
-  { bone: 'rightUpLeg', from: kpt(KPT.rightHip), to: kpt(KPT.rightKnee), depth: 0.35 },
   { bone: 'rightLeg', from: kpt(KPT.rightKnee), to: kpt(KPT.rightAnkle), depth: 0.35 },
   { bone: 'leftFoot', from: kpt(KPT.leftAnkle), to: kpt(KPT.leftBigToe), depth: 0.35 },
   { bone: 'rightFoot', from: kpt(KPT.rightAnkle), to: kpt(KPT.rightBigToe), depth: 0.35 },
+  // Hands: wrist → middle-finger base. Leaf bones (no child) — bind dir captured
+  // from forearm→hand. Drives wrist bend; twist (pronation) is a follow-up.
+  { bone: 'leftHand', from: kpt(KPT.leftWrist), to: kpt(KPT.leftMiddleBase), depth: 1 },
+  { bone: 'rightHand', from: kpt(KPT.rightWrist), to: kpt(KPT.rightMiddleBase), depth: 1 },
   // NOTE: no 'spine' segment — the Meshy 'Spine' bone's child sits BELOW it
   // (Spine→Spine01 = -y), so aiming it up is a ~180° flip → degenerate chest roll
   // (one shoulder up/down, see §B). Torso lean is driven via Hips instead.
-  // neck aimed at the face centroid (steadier than the lone nose). Keeps most
-  // depth so head pitch (look up/down) registers; earlier droop was Hips, not neck.
-  { bone: 'neck', from: shoulderCenter, to: headCenter, depth: 0.85 }
+  // NOTE: neck is NOT here — driven by _aimHead (full basis: head-up + face-right
+  // for head yaw/roll), not a plain direction aim.
 ];
 
 // Pelvis (Hips) torso-lean uses damped depth too (avoids forward droop).

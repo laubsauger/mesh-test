@@ -1,109 +1,180 @@
-// HumanoidRetargeter (T12): aim each rig bone along its canonical segment
-// direction. Rotation-only (ignores scale) onto the SHARED batch skeleton; the
-// caller snapshots the resulting boneMatrices into the performer's slice (V5,
-// V20). First-pass segment alignment — swing-twist + joint limits are follow-ups.
+// HumanoidRetargeter (T12): drive the rig from a canonical pose. Upper limb bones
+// get full swing-TWIST via a bend-plane basis (§22); other bones are direction-
+// aimed (swing only). Rotation-only onto the SHARED batch skeleton; the caller
+// snapshots the resulting boneMatrices into the performer's slice (V5, V20).
 //
 // IMPORTANT: never call skeleton.pose(). Its bind is reconstructed from
 // boneInverses in the ORIGINAL (pre-normalizeModel) space, so on a normalized
 // source it injects a residual scale (mesh shrinks ~0.01 → vanishes, see §B).
-// Rest is restored from the rest LOCAL quaternions captured at load, which live
-// in the normalized source space.
+// Rest is restored from rest LOCAL quaternions captured at load.
 import * as THREE from 'three';
-import { resolveRigBones, SEGMENTS, hipCenter, shoulderCenter, HIPS_DEPTH } from './rig-map.js';
+import { resolveRigBones, SEGMENTS, LIMBS, FOREARMS, hipCenter, shoulderCenter, headCenter, HIPS_DEPTH } from './rig-map.js';
+import { KPT } from './rtmw-constants.js';
+
+const _xAxis = new THREE.Vector3(1, 0, 0);
 
 const _boneW = new THREE.Vector3();
 const _childW = new THREE.Vector3();
+const _endW = new THREE.Vector3();
 const _target = new THREE.Vector3();
+const _rootP = new THREE.Vector3();
+const _midP = new THREE.Vector3();
+const _endP = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _planeN = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _qParent = new THREE.Quaternion();
 const _qLocal = new THREE.Quaternion();
 const _qDelta = new THREE.Quaternion();
+const _mBind = new THREE.Matrix4();
+const _mTarget = new THREE.Matrix4();
 const DEG2RAD = Math.PI / 180;
 
+// Rotation mapping orthonormal-ish basis (a1,a2) → (b1,b2), written to `out`.
+const _a2o = new THREE.Vector3();
+const _a3 = new THREE.Vector3();
+const _b2o = new THREE.Vector3();
+const _b3 = new THREE.Vector3();
+function basisQuat(a1, a2, b1, b2, out) {
+  _a2o.copy(a2).addScaledVector(a1, -a1.dot(a2)).normalize();
+  _a3.crossVectors(a1, _a2o);
+  _b2o.copy(b2).addScaledVector(b1, -b1.dot(b2)).normalize();
+  _b3.crossVectors(b1, _b2o);
+  _mBind.makeBasis(a1, _a2o, _a3).transpose(); // orthonormal → inverse = transpose
+  _mTarget.makeBasis(b1, _b2o, _b3).multiply(_mBind); // target * bind⁻¹
+  out.setFromRotationMatrix(_mTarget);
+}
+
 export class Retargeter {
-  constructor(skeleton, { basis = null, restQuats = null } = {}) {
+  constructor(skeleton, { restQuats = null } = {}) {
     this.skeleton = skeleton;
     this.rig = resolveRigBones(skeleton);
-    this.basis = basis; // optional THREE.Quaternion: canonical-space → rig-space
     this.restQuats = restQuats; // rest LOCAL quats (normalized source space), per bone
-    this.bind = new Map(); // boneKey → { restDirWorld, bindWorldQuat, restLocalQuat }
+    this.bind = new Map(); // boneKey → { restDirWorld, bindWorldQuat, restLocalQuat, bindPlaneN? }
     this.smoothed = new Map(); // boneKey → persistent slerped local quat (T10·2)
+    this.lastPlaneN = new Map(); // limb → last good bend-plane normal (pole stability)
     this._captureBind();
   }
 
-  // Restore bones to their rest LOCAL rotations (NOT skeleton.pose()).
   restPose() {
     if (!this.restQuats) return;
     const bones = this.skeleton.bones;
     for (let i = 0; i < bones.length; i += 1) bones[i].quaternion.copy(this.restQuats[i]);
   }
 
-  // Capture rest world direction (bone → child) + bind world orientation for a
-  // bone, given which child defines its "forward". Returns false if degenerate.
   _captureBone(boneKey, childBone) {
     const bone = this.rig[boneKey];
-    if (!bone || !childBone) return false;
+    if (!bone || !childBone) return null;
     _boneW.setFromMatrixPosition(bone.matrixWorld);
     _childW.setFromMatrixPosition(childBone.matrixWorld);
     const restDirWorld = _childW.clone().sub(_boneW);
-    if (restDirWorld.lengthSq() < 1e-10) return false;
+    if (restDirWorld.lengthSq() < 1e-10) return null;
     restDirWorld.normalize();
     const bindWorldQuat = new THREE.Quaternion();
     bone.getWorldQuaternion(bindWorldQuat);
-    // rest LOCAL rotation (bones are at rest here) — reference for joint limits.
-    this.bind.set(boneKey, { restDirWorld, bindWorldQuat, restLocalQuat: bone.quaternion.clone() });
-    return true;
+    const entry = { restDirWorld, bindWorldQuat, restLocalQuat: bone.quaternion.clone() };
+    this.bind.set(boneKey, entry);
+    return entry;
   }
 
   _captureBind() {
     this.restPose();
     for (const bone of this.skeleton.bones) bone.updateWorldMatrix(true, false);
 
-    // Pelvis "forward" axis = up the spine (Hips → Spine). Driving it leans the
-    // whole torso (the forward/side bend).
-    this._captureBone('hips', this.rig.spine);
+    // Pelvis: rest dir = up the spine; bindAcross = its "right" axis (for yaw).
+    const hipsEntry = this._captureBone('hips', this.rig.spine);
+    if (hipsEntry) {
+      _endP.copy(_xAxis).applyQuaternion(hipsEntry.bindWorldQuat);
+      _endP.addScaledVector(hipsEntry.restDirWorld, -hipsEntry.restDirWorld.dot(_endP));
+      if (_endP.lengthSq() > 1e-8) hipsEntry.bindAcross = _endP.clone().normalize();
+    }
+
+    // Pelvis vertical (squat): rest Hips local Y + the rig's standing leg span
+    // (hip→foot world height) → maps canonical pelvis-drop to rig units.
+    this.hipsRestPosY = this.rig.hips.position.y;
+    _boneW.setFromMatrixPosition(this.rig.leftFoot.matrixWorld);
+    _childW.setFromMatrixPosition(this.rig.rightFoot.matrixWorld);
+    this.restFootMinY = Math.min(_boneW.y, _childW.y); // rest floor height (WORLD, grounding anchor)
+    // foot Y is WORLD (incl normalizeModel scale); hips.position is LOCAL — convert
+    // the world ground delta to hips-local via the parent's world scale.
+    _endP.setFromMatrixScale(this.rig.hips.parent.matrixWorld);
+    this.hipsParentScaleY = _endP.y || 1;
+    this.groundOffsetY = 0;
 
     for (const seg of SEGMENTS) {
-      const bone = this.rig[seg.bone];
-      this._captureBone(seg.bone, bone?.children.find((c) => c.isBone));
+      this._captureBone(seg.bone, this.rig[seg.bone]?.children.find((c) => c.isBone));
+    }
+
+    // Forearms: rest dir (forearm→hand) + a bind "across" axis (world-x projected
+    // perpendicular to the bone) as the roll reference for hand-knuckle twist.
+    for (const fa of FOREARMS) {
+      const entry = this._captureBone(fa.bone, this.rig[fa.bone]?.children.find((c) => c.isBone));
+      if (!entry) continue;
+      _endP.copy(_xAxis).applyQuaternion(entry.bindWorldQuat);
+      _endP.addScaledVector(entry.restDirWorld, -entry.restDirWorld.dot(_endP));
+      if (_endP.lengthSq() > 1e-8) entry.bindAcross = _endP.clone().normalize();
+    }
+
+    // Neck: rest dir up + bindAcross "right" (for head yaw/roll via the eye line).
+    const neckEntry = this._captureBone('neck', this.rig.head);
+    if (neckEntry) {
+      _endP.copy(_xAxis).applyQuaternion(neckEntry.bindWorldQuat);
+      _endP.addScaledVector(neckEntry.restDirWorld, -neckEntry.restDirWorld.dot(_endP));
+      if (_endP.lengthSq() > 1e-8) neckEntry.bindAcross = _endP.clone().normalize();
+    }
+
+    // Hands are leaf bones (no child) — derive rest direction from forearm→hand
+    // (the hand's extension axis), aimed at wrist→middle-finger.
+    for (const handKey of ['leftHand', 'rightHand']) {
+      const bone = this.rig[handKey];
+      if (!bone?.parent?.isBone) continue;
+      _boneW.setFromMatrixPosition(bone.matrixWorld);
+      _childW.setFromMatrixPosition(bone.parent.matrixWorld);
+      const restDirWorld = _boneW.clone().sub(_childW); // forearm → hand
+      if (restDirWorld.lengthSq() < 1e-10) continue;
+      restDirWorld.normalize();
+      const bindWorldQuat = new THREE.Quaternion();
+      bone.getWorldQuaternion(bindWorldQuat);
+      this.bind.set(handKey, { restDirWorld, bindWorldQuat, restLocalQuat: bone.quaternion.clone() });
+    }
+
+    // Upper limbs: also capture the bind bend-plane normal from the rest rig
+    // (upper → mid → end bone positions) for swing-twist.
+    for (const limb of LIMBS) {
+      const midBone = this.rig[limb.midBone];
+      const endBone = this.rig[limb.endBone];
+      const entry = this._captureBone(limb.upper, midBone);
+      if (!entry || !endBone) continue;
+      _boneW.setFromMatrixPosition(this.rig[limb.upper].matrixWorld);
+      _childW.setFromMatrixPosition(midBone.matrixWorld);
+      _endW.setFromMatrixPosition(endBone.matrixWorld);
+      _dir.copy(_childW).sub(_boneW);
+      _planeN.copy(_endW).sub(_childW).cross(_dir); // (end-mid) × (mid-root)
+      if (_planeN.lengthSq() > 1e-10) entry.bindPlaneN = _planeN.clone().normalize();
     }
   }
 
-  // Aim a captured bone from world dir (to - from). from/to: {x,y,z,confidence}.
-  // depthScale damps the noisy z per-bone (arms full, torso/legs/head low).
-  // maxAngleDeg clamps rotation from rest (joint limit, T13). follow is the
-  // per-render-frame slerp rate toward the target (T10·2) — decouples render
-  // smoothness from the slow pose-fps (no stop-motion) and damps jitter.
-  _aim(boneKey, from, to, kptThresh, mirrorX, depthScale, maxAngleDeg, follow) {
-    const bind = this.bind.get(boneKey);
-    if (!bind || !from || !to || from.confidence < kptThresh || to.confidence < kptThresh) return;
-
-    _target.set(to.x - from.x, to.y - from.y, (to.z - from.z) * depthScale);
-    if (_target.lengthSq() < 1e-8) return;
-    _target.normalize();
-    if (mirrorX) _target.x = -_target.x; // selfie video is X-mirrored
-
-    _q.setFromUnitVectors(bind.restDirWorld, _target).multiply(bind.bindWorldQuat);
-
+  // Set bone local from a target WORLD quat: parent-relative, gain scale, joint-
+  // limit clamp, render-rate slerp (T10·2). gain<1 scales the rotation away from
+  // rest (tames over-eager bones, e.g. head pitch).
+  _setBoneFromWorld(boneKey, bind, qWorld, maxAngleDeg, follow, gain = 1) {
     const bone = this.rig[boneKey];
     if (bone.parent) {
       bone.parent.getWorldQuaternion(_qParent).invert();
-      _qLocal.copy(_qParent.multiply(_q));
+      _qLocal.copy(_qParent.multiply(qWorld));
     } else {
-      _qLocal.copy(_q);
+      _qLocal.copy(qWorld);
     }
 
-    // Joint limit: clamp the rotation away from rest to maxAngleDeg.
+    if (gain < 1) _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, gain);
+
     if (maxAngleDeg < 180) {
       _qDelta.copy(bind.restLocalQuat).invert().multiply(_qLocal);
       const angle = 2 * Math.acos(Math.min(1, Math.abs(_qDelta.w)));
       const maxRad = maxAngleDeg * DEG2RAD;
-      if (angle > maxRad && angle > 1e-4) {
-        _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, maxRad / angle);
-      }
+      if (angle > maxRad && angle > 1e-4) _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, maxRad / angle);
     }
 
-    // Render-rate interpolation: slerp persistent state toward the target.
     let cur = this.smoothed.get(boneKey);
     if (!cur) {
       cur = bind.restLocalQuat.clone();
@@ -114,19 +185,208 @@ export class Retargeter {
     bone.updateWorldMatrix(false, false);
   }
 
-  // canonical: { joints: [{x,y,z,confidence}, ...] } in canonical space.
-  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, follow = 1 } = {}) {
-    this.restPose(); // start from rest each frame so untracked bones stay at rest
+  // Direction-only (swing) aim. from/to: {x,y,z,confidence}.
+  _aim(boneKey, from, to, opts) {
+    const bind = this.bind.get(boneKey);
+    if (!bind || !from || !to || from.confidence < opts.kptThresh || to.confidence < opts.kptThresh) return;
+    _target.set(to.x - from.x, to.y - from.y, (to.z - from.z) * opts.depth);
+    if (_target.lengthSq() < 1e-8) return;
+    _target.normalize();
+    if (opts.mirrorX) _target.x = -_target.x;
+    _q.setFromUnitVectors(bind.restDirWorld, _target).multiply(bind.bindWorldQuat);
+    this._setBoneFromWorld(boneKey, bind, _q, opts.maxAngleDeg, opts.follow, opts.gain ?? 1);
+  }
 
-    // Pelvis first (root) — leans the whole body; limbs below compensate via
-    // their parent's world orientation. Damped depth (avoids forward droop).
-    this._aim('hips', hipCenter(canonical), shoulderCenter(canonical), kptThresh, mirrorX, depthScale * HIPS_DEPTH, jointLimitDeg, follow);
+  // Upper-limb aim with swing-twist: orient by bone direction AND bend-plane.
+  _aimLimb(limb, canonical, opts) {
+    const bind = this.bind.get(limb.upper);
+    if (!bind) return;
+    const r = canonical.joints[limb.root];
+    const m = canonical.joints[limb.mid];
+    const e = canonical.joints[limb.end];
+    if (!r || !m || r.confidence < opts.kptThresh || m.confidence < opts.kptThresh) return;
 
+    const sx = opts.mirrorX ? -1 : 1;
+    _rootP.set(r.x * sx, r.y, r.z * limb.depth);
+    _midP.set(m.x * sx, m.y, m.z * limb.depth);
+    _dir.copy(_midP).sub(_rootP);
+    if (_dir.lengthSq() < 1e-8) return;
+    _dir.normalize();
+
+    const canTwist = opts.swingTwist && bind.bindPlaneN && e && e.confidence >= opts.kptThresh;
+    if (canTwist) {
+      _endP.set(e.x * sx, e.y, e.z * limb.depth);
+      _planeN.copy(_endP).sub(_midP).cross(_dir); // (end-mid) × (dir)
+      const planeLen = _planeN.length();
+      // Pole-vector stability + smoothing: the bend normal depends on the wrist,
+      // so wrist/forearm jitter would roll the UPPER arm ("elbow spins when I turn
+      // my wrist"). Reuse the last plane when near-straight, and heavily smooth it
+      // (lerp) so twist follows gross changes, not per-frame wrist noise.
+      let plane = null;
+      if (planeLen > 0.04) {
+        _planeN.divideScalar(planeLen);
+        let last = this.lastPlaneN.get(limb.upper);
+        if (!last) {
+          last = _planeN.clone();
+          this.lastPlaneN.set(limb.upper, last);
+        } else {
+          last.lerp(_planeN, opts.planeFollow).normalize();
+        }
+        plane = last;
+      } else {
+        plane = this.lastPlaneN.get(limb.upper) ?? null;
+      }
+      if (plane) {
+        basisQuat(bind.restDirWorld, bind.bindPlaneN, _dir, plane, _q);
+        _q.multiply(bind.bindWorldQuat);
+        this._setBoneFromWorld(limb.upper, bind, _q, opts.maxAngleDeg, opts.follow);
+        return;
+      }
+    }
+    // fallback: swing only
+    _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat);
+    this._setBoneFromWorld(limb.upper, bind, _q, opts.maxAngleDeg, opts.follow);
+  }
+
+  // Forearm: aim elbow→wrist (swing) + optional axial twist from the hand knuckle
+  // line (indexMCP→pinkyMCP), so pronation/supination rotates the forearm.
+  _aimForeArm(fa, canonical, opts) {
+    const bind = this.bind.get(fa.bone);
+    if (!bind) return;
+    const r = canonical.joints[fa.root];
+    const m = canonical.joints[fa.mid];
+    if (!r || !m || r.confidence < opts.kptThresh || m.confidence < opts.kptThresh) return;
+    const sx = opts.mirrorX ? -1 : 1;
+    _rootP.set(r.x * sx, r.y, r.z * opts.depth);
+    _midP.set(m.x * sx, m.y, m.z * opts.depth);
+    _dir.copy(_midP).sub(_rootP);
+    if (_dir.lengthSq() < 1e-8) return;
+    _dir.normalize();
+
+    if (opts.wristTwist && bind.bindAcross) {
+      const a = canonical.joints[fa.rollA];
+      const b = canonical.joints[fa.rollB];
+      if (a && b && a.confidence >= opts.kptThresh && b.confidence >= opts.kptThresh) {
+        _planeN.set((b.x - a.x) * sx, b.y - a.y, (b.z - a.z) * opts.depth);
+        _planeN.addScaledVector(_dir, -_dir.dot(_planeN)); // perpendicular to forearm
+        const len = _planeN.length();
+        if (len > 0.02) {
+          _planeN.divideScalar(len);
+          let last = this.lastPlaneN.get(fa.bone);
+          if (!last) { last = _planeN.clone(); this.lastPlaneN.set(fa.bone, last); }
+          else last.lerp(_planeN, opts.planeFollow).normalize();
+          basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
+          _q.multiply(bind.bindWorldQuat);
+          this._setBoneFromWorld(fa.bone, bind, _q, opts.maxAngleDeg, opts.follow);
+          return;
+        }
+      }
+    }
+    _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat);
+    this._setBoneFromWorld(fa.bone, bind, _q, opts.maxAngleDeg, opts.follow);
+  }
+
+  // Pelvis with optional YAW: up→torso-up (lean) + right→hip-axis (turning), so
+  // the whole upper body rotates when you turn. Falls back to lean-only.
+  _aimHips(canonical, opts) {
+    const bind = this.bind.get('hips');
+    if (!bind) return;
+    const hc = hipCenter(canonical);
+    const sc = shoulderCenter(canonical);
+    const lh = canonical.joints[KPT.leftHip];
+    const rh = canonical.joints[KPT.rightHip];
+    if (hc.confidence < opts.kptThresh || sc.confidence < opts.kptThresh || !lh || !rh) return;
+    const sx = opts.mirrorX ? -1 : 1;
+    _dir.set((sc.x - hc.x) * sx, sc.y - hc.y, (sc.z - hc.z) * opts.depth); // torso up (lean)
+    if (_dir.lengthSq() < 1e-8) return;
+    _dir.normalize();
+
+    if (opts.yaw && bind.bindAcross && lh.confidence >= opts.kptThresh && rh.confidence >= opts.kptThresh) {
+      // hip axis (right). Turning lives in the z-separation, which monocular depth
+      // under-reads → amplify z by yawGain so turns actually register.
+      _planeN.set((rh.x - lh.x) * sx, rh.y - lh.y, (rh.z - lh.z) * opts.yawGain);
+      _planeN.addScaledVector(_dir, -_dir.dot(_planeN)); // perpendicular to up
+      const len = _planeN.length();
+      if (len > 0.02) {
+        _planeN.divideScalar(len);
+        let last = this.lastPlaneN.get('hips');
+        if (!last) { last = _planeN.clone(); this.lastPlaneN.set('hips', last); }
+        else last.lerp(_planeN, Math.max(opts.planeFollow, 0.3)).normalize(); // responsive yaw
+        basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
+        _q.multiply(bind.bindWorldQuat);
+        this._setBoneFromWorld('hips', bind, _q, opts.maxAngleDeg, opts.follow);
+        return;
+      }
+    }
+    _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat); // lean only
+    this._setBoneFromWorld('hips', bind, _q, opts.maxAngleDeg, opts.follow);
+  }
+
+  // Head/neck: pitch from head-up direction, + YAW from the nose's horizontal
+  // offset vs the ear midpoint (a robust 2D signal — head turn shifts the nose
+  // sideways between the ears; no reliance on weak depth).
+  _aimHead(canonical, opts) {
+    const bind = this.bind.get('neck');
+    if (!bind) return;
+    const sc = shoulderCenter(canonical);
+    const hcen = headCenter(canonical);
+    if (sc.confidence < opts.kptThresh || hcen.confidence < opts.kptThresh) return;
+    const sx = opts.mirrorX ? -1 : 1;
+    _dir.set((hcen.x - sc.x) * sx, hcen.y - sc.y, (hcen.z - sc.z) * opts.depth);
+    if (_dir.lengthSq() < 1e-8) return;
+    _dir.normalize();
+    _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat); // pitch
+
+    const nose = canonical.joints[KPT.nose];
+    const le = canonical.joints[KPT.leftEar];
+    const re = canonical.joints[KPT.rightEar];
+    if (opts.yaw && nose && le && re && nose.confidence >= opts.kptThresh && le.confidence >= opts.kptThresh && re.confidence >= opts.kptThresh) {
+      const earMidX = (le.x + re.x) / 2;
+      const earW = Math.abs(re.x - le.x) || 0.1;
+      let yawA = (-(nose.x - earMidX) / earW) * sx * opts.yawGain * 0.6;
+      yawA = Math.max(-1.2, Math.min(1.2, yawA)); // clamp ±~70°
+      _qParent.setFromAxisAngle(_dir, yawA); // yaw about the head's up axis
+      _q.premultiply(_qParent);
+    }
+    this._setBoneFromWorld('neck', bind, _q, opts.maxAngleDeg, opts.follow, opts.gain);
+  }
+
+  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, yawGain = 2.5 } = {}) {
+    this.restPose();
+    this.rig.hips.position.y = this.hipsRestPosY; // reset (restPose only touches rotations)
+    const base = { kptThresh, mirrorX, follow, maxAngleDeg: jointLimitDeg, swingTwist, planeFollow };
+
+    // Pelvis rotation (leans whole body); upper limbs next (children compensate);
+    // forearms (with optional twist); then lower bones / feet / hands / neck. Arms
+    // use a tighter limit (over-rotation guard).
+    this._aimHips(canonical, { ...base, depth: depthScale * HIPS_DEPTH, yaw: bodyYaw, yawGain });
+    for (const limb of LIMBS) {
+      const isArm = limb.upper.includes('Arm');
+      this._aimLimb(limb, canonical, { ...base, depth: depthScale * limb.depth, maxAngleDeg: isArm ? armLimit : jointLimitDeg });
+    }
+    for (const fa of FOREARMS) this._aimForeArm(fa, canonical, { ...base, depth: depthScale * fa.depth, wristTwist, maxAngleDeg: armLimit });
+    this._aimHead(canonical, { ...base, depth: depthScale * 0.85, yawGain, gain: headGain });
     for (const seg of SEGMENTS) {
-      this._aim(
-        seg.bone, seg.from(canonical), seg.to(canonical),
-        kptThresh, mirrorX, depthScale * (seg.depth ?? 1), seg.maxAngle ?? jointLimitDeg, follow
-      );
+      this._aim(seg.bone, seg.from(canonical), seg.to(canonical), {
+        ...base,
+        depth: depthScale * (seg.depth ?? 1),
+        maxAngleDeg: seg.maxAngle ?? jointLimitDeg
+      });
+    }
+
+    // Foot-anchored grounding (§24/§25): the pose just bent the legs with the
+    // pelvis at rest height → the feet moved off the floor. Offset the Hips so the
+    // LOWEST (support) foot returns to its rest floor height — so squats lower the
+    // body with feet planted, instead of the pelvis floating + legs pulling up.
+    if (grounding) {
+      _boneW.setFromMatrixPosition(this.rig.leftFoot.matrixWorld);
+      _childW.setFromMatrixPosition(this.rig.rightFoot.matrixWorld);
+      const lowestFootY = Math.min(_boneW.y, _childW.y);
+      const targetDelta = this.restFootMinY - lowestFootY; // + to lift body so foot sits on floor
+      this.groundOffsetY += (targetDelta - this.groundOffsetY) * groundFollow; // smooth the bob
+      this.rig.hips.position.y = this.hipsRestPosY + this.groundOffsetY / this.hipsParentScaleY; // world→local
+    } else {
+      this.groundOffsetY = 0;
     }
   }
 }

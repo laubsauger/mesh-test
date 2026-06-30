@@ -39,9 +39,10 @@ describe('rig-map — T11: canonical → Meshy bone', () => {
     }
   });
 
-  it('SEGMENTS include head (neck); torso lean is driven via Hips, not a spine segment', () => {
+  it('SEGMENTS exclude spine (180° flip) + neck/head (driven by full-basis _aimHead/_aimHips)', () => {
     const bones = SEGMENTS.map((s) => s.bone);
-    expect(bones).toContain('neck');
     expect(bones).not.toContain('spine'); // §B: Spine child is below it → 180° flip
+    expect(bones).not.toContain('neck'); // head yaw/roll via _aimHead basis
+    expect(bones).toContain('leftFoot'); // feet still direction-aimed
   });
 });

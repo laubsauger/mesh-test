@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { bboxToRect, decode3d } from '../src/pose/decode.js';
+import { bboxToRect, decode3d, letterboxRect } from '../src/pose/decode.js';
 import { Z_RANGE, RTMW3D_MODEL } from '../src/pose/rtmw-constants.js';
 
 const { resW, resH } = RTMW3D_MODEL; // 288 x 384
@@ -28,6 +28,26 @@ describe('bboxToRect — aspect pad + padding (V_pre)', () => {
     // centered on box center (50,50)
     expect(rect.sx).toBeCloseTo(50 - 62.5, 4);
     expect(rect.sy).toBeCloseTo(50 - 83.3333, 3);
+  });
+});
+
+describe('letterboxRect — aspect-preserved fit + inverse map', () => {
+  it('16:9 video into 384 square: fits width, centers vertically', () => {
+    const lb = letterboxRect(1280, 720, 384);
+    expect(lb.scale).toBeCloseTo(384 / 1280, 6); // longest side (width) fills
+    expect(lb.drawW).toBeCloseTo(384, 4);
+    expect(lb.offsetX).toBeCloseTo(0, 4);
+    expect(lb.drawH).toBeCloseTo(216, 4);
+    expect(lb.offsetY).toBeCloseTo(84, 4); // (384-216)/2
+  });
+
+  it('inverse maps a detection-space point back to source px', () => {
+    const lb = letterboxRect(1280, 720, 384);
+    // a point at the letterbox center maps to video center
+    const xs = (192 - lb.offsetX) / lb.scale;
+    const ys = (192 - lb.offsetY) / lb.scale;
+    expect(xs).toBeCloseTo(640, 3);
+    expect(ys).toBeCloseTo(360, 3);
   });
 });
 

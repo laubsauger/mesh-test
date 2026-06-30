@@ -18,6 +18,16 @@ export function bboxToRect(box, resW = RTMW3D_MODEL.resW, resH = RTMW3D_MODEL.re
   return { sx: cx - w / 2, sy: cy - h / 2, sw: w, sh: h };
 }
 
+// Letterbox a vidW×vidH frame into an R×R square preserving aspect (yolo wants
+// aspect-correct input, not a stretched square). Returns the draw rect + the
+// inverse mapping (detection px in R-space → source px).
+export function letterboxRect(vidW, vidH, R) {
+  const scale = R / Math.max(vidW, vidH);
+  const drawW = vidW * scale;
+  const drawH = vidH * scale;
+  return { scale, drawW, drawH, offsetX: (R - drawW) / 2, offsetY: (R - drawH) / 2 };
+}
+
 // 3-axis SimCC argmax decode. `out` = { [outX]:{data,dims}, [outY]:..., [outZ]:... }.
 // Returns k2d (source-frame px + score) for overlays and k3d (root-relative
 // normalized + score) for driving. resW/resH = model input W/H.

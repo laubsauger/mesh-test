@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { toCanonical } from '../src/pose/observation-adapter.js';
+import { toCanonical, mirrorCanonical, MIRROR_INDEX } from '../src/pose/observation-adapter.js';
 import { KPT, NUM_KPTS } from '../src/pose/rtmw-constants.js';
 
 // Minimal frame: full 133 kpts, only hips + shoulders meaningful.
@@ -44,5 +44,23 @@ describe('toCanonical — V21/V22: pelvis-center + canonical basis', () => {
   it('throws if hips missing (no pelvis origin)', () => {
     const bad = { timestampMs: 0, keypoints3D: [{ x: 0, y: 0, z: 0, confidence: 0 }] };
     expect(() => toCanonical(bad)).toThrow(/hip/);
+  });
+});
+
+describe('mirrorCanonical — swap left↔right (no coord negate)', () => {
+  it('MIRROR_INDEX swaps pairs + hands, keeps nose/spine', () => {
+    expect(MIRROR_INDEX[KPT.leftShoulder]).toBe(KPT.rightShoulder);
+    expect(MIRROR_INDEX[KPT.rightWrist]).toBe(KPT.leftWrist);
+    expect(MIRROR_INDEX[91]).toBe(112); // hand block
+    expect(MIRROR_INDEX[KPT.nose]).toBe(KPT.nose);
+  });
+
+  it('proper mirror: left data → right joint, x negated (swap + reflect)', () => {
+    const joints = Array.from({ length: NUM_KPTS }, () => ({ x: 0, y: 0, z: 0, confidence: 0.9 }));
+    joints[KPT.leftWrist] = { x: 0.7, y: 0.2, z: 0.1, confidence: 0.9 };
+    const m = mirrorCanonical({ timestampMs: 0, joints });
+    expect(m.joints[KPT.rightWrist].x).toBe(-0.7); // swapped AND x-negated
+    expect(m.joints[KPT.rightWrist].y).toBe(0.2);
+    expect(m.joints[KPT.rightWrist].z).toBe(0.1);
   });
 });

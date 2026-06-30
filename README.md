@@ -1,0 +1,74 @@
+# Mesh VJ Layer — WebGPU crowd + real-time webcam pose driving
+
+A WebGPU "VJ layer": GPU-skinned crowd of Meshy biped characters with live
+arrangement / motion / lighting, **and** real-time RTMW3D webcam pose driving one
+(or many) of the characters. Three.js r0.185 + TSL + Vite. Pure ESM. **WebGPU
+only** — no WebGL fallback.
+
+See `SPEC.md` for the full spec/invariants and `docs/pose-driver.md` for the pose
+design.
+
+## Prerequisites
+
+- **Node 18+** and npm.
+- A **WebGPU browser**: Chrome or Edge (Windows/macOS/Linux). Check
+  `chrome://gpu` shows WebGPU enabled.
+- A **webcam** for pose driving.
+- The **pose ONNX models** (large, git-ignored — see below).
+
+## Models (required, git-ignored)
+
+The character GLBs in `public/models/*.glb` are committed. The **pose models are
+not** — `rtmw3d-x` is ~369 MB (> GitHub's 100 MB limit), so `public/models/**/*.onnx`
+is git-ignored. After cloning you must place them:
+
+```
+public/models/rtmw3d-x/inference_model.onnx      # RTMW3D-x 3D pose (≈369 MB)
+public/models/yolo26n/inference_model_384.onnx   # person detector (top-down crop)
+```
+
+Generate them with `export_onnx.py` from the companion `object-detect` project, or
+copy an existing `web/public/models/{rtmw3d-x,yolo26n}` folder. The app throws a
+clear "model fetch 404" if they're missing.
+
+## Run
+
+```bash
+npm install
+npm run dev        # http://127.0.0.1:5173  (port may shift if taken)
+npm run build      # production build → dist/  (also emits dist/ort/)
+npm run preview    # serve the built dist/
+npm test           # vitest (pure pose-math units)
+```
+
+The dev server sets **COOP/COEP** headers (cross-origin isolation) so
+onnxruntime-web can multi-thread; a small Vite plugin serves the ort wasm from
+`node_modules` (and emits to `dist/ort/` on build). No CDN, no manual copy.
+
+All runtime controls live in the three.js **Inspector** panels (`VJ Layer / *`),
+not custom DOM — Pose, Pose Stats, Scene, Lighting, Meshes.
+
+## Pose pipeline (short version)
+
+Webcam → **Web Worker** (`src/pose/pose-worker.js`, own GPUDevice so inference
+doesn't contend with the renderer) → yolo26n detect (letterboxed 384) → crop →
+rtmw3d → SimCC decode → canonical → retarget onto the Meshy rig. Inference EP is
+**webgpu** (the only viable one in-browser here; wasm OOMs on the 369 MB model
+alongside the GLB scene — see `SPEC.md` §B5).
+
+## Windows / performance
+
+Cloning and running on **Windows with a discrete NVIDIA/AMD GPU + Chrome WebGPU**
+is the easy perf win — the in-browser webgpu EP will be far faster than an
+integrated/battery Mac (the 369 MB model's per-inference time drops a lot). Just
+follow **Run** above; everything is cross-platform (the Vite plugin uses Node path
+APIs, COOP/COEP works on Windows dev).
+
+**TensorRT note:** onnxruntime-**web** (what runs in the browser) has **no
+TensorRT EP** — TRT is a *native* provider. To use TensorRT / CUDA you'd run pose
+inference **natively** (Python/C++ onnxruntime with the TRT EP) as a local server
+and stream `RTMWPoseFrame`s to the browser over WebSocket — the same bridge
+pattern `object-detect/bridge.py` uses for detection. That's a separate native
+path (not yet built here); the browser side already speaks `RTMWPoseFrame`, so the
+adapter/retarget/render stack would be reused unchanged. This is the route for
+max performance on a Windows TRT box.

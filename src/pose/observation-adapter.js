@@ -11,6 +11,30 @@ function mid(a, b) {
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 };
 }
 
+// Index → its left/right partner (COCO-WholeBody). A proper mirror SWAPS paired
+// joints (relabel) — no coordinate negation, so handedness/bend-planes stay
+// consistent (unlike mirrorX, which reflects x and twists limbs).
+export const MIRROR_INDEX = (() => {
+  const m = Array.from({ length: 133 }, (_, i) => i);
+  const pairs = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12], [13, 14], [15, 16], [17, 20], [18, 21], [19, 22]];
+  for (const [a, b] of pairs) { m[a] = b; m[b] = a; }
+  for (let k = 0; k < 21; k += 1) { m[91 + k] = 112 + k; m[112 + k] = 91 + k; } // hands
+  return m;
+})();
+
+// Proper mirror: swap L/R joints AND negate x. Either alone is wrong — swap-only
+// gives a bone wrong-chirality data; x-negate-only reflects → flips bend-plane
+// handedness (twist). Together they're an orientation-preserving isometry per
+// limb (a reflected right arm IS a valid left arm), so swing-twist stays clean.
+export function mirrorCanonical(canon) {
+  const src = canon.joints;
+  const joints = src.map((_, i) => {
+    const s = src[MIRROR_INDEX[i]];
+    return { x: -s.x, y: s.y, z: s.z, confidence: s.confidence };
+  });
+  return { ...canon, joints };
+}
+
 export function toCanonical(frame) {
   const k = frame.keypoints3D;
   const lh = k[KPT.leftHip];

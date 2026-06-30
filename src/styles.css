@@ -94,6 +94,46 @@ body,
   text-transform: uppercase;
 }
 
+/* Fullscreen = clean output: hide the status line. */
+body.is-fullscreen .status {
+  display: none;
+}
+
+/* Guided calibration overlay — big, centered, readable from across the room. */
+.calib-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 8;
+  display: grid;
+  place-items: center;
+  background: rgb(2 4 10 / 0.45);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
+.calib-overlay[hidden] {
+  display: none;
+}
+
+.calib-text {
+  text-align: center;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #e8eef7;
+  line-height: 1.5;
+  white-space: pre-line;
+  text-shadow: 0 2px 16px rgb(0 0 0 / 0.75);
+}
+
+.calib-text .big {
+  display: block;
+  margin-top: 10px;
+  font-size: 110px;
+  font-variant-numeric: tabular-nums;
+  color: #39ff14;
+}
+
 .preloader {
   position: fixed;
   inset: 0;

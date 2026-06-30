@@ -22,8 +22,8 @@ export const RTMW3D_MODEL = {
 
 export const YOLO_DET_MODEL = {
   id: 'yolo26n',
-  url: 'models/yolo26n/inference_model.onnx',
-  res: 640,
+  url: 'models/yolo26n/inference_model_384.onnx', // 384 export (512/640 wasteful for this)
+  res: 384,
   inputName: 'images',
   personClassId: 0
 };
@@ -49,5 +49,12 @@ export const KPT = {
   leftKnee: 13, rightKnee: 14,
   leftAnkle: 15, rightAnkle: 16,
   leftBigToe: 17, leftSmallToe: 18, leftHeel: 19,
-  rightBigToe: 20, rightSmallToe: 21, rightHeel: 22
+  rightBigToe: 20, rightSmallToe: 21, rightHeel: 22,
+  // Hand keypoints: left 91-111, right 112-132 (21 each: wrist, then 5 fingers ×4).
+  // Middle-finger base (MCP) gives a stable hand-pointing direction.
+  leftHandRoot: 91, leftMiddleBase: 100,
+  rightHandRoot: 112, rightMiddleBase: 121,
+  // Finger MCP bases (knuckle line index→pinky gives palm/forearm roll axis).
+  leftIndexBase: 96, leftPinkyBase: 108,
+  rightIndexBase: 117, rightPinkyBase: 129
 };

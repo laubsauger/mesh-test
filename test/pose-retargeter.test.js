@@ -138,7 +138,7 @@ describe('Retargeter — T12: no NaN, valid bone matrices', () => {
     };
 
     const tight = new Retargeter(skeleton, { restQuats });
-    tight.apply(c, { kptThresh: 0.3, mirrorX: false, jointLimitDeg: 45 });
+    tight.apply(c, { kptThresh: 0.3, mirrorX: false, jointLimitDeg: 45, armLimit: 45 }); // leftArm uses armLimit
     expect(angleFromRest()).toBeLessThanOrEqual((45 + 1) * Math.PI / 180);
   });
 

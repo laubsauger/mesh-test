@@ -32,13 +32,16 @@ import { CHOREOGRAPHIES, computeWalkerPhase } from './choreography.js';
 import { boneSourceForIndex } from './bone-source.js';
 import { assetUrl } from './asset-url.js';
 import { POSE_EPS } from './pose/ep.js';
+import { BODY_BONES } from './pose/topology.js';
 import { probeEPs } from './pose/ep-probe.js';
 import { RTMWPoseProvider } from './pose/rtmw-provider.js';
+import { WorkerPoseProvider } from './pose/worker-pose-provider.js';
 import { drawOverlay } from './pose/overlay-2d.js';
-import { toCanonical } from './pose/observation-adapter.js';
+import { toCanonical, mirrorCanonical } from './pose/observation-adapter.js';
 import { Retargeter } from './pose/retargeter.js';
 import { KPT, NUM_KPTS } from './pose/rtmw-constants.js';
 import { CanonicalSmoother } from './pose/one-euro.js';
+import { PoseRecorder, PosePlayer } from './pose/recorder.js';
 
 const canvas = document.querySelector('#scene');
 const statusEl = document.querySelector('#status');
@@ -46,6 +49,8 @@ const posePipEl = document.querySelector('#pose-pip');
 const poseVideoEl = document.querySelector('#pose-video');
 const poseOverlayEl = document.querySelector('#pose-overlay');
 const posePipLabel = document.querySelector('#pose-pip-label');
+const calibOverlay = document.querySelector('#calib-overlay');
+const calibTextEl = document.querySelector('#calib-text');
 
 const preloaderEl = document.querySelector('#preloader');
 const preloaderBar = document.querySelector('#preloader-bar');
@@ -69,15 +74,62 @@ scene.background = new THREE.Color(0x010102);
 scene.fog = new THREE.FogExp2(0x010102, 0.034);
 
 const camera = new THREE.PerspectiveCamera(36, 1, 0.1, 180);
-camera.position.set(0, 3.4, 20);
+camera.position.set(0, 1.5, 5.5); // dev default: close on a single performer
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.055;
 controls.target.set(0, 0.95, 0);
-controls.maxPolarAngle = Math.PI * 0.48;
-controls.minDistance = 3.5;
-controls.maxDistance = 38;
+// Free framing: full vertical orbit, wide zoom range, screen-space pan.
+controls.maxPolarAngle = Math.PI;
+controls.minPolarAngle = 0;
+controls.minDistance = 0.5;
+controls.maxDistance = 300;
+controls.enablePan = true;
+controls.screenSpacePanning = true;
+controls.panSpeed = 1.0;
+controls.zoomSpeed = 1.2;
+const cameraOffset = new THREE.Vector3();
+
+// 3D debug overlay: the canonical pose (what drives the rig) drawn as a line
+// skeleton at the pose performer, to spot retarget discrepancies vs the mesh.
+const poseDebugGeom = new THREE.BufferGeometry();
+poseDebugGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(BODY_BONES.length * 2 * 3), 3));
+const poseDebugLines = new THREE.LineSegments(
+  poseDebugGeom,
+  new THREE.LineBasicMaterial({ color: 0x39ff14, depthTest: false, transparent: true })
+);
+poseDebugLines.frustumCulled = false;
+poseDebugLines.renderOrder = 999;
+poseDebugLines.visible = false;
+scene.add(poseDebugLines);
+
+// Magenta = the ACTUAL driven rig bones (placed on the mesh via the instance
+// matrix). Green pose vs magenta bones → see exactly how retarget interpreted it.
+const RIG_EDGE_NAMES = [
+  ['Hips', 'Spine'], ['Spine', 'Spine01'], ['Spine01', 'Spine02'], ['Spine02', 'neck'], ['neck', 'Head'],
+  ['Spine02', 'LeftShoulder'], ['LeftShoulder', 'LeftArm'], ['LeftArm', 'LeftForeArm'], ['LeftForeArm', 'LeftHand'],
+  ['Spine02', 'RightShoulder'], ['RightShoulder', 'RightArm'], ['RightArm', 'RightForeArm'], ['RightForeArm', 'RightHand'],
+  ['Hips', 'LeftUpLeg'], ['LeftUpLeg', 'LeftLeg'], ['LeftLeg', 'LeftFoot'],
+  ['Hips', 'RightUpLeg'], ['RightUpLeg', 'RightLeg'], ['RightLeg', 'RightFoot']
+];
+const poseRigGeom = new THREE.BufferGeometry();
+poseRigGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(RIG_EDGE_NAMES.length * 2 * 3), 3));
+const poseRigLines = new THREE.LineSegments(
+  poseRigGeom,
+  new THREE.LineBasicMaterial({ color: 0xff2bd6, depthTest: false, transparent: true })
+);
+poseRigLines.frustumCulled = false;
+poseRigLines.renderOrder = 1000;
+poseRigLines.visible = false;
+scene.add(poseRigLines);
+
+// Joint dots (lines are 1px in WebGPU — dots make the overlays readable).
+const poseDebugPoints = new THREE.Points(poseDebugGeom, new THREE.PointsMaterial({ color: 0x39ff14, size: 0.05, sizeAttenuation: true, depthTest: false, transparent: true }));
+const poseRigPoints = new THREE.Points(poseRigGeom, new THREE.PointsMaterial({ color: 0xff2bd6, size: 0.055, sizeAttenuation: true, depthTest: false, transparent: true }));
+for (const p of [poseDebugPoints, poseRigPoints]) { p.frustumCulled = false; p.renderOrder = 1001; p.visible = false; scene.add(p); }
+const _instMat = new THREE.Matrix4();
+const _vA = new THREE.Vector3();
 
 const floor = new THREE.Mesh(
   new THREE.PlaneGeometry(360, 360),
@@ -247,26 +299,50 @@ const state = {
   animationName: 'Walking',
   arrangement: 'line',
   movement: 'in place',
-  count: 7,
+  count: 1,
   speed: 1,
   choreography: 'desync',
   choreoDelay: 0.6,
-  posePerformerCount: 0,
-  // webgpu EP: works here and is fast; wasm EP currently freezes the main thread
-  // (heavy 369MB model, single inference loop) until the worker offload (T20).
-  // webgpu shares the renderer's GPU (V23 risk) — wasm-in-worker is the robust
-  // long-term path. Switch via the EP selector / probe.
+  posePerformerCount: 1,
+  // webgpu EP (only viable one here): wasm OOM-crashes the tab — this app already
+  // holds ~206MB of GLB chars, and wasm would load the 369MB model into the wasm
+  // heap on top (B5). webgpu keeps the model on the GPU so it fits, but shares the
+  // device with the renderer → contends (inference climbs under load, V23). The
+  // pose loop yields a render frame between inferences to ease that; a dedicated
+  // worker (T20) is the real isolation.
   poseEP: 'webgpu',
-  poseEnabled: false,
+  poseEnabled: true, // dev default: pose on at load
+  poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
   poseKptThresh: 0.3,
   poseRetarget: true,
   poseMirrorX: false,
-  poseDepthScale: 1.5,
+  poseMirror: true,
+  poseDepthScale: 1, // 1 = accurate (>1 exaggerates depth → arms over-rotate)
+  poseArmLimit: 110, // tighter joint limit for arms (over-rotation guard)
   poseSmoothing: true,
   poseSmoothMinCutoff: 2,
   poseSmoothBeta: 0.02,
   poseJointLimit: 150,
-  poseFollow: 0.3,
+  poseBodyYaw: true,
+  poseYawGain: 2.5, // amplify depth-separation so turning (yaw) registers
+  poseFollow: 0.5, // higher = snappier (less laggy/jello)
+  poseSwingTwist: true,
+  poseWristTwist: true,
+  poseTwistSmooth: 0.12,
+  poseHeadGain: 0.7,
+  poseRejectOutliers: true,
+  poseMaxJump: 0.5,
+  poseHoldMs: 2000,
+  poseBoneGate: true,
+  poseGrounding: true,
+  poseGroundFollow: 0.3,
+  poseOverlay: true,
+  poseDebug3D: false,
+  poseDebugScale: 3,
+  poseDebugHeight: 1,
+  poseDetectEveryN: 2,
+  poseRecording: false,
+  poseReplaying: false,
   spacing: 2.8,
   scale: 1,
   sizeVariance: 0,
@@ -295,6 +371,8 @@ const state = {
   quality: 'performance',
   emissiveBoost: 1,
   cameraDrift: true,
+  cameraDriftSpeed: 0.4,
+  cameraDistance: 5.5,
   floorGrid: true,
   glowShadows: false,
   shufflePhase() {
@@ -302,6 +380,40 @@ const state = {
   },
   applyQualityPreset() {
     applyQualityPreset(state.quality);
+  },
+  toggleFullscreen() {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen?.();
+  },
+  calibratePose() {
+    calibPhase = 'ready';
+    calibPhaseStart = performance.now();
+  },
+  savePoseRecording() {
+    if (!poseRecorder.length) { statusEl.textContent = 'Nothing recorded.'; return; }
+    const blob = new Blob([JSON.stringify(poseRecorder.toSession())], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `pose-${poseRecorder.length}f.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    statusEl.textContent = `Saved ${poseRecorder.length} frames.`;
+  },
+  loadPoseRecording() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json';
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      try {
+        poseRecorder.load(JSON.parse(await file.text()));
+        statusEl.textContent = `Loaded ${poseRecorder.length} frames — enable Replay.`;
+      } catch (error) {
+        statusEl.textContent = `Load failed: ${error.message}`;
+      }
+    };
+    input.click();
   },
   runEpProbe() {
     statusEl.textContent = 'EP probe running… (console for detail)';
@@ -332,11 +444,16 @@ async function init() {
   resize();
   renderer.setAnimationLoop(render);
 
-  // Camera drift writes camera.position every frame, which fights the user's
-  // OrbitControls drag. The moment they grab the camera, yield: turn drift off
-  // (the inspector toggle reflects it via .listen(), so it's re-enableable).
-  controls.addEventListener('start', () => {
-    state.cameraDrift = false;
+  // Drift = OrbitControls.autoRotate: orbits around the CURRENT target at the
+  // user's manual distance (zoom/pan persist). Pauses during an active drag and
+  // resumes — so manual framing and drift coexist.
+  controls.autoRotate = state.cameraDrift;
+  controls.autoRotateSpeed = state.cameraDriftSpeed;
+
+  // Fullscreen hides the status line (clean VJ output); resize to fill.
+  document.addEventListener('fullscreenchange', () => {
+    document.body.classList.toggle('is-fullscreen', !!document.fullscreenElement);
+    resize();
   });
 
   setPreloader(0.1, 'Loading manifest…');
@@ -362,6 +479,9 @@ async function init() {
   hidePreloader();
 
   window.addEventListener('resize', resize);
+
+  // dev default: auto-start pose (prompts for the webcam on load).
+  if (state.poseEnabled) startPose();
 }
 
 function setPreloader(frac, label) {
@@ -377,7 +497,8 @@ function hidePreloader() {
 }
 
 function buildInspectorControls() {
-  state.selectedMeshIds = manifest.meshes.map((mesh) => mesh.id);
+  // dev default: single mesh selected (pose drives one performer).
+  state.selectedMeshIds = manifest.meshes.length ? [manifest.meshes[0].id] : [];
 
   const performanceGroup = renderer.inspector.createParameters('VJ Layer / Scene');
   performanceGroup.add(state, 'count', 1, 500).name('Count').onChange((value) => {
@@ -406,7 +527,20 @@ function buildInspectorControls() {
   performanceGroup.add(state, 'disorder', 0, 1, 0.01).name('Disorder').onChange(() => arrangeWalkers());
   performanceGroup.add(state, 'wanderRadius', 0, 40, 0.1).name('Wander Radius');
   performanceGroup.add(state, 'wanderSpeed', 0, 3, 0.01).name('Wander Speed');
-  performanceGroup.add(state, 'cameraDrift').name('Camera Drift').listen();
+  performanceGroup.add(state, 'toggleFullscreen').name('Fullscreen');
+  performanceGroup.add(state, 'cameraDrift').name('Camera Drift').listen().onChange((value) => {
+    controls.autoRotate = value;
+  });
+  performanceGroup.add(state, 'cameraDriftSpeed', -3, 3, 0.05).name('Drift Speed').onChange((value) => {
+    controls.autoRotateSpeed = value;
+  });
+  performanceGroup.add(state, 'cameraDistance', controls.minDistance, controls.maxDistance, 0.1)
+    .name('Camera Distance').onChange((value) => {
+      cameraOffset.copy(camera.position).sub(controls.target);
+      if (cameraOffset.lengthSq() < 1e-6) cameraOffset.set(0, 0, 1);
+      camera.position.copy(controls.target).addScaledVector(cameraOffset.normalize(), value);
+      controls.update();
+    });
   performanceGroup.add(state, 'floorGrid').name('Floor Grid').onChange((value) => {
     grid.visible = value;
   });
@@ -468,7 +602,7 @@ function buildInspectorControls() {
 
   const meshGroup = renderer.inspector.createParameters('VJ Layer / Meshes');
   for (const mesh of manifest.meshes) {
-    const meshState = { enabled: true };
+    const meshState = { enabled: state.selectedMeshIds.includes(mesh.id) };
     meshGroup.add(meshState, 'enabled').name(mesh.name).onChange((enabled) => {
       if (enabled) {
         state.selectedMeshIds = [...new Set([...state.selectedMeshIds, mesh.id])];
@@ -490,15 +624,65 @@ function buildInspectorControls() {
     state.posePerformerCount = Math.round(value);
     for (const walker of walkers) walker.boneSource = boneSourceForIndex(walker.index, state.posePerformerCount);
   });
+  poseGroup.add(state, 'poseWorker').name('Inference Worker').listen();
   poseGroup.add(state, 'poseEP', POSE_EPS).name('Pose EP');
   poseGroup.add(state, 'poseKptThresh', 0, 1, 0.01).name('Kpt Threshold');
   poseGroup.add(state, 'poseRetarget').name('Pose Retarget').listen();
-  poseGroup.add(state, 'poseMirrorX').name('Mirror X').listen();
+  poseGroup.add(state, 'poseMirror').name('Mirror Pose').listen();
+  poseGroup.add(state, 'poseMirrorX').name('Mirror X (raw)').listen();
   poseGroup.add(state, 'poseDepthScale', 0, 3, 0.01).name('Depth Scale');
   poseGroup.add(state, 'poseSmoothing').name('Smoothing').listen();
   poseGroup.add(state, 'poseSmoothMinCutoff', 0.1, 8, 0.1).name('Smooth Min Cutoff');
   poseGroup.add(state, 'poseSmoothBeta', 0, 0.2, 0.001).name('Smooth Beta');
   poseGroup.add(state, 'poseJointLimit', 30, 180, 1).name('Joint Limit °');
+  poseGroup.add(state, 'poseArmLimit', 30, 180, 1).name('Arm Limit °');
+  poseGroup.add(state, 'poseFollow', 0.05, 1, 0.01).name('Pose Follow (smooth)');
+  poseGroup.add(state, 'poseBodyYaw').name('Body Yaw (turn)').listen();
+  poseGroup.add(state, 'poseYawGain', 1, 8, 0.1).name('Yaw Gain (depth)');
+  poseGroup.add(state, 'poseSwingTwist').name('Swing-Twist').listen();
+  poseGroup.add(state, 'poseTwistSmooth', 0.02, 1, 0.01).name('Twist Smooth');
+  poseGroup.add(state, 'poseWristTwist').name('Wrist Twist (hands)').listen();
+  poseGroup.add(state, 'poseHeadGain', 0.1, 1.5, 0.01).name('Head Gain');
+  poseGroup.add(state, 'poseRejectOutliers').name('Reject Jumps').listen();
+  poseGroup.add(state, 'poseMaxJump', 0.1, 1.5, 0.01).name('Max Jump');
+  poseGroup.add(state, 'poseHoldMs', 200, 6000, 50).name('Hold Last (ms)');
+  poseGroup.add(state, 'calibratePose').name('Calibrate (hold A-pose)');
+  poseGroup.add(state, 'poseBoneGate').name('Bone-Length Gate').listen();
+  poseGroup.add(state, 'poseGrounding').name('Grounding (feet)').listen();
+  poseGroup.add(state, 'poseGroundFollow', 0.05, 1, 0.01).name('Ground Smooth');
+  poseGroup.add(state, 'poseOverlay').name('2D Overlay').listen();
+  poseGroup.add(state, 'poseDebug3D').name('Pose Debug 3D').listen();
+  poseGroup.add(state, 'poseDebugScale', 0.2, 3, 0.01).name('Debug Scale');
+  poseGroup.add(state, 'poseDebugHeight', 0, 3, 0.01).name('Debug Height');
+  poseGroup.add(state, 'poseDetectEveryN', 1, 6, 1).name('Detect Every N');
+
+  const poseStatsGroup = renderer.inspector.createParameters('VJ Layer / Pose Stats (ms)');
+  poseStatsGroup.add(poseStats, 'poseFps').name('Pose FPS').listen();
+  poseStatsGroup.add(poseStats, 'detectMs').name('Detect (yolo)').listen();
+  poseStatsGroup.add(poseStats, 'preprocessMs').name('Preprocess').listen();
+  poseStatsGroup.add(poseStats, 'inferenceMs').name('RTMW Inference').listen();
+  poseStatsGroup.add(poseStats, 'decodeMs').name('Decode').listen();
+  poseStatsGroup.add(poseStats, 'overlayMs').name('Overlay Draw').listen();
+  poseStatsGroup.add(poseStats, 'retargetMs').name('Retarget/frame').listen();
+  poseGroup.add(state, 'poseRecording').name('Record').listen().onChange((on) => {
+    if (on) {
+      poseRecorder.start({
+        createdAt: new Date().toISOString(),
+        inputWidth: poseProvider?.video?.videoWidth || 0,
+        inputHeight: poseProvider?.video?.videoHeight || 0
+      });
+      statusEl.textContent = 'Recording…';
+    } else {
+      poseRecorder.stop();
+      statusEl.textContent = `Recorded ${poseRecorder.length} frames.`;
+    }
+  });
+  poseGroup.add(state, 'poseReplaying').name('Replay').listen().onChange((on) => {
+    if (on) startReplay();
+    else stopReplay();
+  });
+  poseGroup.add(state, 'savePoseRecording').name('Save Recording');
+  poseGroup.add(state, 'loadPoseRecording').name('Load Recording');
   poseGroup.add(state, 'runEpProbe').name('Probe EPs (console)');
 
   const statsGroup = renderer.inspector.createParameters('VJ Layer / Render Stats');
@@ -1276,7 +1460,17 @@ function computePoseMatrices(batch) {
         kptThresh: state.poseKptThresh,
         mirrorX: state.poseMirrorX,
         depthScale: state.poseDepthScale,
-        jointLimitDeg: state.poseJointLimit
+        jointLimitDeg: state.poseJointLimit,
+        armLimit: state.poseArmLimit,
+        follow: state.poseFollow,
+        swingTwist: state.poseSwingTwist,
+        headGain: state.poseHeadGain,
+        planeFollow: state.poseTwistSmooth,
+        wristTwist: state.poseWristTwist,
+        grounding: state.poseGrounding,
+        groundFollow: state.poseGroundFollow,
+        bodyYaw: state.poseBodyYaw,
+        yawGain: state.poseYawGain
       });
     } else {
       batch.retargeter.restPose();
@@ -1316,7 +1510,12 @@ function updateCrowdBatches(elapsed) {
   for (const batch of crowdBatches) {
     // One retarget per batch, shared by all pose performers.
     const hasPose = batch.walkers.some((w) => w.boneSource === 'pose');
-    const posedMatrices = hasPose ? computePoseMatrices(batch) : null;
+    let posedMatrices = null;
+    if (hasPose) {
+      const rt0 = performance.now();
+      posedMatrices = computePoseMatrices(batch);
+      poseStats.retargetMs = ema(poseStats.retargetMs, performance.now() - rt0);
+    }
 
     for (const walker of batch.walkers) {
       if (walker.boneSource === 'pose') {
@@ -1387,12 +1586,29 @@ function reportAssetProgress() {
 let poseProvider = null;
 let poseOverlayCtx = null;
 let poseLoopActive = false;
+let poseLoopId = 0; // generation guard — only the latest loop runs (no stacking)
 let latestCanonical = null;
 let lastGoodPoseAt = 0;
 const poseSmoother = new CanonicalSmoother(NUM_KPTS, {
   minCutoff: 2,
   beta: 0.02
 });
+const poseRecorder = new PoseRecorder();
+let replayActive = false;
+let replayPlayer = null;
+let lastPoseFrameAt = 0;
+
+// Per-stage timing breakdown (ms), EMA-smoothed, shown in the Pose Stats panel.
+const poseStats = {
+  poseFps: 0,
+  detectMs: 0,
+  preprocessMs: 0,
+  inferenceMs: 0,
+  decodeMs: 0,
+  overlayMs: 0,
+  retargetMs: 0
+};
+const ema = (prev, next, a = 0.2) => prev + a * (next - prev);
 
 // Minimal robustness gate (V11/V12, ahead of full T9): only drive from a frame
 // whose CORE joints (hips + shoulders) are confident — a garbage/partial frame
@@ -1405,17 +1621,105 @@ function frameCoreConfident(canon) {
   return POSE_CORE_JOINTS.every((i) => canon.joints[i] && canon.joints[i].confidence >= state.poseKptThresh);
 }
 
-function updateCanonical(frame) {
-  let canon = frame ? toCanonical(frame) : null;
-  if (canon && state.poseSmoothing) {
-    poseSmoother.setParams({ minCutoff: state.poseSmoothMinCutoff, beta: state.poseSmoothBeta });
-    canon = poseSmoother.smooth(canon);
+// Guided calibration (§6): capture a neutral A-pose ~2s → median limb lengths.
+// Direction-based retarget doesn't need them to STRETCH-fix, but they gate bad
+// joints (a bone gone implausibly long/short = a bad measurement → reject, §16).
+const CALIB_BONES = [
+  ['lThigh', KPT.leftHip, KPT.leftKnee],
+  ['lShin', KPT.leftKnee, KPT.leftAnkle],
+  ['rThigh', KPT.rightHip, KPT.rightKnee],
+  ['rShin', KPT.rightKnee, KPT.rightAnkle],
+  ['lUarm', KPT.leftShoulder, KPT.leftElbow],
+  ['lFarm', KPT.leftElbow, KPT.leftWrist],
+  ['rUarm', KPT.rightShoulder, KPT.rightElbow],
+  ['rFarm', KPT.rightElbow, KPT.rightWrist]
+];
+// Guided calibration phases: idle → ready (3s get-into-pose) → capturing (2s
+// sample) → done (1.5s result). Drives the on-screen overlay.
+const CALIB_READY_MS = 5000;
+const CALIB_CAPTURE_MS = 2000;
+const CALIB_DONE_MS = 1600;
+let calibPhase = 'idle';
+let calibPhaseStart = 0;
+const calibSamples = {};
+const poseCalibration = { lengths: null, ready: false };
+
+function jointDist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+// Bone-length plausibility gate: any driven bone wildly off its calibrated length
+// → a bad joint this frame → treat the frame as an outlier.
+function boneLengthBad(canon) {
+  if (!poseCalibration.ready) return false;
+  for (const [k, a, b] of CALIB_BONES) {
+    const ja = canon.joints[a];
+    const jb = canon.joints[b];
+    if (!ja || !jb || ja.confidence < state.poseKptThresh || jb.confidence < state.poseKptThresh) continue;
+    const ratio = jointDist(ja, jb) / poseCalibration.lengths[k];
+    if (ratio < 0.55 || ratio > 1.6) return true;
   }
-  if (canon && frameCoreConfident(canon)) {
-    latestCanonical = canon;
-    lastGoodPoseAt = performance.now();
-  } else if (performance.now() - lastGoodPoseAt > 500) {
-    latestCanonical = null; // sustained loss → bind
+  return false;
+}
+
+// Outlier reject (§14): did a core joint teleport vs the last accepted frame?
+let lastAcceptedRaw = null;
+let consecutiveRejects = 0;
+const MAX_REJECTS = 6; // after this many, accept (genuine fast motion, not a glitch)
+
+function coreJumped(raw) {
+  if (!lastAcceptedRaw) return false;
+  const max2 = state.poseMaxJump * state.poseMaxJump;
+  for (const i of POSE_CORE_JOINTS) {
+    const a = raw.joints[i];
+    const b = lastAcceptedRaw.joints[i];
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    const dz = a.z - b.z;
+    if (dx * dx + dy * dy + dz * dz > max2) return true;
+  }
+  return false;
+}
+
+function updateCanonical(frame) {
+  const raw = frame ? toCanonical(frame) : null;
+  const now = performance.now();
+
+  if (raw) {
+    // Drive whatever is confident — do NOT require all core joints (that forced an
+    // A-pose fallback when e.g. legs/hips dropped). Each bone self-gates on its own
+    // joints' confidence in the retargeter; un-tracked regions rest, tracked drive.
+    // Reject before smooth (§54): a sudden teleport OR an implausible bone length
+    // is an outlier → hold the last good pose (unless it persists = real motion).
+    const outlier = coreJumped(raw) || (state.poseBoneGate && boneLengthBad(raw));
+    if (state.poseRejectOutliers && outlier && consecutiveRejects < MAX_REJECTS) {
+      consecutiveRejects += 1;
+      return;
+    }
+    consecutiveRejects = 0;
+    lastAcceptedRaw = raw;
+    let canon = raw;
+    if (state.poseSmoothing) {
+      poseSmoother.setParams({ minCutoff: state.poseSmoothMinCutoff, beta: state.poseSmoothBeta });
+      canon = poseSmoother.smooth(raw);
+    }
+    latestCanonical = state.poseMirror ? mirrorCanonical(canon) : canon;
+    lastGoodPoseAt = now;
+
+    // Calibration: collect bone-length samples during the capture phase (finalize
+    // + countdown are driven by updateCalibration in the render loop).
+    if (calibPhase === 'capturing') {
+      for (const [k, a, b] of CALIB_BONES) {
+        const ja = raw.joints[a];
+        const jb = raw.joints[b];
+        if (ja && jb && ja.confidence >= state.poseKptThresh && jb.confidence >= state.poseKptThresh) {
+          calibSamples[k].push(jointDist(ja, jb));
+        }
+      }
+    }
+  } else if (now - lastGoodPoseAt > state.poseHoldMs) {
+    latestCanonical = null; // sustained loss → bind (hold last-known until then)
+    lastAcceptedRaw = null;
   }
   // else: brief dropout → keep holding the last good pose
 }
@@ -1423,11 +1727,16 @@ function updateCanonical(frame) {
 async function startPose() {
   if (poseProvider) return;
   posePipEl.hidden = false;
-  posePipLabel.textContent = 'pose: starting…';
+  posePipLabel.textContent = 'pose: loading model…';
+  statusEl.textContent = 'Loading pose model (369MB) — first load compiles GPU shaders, may briefly stutter…';
+  const t0 = performance.now();
   try {
     poseSmoother.reset();
-    poseProvider = new RTMWPoseProvider({ ep: state.poseEP, kptThresh: state.poseKptThresh });
+    const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
+    poseProvider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh });
     await poseProvider.start();
+    console.info(`[pose] ready in ${((performance.now() - t0) / 1000).toFixed(1)}s (${state.poseWorker ? 'worker' : 'main'}/${state.poseEP})`);
+    statusEl.textContent = '';
     poseVideoEl.srcObject = poseProvider.stream;
     await poseVideoEl.play();
     poseOverlayEl.width = poseProvider.video.videoWidth || 1280;
@@ -1435,7 +1744,7 @@ async function startPose() {
     poseOverlayCtx = poseOverlayEl.getContext('2d');
     poseLoopActive = true;
     posePipLabel.textContent = `pose: ${state.poseEP}`;
-    poseLoop();
+    poseLoop(++poseLoopId);
   } catch (error) {
     console.error('pose start failed:', error);
     posePipLabel.textContent = `pose: ${error.message}`;
@@ -1445,11 +1754,30 @@ async function startPose() {
   }
 }
 
+// Draw overlay + drive canonical from one frame. Shared by live + replay.
+function consumePoseFrame(frame) {
+  if (poseOverlayCtx) {
+    const ov0 = performance.now();
+    if (state.poseOverlay) {
+      drawOverlay(poseOverlayCtx, frame, poseOverlayEl.width, poseOverlayEl.height, {
+        kptThresh: state.poseKptThresh,
+        mirror: true
+      });
+    } else {
+      poseOverlayCtx.clearRect(0, 0, poseOverlayEl.width, poseOverlayEl.height);
+    }
+    poseStats.overlayMs = ema(poseStats.overlayMs, performance.now() - ov0);
+  }
+  updateCanonical(frame);
+  window.__poseCanonical = latestCanonical;
+}
+
 // Latest-frame loop: always infers the current video frame, so no backlog builds
 // (V17 worker offload comes in T20; this keeps it newest-only on the main thread).
-async function poseLoop() {
-  while (poseLoopActive && poseProvider) {
+async function poseLoop(myId) {
+  while (poseLoopActive && poseProvider && myId === poseLoopId) {
     try {
+      poseProvider.detectEveryN = state.poseDetectEveryN;
       const frame = await poseProvider.infer();
       const vw = poseProvider.video?.videoWidth;
       const vh = poseProvider.video?.videoHeight;
@@ -1457,12 +1785,23 @@ async function poseLoop() {
         poseOverlayEl.width = vw;
         poseOverlayEl.height = vh;
       }
-      drawOverlay(poseOverlayCtx, frame, poseOverlayEl.width, poseOverlayEl.height, {
-        kptThresh: state.poseKptThresh,
-        mirror: true
-      });
-      updateCanonical(frame);
-      window.__poseCanonical = latestCanonical;
+      poseRecorder.capture(frame);
+      consumePoseFrame(frame);
+
+      // Stage breakdown from the provider + actual pose throughput (fps).
+      const tm = poseProvider.timings;
+      poseStats.detectMs = ema(poseStats.detectMs, tm.detect);
+      poseStats.preprocessMs = ema(poseStats.preprocessMs, tm.preprocess);
+      poseStats.inferenceMs = ema(poseStats.inferenceMs, tm.inference);
+      poseStats.decodeMs = ema(poseStats.decodeMs, tm.decode);
+      const now = performance.now();
+      if (lastPoseFrameAt) poseStats.poseFps = ema(poseStats.poseFps, 1000 / Math.max(1, now - lastPoseFrameAt));
+      lastPoseFrameAt = now;
+
+      // Yield a render frame between inferences so three's GPU work + the webgpu
+      // command queue drain instead of being hammered back-to-back (eases the
+      // shared-GPU contention that makes webgpu inference climb under load).
+      await new Promise((resolve) => requestAnimationFrame(resolve));
     } catch (error) {
       console.error('pose loop error:', error);
       poseLoopActive = false;
@@ -1471,8 +1810,48 @@ async function poseLoop() {
   }
 }
 
+// Replay a recording through the pipeline (no webcam) — iterate retarget/smooth/
+// twist against a fixed motion. Pauses live inference while active.
+function startReplay() {
+  if (!poseRecorder.length) {
+    statusEl.textContent = 'No recording to replay.';
+    state.poseReplaying = false;
+    return;
+  }
+  poseLoopActive = false; // pause live
+  poseLoopId += 1; // kill any in-flight live loop
+  poseSmoother.reset();
+  const meta = poseRecorder.metadata ?? {};
+  poseOverlayEl.width = meta.inputWidth || poseOverlayEl.width || 1280;
+  poseOverlayEl.height = meta.inputHeight || poseOverlayEl.height || 720;
+  poseOverlayCtx = poseOverlayEl.getContext('2d');
+  posePipEl.hidden = false;
+  posePipLabel.textContent = `replay: ${poseRecorder.length}f`;
+  replayPlayer = new PosePlayer(poseRecorder.frames);
+  replayActive = true;
+  const t0 = performance.now();
+  const step = () => {
+    if (!replayActive) return;
+    consumePoseFrame(replayPlayer.frameAt(performance.now() - t0));
+    requestAnimationFrame(step);
+  };
+  step();
+}
+
+function stopReplay() {
+  replayActive = false;
+  replayPlayer = null;
+  if (!state.poseEnabled) {
+    if (poseOverlayCtx) poseOverlayCtx.clearRect(0, 0, poseOverlayEl.width, poseOverlayEl.height);
+    posePipEl.hidden = true;
+    posePipLabel.textContent = 'pose: off';
+    latestCanonical = null;
+  }
+}
+
 function stopPose() {
   poseLoopActive = false;
+  poseLoopId += 1; // invalidate any in-flight loop so it can't resume on restart
   if (poseProvider) {
     poseProvider.stop();
     poseProvider = null;
@@ -1482,6 +1861,124 @@ function stopPose() {
   posePipEl.hidden = true;
   posePipLabel.textContent = 'pose: off';
   latestCanonical = null;
+  calibPhase = 'idle';
+  calibOverlay.hidden = true;
+  poseCalibration.ready = false; // re-calibrate per person/session
+}
+
+// 3D debug overlay: magenta = actual driven rig bones (on the mesh via the
+// instance matrix); green = the canonical pose that drove them, pelvis-aligned to
+// the mesh and scaled to match. Compare → see what the retarget did with the pose.
+function updatePoseDebug3D() {
+  const show = state.poseDebug3D && !!latestCanonical;
+  poseDebugLines.visible = show;
+  poseRigLines.visible = show;
+  poseDebugPoints.visible = show;
+  poseRigPoints.visible = show;
+  if (!show) return;
+  const walker = walkers.find((w) => w.boneSource === 'pose') ?? walkers[0];
+  const skeleton = walker?.batch?.skeletonStates?.[0]?.skeleton;
+  if (!walker || !skeleton) {
+    poseDebugLines.visible = poseRigLines.visible = poseDebugPoints.visible = poseRigPoints.visible = false;
+    return;
+  }
+
+  // Walker's instance matrix (source-space bone pos → world, lands on the mesh).
+  _instMat.fromArray(walker.batch.instanceMatrices.array, walker.batchIndex * 16);
+  const byName = new Map(skeleton.bones.map((b) => [b.name, b]));
+  const worldOf = (name) => {
+    const bone = byName.get(name);
+    if (!bone) return null;
+    return _vA.setFromMatrixPosition(bone.matrixWorld).applyMatrix4(_instMat).clone();
+  };
+
+  // Magenta rig bones.
+  const rp = poseRigGeom.attributes.position.array;
+  let m = 0;
+  for (const [a, b] of RIG_EDGE_NAMES) {
+    const pa = worldOf(a);
+    const pb = worldOf(b);
+    if (!pa || !pb) continue;
+    rp[m++] = pa.x; rp[m++] = pa.y; rp[m++] = pa.z;
+    rp[m++] = pb.x; rp[m++] = pb.y; rp[m++] = pb.z;
+  }
+  poseRigGeom.setDrawRange(0, m / 3);
+  poseRigGeom.attributes.position.needsUpdate = true;
+
+  // Green canonical, pelvis-aligned to the mesh hips + scaled to the rig.
+  const hipsW = worldOf('Hips');
+  const spineW = worldOf('Spine02');
+  const J = latestCanonical.joints;
+  const torsoCanon = Math.hypot(latestCanonical.shoulderCenter.x, latestCanonical.shoulderCenter.y, latestCanonical.shoulderCenter.z) || 1;
+  const torsoRig = hipsW && spineW ? hipsW.distanceTo(spineW) : 0.3;
+  const s = (torsoRig / torsoCanon) * state.poseDebugScale;
+  const ox = hipsW ? hipsW.x : walker.position.x;
+  const oy = hipsW ? hipsW.y : state.poseDebugHeight;
+  const oz = hipsW ? hipsW.z : walker.position.z;
+  const pos = poseDebugGeom.attributes.position.array;
+  let n = 0;
+  for (const [a, b] of BODY_BONES) {
+    const ja = J[a];
+    const jb = J[b];
+    if (!ja || !jb || ja.confidence < state.poseKptThresh || jb.confidence < state.poseKptThresh) continue;
+    pos[n++] = ox + ja.x * s; pos[n++] = oy + ja.y * s; pos[n++] = oz + ja.z * s;
+    pos[n++] = ox + jb.x * s; pos[n++] = oy + jb.y * s; pos[n++] = oz + jb.z * s;
+  }
+  poseDebugGeom.setDrawRange(0, n / 3);
+  poseDebugGeom.attributes.position.needsUpdate = true;
+}
+
+// Guided calibration phase machine + on-screen overlay (countdown a single
+// performer can read from across the room).
+const CALIB_FIGURE = `<svg width="110" height="170" viewBox="0 0 110 170" fill="none" stroke="#7df9ee" stroke-width="5" stroke-linecap="round" style="display:block;margin:0 auto 16px">
+  <circle cx="55" cy="22" r="14"/>
+  <line x1="55" y1="36" x2="55" y2="100"/>
+  <line x1="55" y1="50" x2="18" y2="94"/>
+  <line x1="55" y1="50" x2="92" y2="94"/>
+  <line x1="55" y1="100" x2="38" y2="162"/>
+  <line x1="55" y1="100" x2="72" y2="162"/>
+</svg>`;
+function setCalibText(line, big, figure = false) {
+  const fig = figure ? CALIB_FIGURE : '';
+  const num = big != null ? `<span class="big">${big}</span>` : '';
+  calibTextEl.innerHTML = `${fig}${line}${num}`;
+}
+function updateCalibration() {
+  if (calibPhase === 'idle') { calibOverlay.hidden = true; return; }
+  calibOverlay.hidden = false;
+  const t = performance.now() - calibPhaseStart;
+
+  if (calibPhase === 'ready') {
+    setCalibText('Stand like this — full body in frame', Math.ceil((CALIB_READY_MS - t) / 1000), true);
+    if (t >= CALIB_READY_MS) {
+      for (const [k] of CALIB_BONES) calibSamples[k] = [];
+      calibPhase = 'capturing';
+      calibPhaseStart = performance.now();
+    }
+  } else if (calibPhase === 'capturing') {
+    setCalibText('Hold still — calibrating', Math.ceil((CALIB_CAPTURE_MS - t) / 1000), true);
+    if (t >= CALIB_CAPTURE_MS) {
+      const lengths = {};
+      let ok = true;
+      for (const [k] of CALIB_BONES) {
+        const s = calibSamples[k];
+        if (s.length < 5) { ok = false; break; }
+        s.sort((x, y) => x - y);
+        lengths[k] = s[s.length >> 1];
+      }
+      if (ok) {
+        poseCalibration.lengths = lengths;
+        poseCalibration.ready = true;
+        setCalibText('✓ Calibrated');
+      } else {
+        setCalibText('✗ Full body not visible — try again');
+      }
+      calibPhase = 'done';
+      calibPhaseStart = performance.now();
+    }
+  } else if (calibPhase === 'done') {
+    if (t >= CALIB_DONE_MS) { calibPhase = 'idle'; calibOverlay.hidden = true; }
+  }
 }
 
 function render(timestamp) {
@@ -1494,11 +1991,8 @@ function render(timestamp) {
     updatePerformerLightRig(walker, elapsed);
   }
   updateCrowdBatches(elapsed);
-
-  if (state.cameraDrift) {
-    camera.position.x = Math.sin(elapsed * 0.08) * 18;
-    camera.position.z = Math.cos(elapsed * 0.08) * 20;
-  }
+  updatePoseDebug3D();
+  updateCalibration();
 
   const bx = armyBounds.centerX;
   const bz = armyBounds.centerZ;

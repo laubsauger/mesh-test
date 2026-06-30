@@ -3,6 +3,7 @@
 // Faithful port of I.reference detPersonBoxes.
 import { ort, createPoseSession } from './ort-session.js';
 import { YOLO_DET_MODEL } from './rtmw-constants.js';
+import { letterboxRect } from './decode.js';
 import { assetUrl } from '../asset-url.js';
 
 export class PersonDetector {
@@ -27,7 +28,10 @@ export class PersonDetector {
 
   async detect(video, vidW, vidH) {
     const R = this.res;
-    this.ctx.drawImage(video, 0, 0, R, R);
+    const lb = letterboxRect(vidW, vidH, R); // aspect-preserved, gray pad
+    this.ctx.fillStyle = 'rgb(114,114,114)';
+    this.ctx.fillRect(0, 0, R, R);
+    this.ctx.drawImage(video, 0, 0, vidW, vidH, lb.offsetX, lb.offsetY, lb.drawW, lb.drawH);
     const d = this.ctx.getImageData(0, 0, R, R).data;
     const hw = R * R;
     for (let i = 0; i < hw; i += 1) {
@@ -43,16 +47,16 @@ export class PersonDetector {
     const data = o0.data;
     const stride = o0.dims[2];
     const boxes = [];
+    const unX = (v) => (v - lb.offsetX) / lb.scale;
+    const unY = (v) => (v - lb.offsetY) / lb.scale;
     for (let q = 0; q < data.length / stride; q += 1) {
       const o = q * stride;
       const score = data[o + 4];
       if (score < this.threshold) break; // rows score-sorted desc → done
       if (Math.round(data[o + 5]) !== YOLO_DET_MODEL.personClassId) continue;
-      const x1 = (data[o] / R) * vidW;
-      const y1 = (data[o + 1] / R) * vidH;
-      const x2 = (data[o + 2] / R) * vidW;
-      const y2 = (data[o + 3] / R) * vidH;
-      boxes.push({ x: x1, y: y1, w: x2 - x1, h: y2 - y1, score });
+      const x1 = unX(data[o]);
+      const y1 = unY(data[o + 1]);
+      boxes.push({ x: x1, y: y1, w: unX(data[o + 2]) - x1, h: unY(data[o + 3]) - y1, score });
     }
     for (const k in out) out[k].dispose();
     boxes.sort((a, b) => b.score - a.score);
