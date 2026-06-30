@@ -131,7 +131,12 @@ export class SidecarPoseProvider {
     dv.setFloat64(0, ts, true);
     dv.setUint32(8, w, true);
     dv.setUint32(12, h, true);
-    dv.setUint32(16, this.detectEveryN, true);
+    // Always detect every frame on the sidecar (= 1, NOT this.detectEveryN). yolo
+    // is a few ms natively and runs off the renderer's device, so there's no reason
+    // to reuse a stale box — which, under load, misaligns the crop and feeds rtmw a
+    // half-cropped person → the intermittent garbage/glitch. (detectEveryN only
+    // exists to spare the webgpu worker's GPU contention; the sidecar has none.)
+    dv.setUint32(16, 1, true);
     buf.set(rgba, HEADER_BYTES);
 
     this._sentW = w; this._sentH = h; this._sentAt = ts;
