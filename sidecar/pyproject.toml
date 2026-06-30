@@ -7,29 +7,27 @@ dependencies = [
     "numpy>=1.26",
     "opencv-python-headless>=4.9",
     "websockets>=12",
-    # GPU box (Linux/Windows): onnxruntime-gpu with the `[cuda,cudnn]` EXTRA — ORT
-    # declares + pulls its OWN matching CUDA + cuDNN nvidia wheels into the venv (no
-    # global install, no guessing package names). Pinned to the CUDA-12 line (the
-    # OFFICIALLY tested config: CUDA 12.x + cuDNN 9, default on PyPI since 1.19) —
-    # the cu13 builds (>=1.23) have broken/inconsistent nvidia pip packaging.
-    # ⇒ plain `npm run sidecar` gives the CUDA EP on the GPU box. `sidecar:cuda` adds
-    #   TensorRT on top (the `trt` extra). preload_dlls() loads them from site-packages.
-    "onnxruntime-gpu[cuda,cudnn]>=1.20,<1.23 ; platform_system != 'Darwin'",
+    # GPU box (Linux/Windows). EXACT verified matrix (onnxruntime TensorRT-EP docs):
+    #   onnxruntime-gpu 1.22  →  CUDA 12.x  +  cuDNN 9.x  +  TensorRT 10.9
+    # The `[cuda,cudnn]` extra makes ORT pull its OWN matching CUDA 12 + cuDNN 9
+    # wheels into the venv (proven: the user's log loads cublas/cudnn fine). Pinned
+    # to 1.22 specifically so the TensorRT version (10.9, in the `trt` extra) matches
+    # — 1.20→TRT10.4, 1.21→TRT10.8, 1.22→TRT10.9. (1.23+ switched to CUDA-13 whose
+    # nvidia pip packaging is broken — avoid.)
+    # ⇒ `npm run sidecar` = CUDA EP on the GPU box. `sidecar:cuda` adds TensorRT.
+    "onnxruntime-gpu[cuda,cudnn]==1.22.* ; platform_system != 'Darwin'",
     # Mac dev box: plain onnxruntime (CPU/CoreML) for protocol work.
     "onnxruntime>=1.18 ; platform_system == 'Darwin'",
 ]
 
-[project.optional-dependencies]
-# TensorRT EP on top of the CUDA base. onnxruntime-gpu 1.22 needs TensorRT **10**
-# (it loads nvinfer_10.dll) — pin to 10.x or pip resolves a bindings-only stub that
-# lacks the libs. `tensorrt-cu12-libs` carries the actual nvinfer_10.dll.
-# NOTE: CUDA EP (the BASE install) already gives full GPU (~10-15ms on a 4090). TRT
-# is an optional further speedup and the finickiest piece — if it won't resolve,
-# just use `npm run sidecar` (CUDA). Enable TRT with `npm run sidecar:cuda`.
-trt = [
-    "tensorrt-cu12>=10,<11 ; platform_system != 'Darwin'",
-    "tensorrt-cu12-libs>=10,<11 ; platform_system != 'Darwin'",
-]
+# TensorRT EP is NOT a pyproject dependency on purpose: `tensorrt-cu12` ships as an
+# sdist that REFUSES to build on macOS ("only Linux/Windows"), so putting it here
+# breaks uv's universal lock on the Mac dev box even when markered out. Instead the
+# `sidecar:cuda` npm script injects it at run time with `uv run --with` (resolved
+# for the CURRENT platform only — Windows/Linux gets the wheel, Mac never runs it):
+#   uv run --with tensorrt-cu12==10.9.0.34
+# onnxruntime-gpu 1.22 links onnx-tensorrt 10.9-GA → TensorRT 10.9 (nvinfer_10.dll).
+# 10.9.0.34 pulls tensorrt-cu12-libs (the actual DLLs); preload_dlls() loads them.
 
 # Managed entirely by uv — `uv run` creates/locks .venv/ here, never touches global.
 #   cd sidecar && uv run python pose_sidecar.py          (or: npm run sidecar)

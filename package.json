@@ -11,7 +11,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "check:models": "node scripts/check-models.mjs",
     "sidecar": "uv run --project sidecar python sidecar/pose_sidecar.py",
-    "sidecar:cuda": "uv run --project sidecar --extra trt python sidecar/pose_sidecar.py",
+    "sidecar:cuda": "uv run --project sidecar --with tensorrt-cu12==10.9.0.34 python sidecar/pose_sidecar.py",
     "prepare:bipeds": "node scripts/prepare-bipeds.mjs",
     "optimize:bipeds": "node scripts/optimize-bipeds.mjs",
     "test": "vitest run"
