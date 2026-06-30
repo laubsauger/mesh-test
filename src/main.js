@@ -37,6 +37,7 @@ import { probeEPs } from './pose/ep-probe.js';
 import { RTMWPoseProvider } from './pose/rtmw-provider.js';
 import { WorkerPoseProvider } from './pose/worker-pose-provider.js';
 import { SidecarPoseProvider } from './pose/sidecar-pose-provider.js';
+import { NativeCapturePoseProvider } from './pose/native-capture-provider.js';
 import { drawOverlay } from './pose/overlay-2d.js';
 import { toCanonical, mirrorCanonical } from './pose/observation-adapter.js';
 import { Retargeter } from './pose/retargeter.js';
@@ -317,6 +318,7 @@ const state = {
   poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS
   poseSidecarDebug: false, // sidecar: console per-frame timing/flow trace
   poseReadback: 'bitmap', // sidecar frame snapshot: 'bitmap'(createImageBitmap) | 'videoframe'(WebCodecs)
+  posePreview: true, // sidecar-native: push a low-res webcam JPEG so the overlay isn't blind
   poseSendMaxSide: 640, // sidecar: longest edge shipped over the wire. The models only need
   // yolo@320 + a 384×288 crop, so full-res (1280 = 3.6MB/frame) just bloats readback+transport
   // (~19ms + ~27ms) for no accuracy gain. 640 = 0.9MB → ~4× less data. Bump if a DISTANT
@@ -647,7 +649,7 @@ function buildInspectorControls() {
   });
   poseGroup.add(state, 'poseWorker').name('Inference Worker').listen();
   poseGroup.add(state, 'poseEP', POSE_EPS).name('Pose EP');
-  poseGroup.add(state, 'poseBackend', ['worker', 'sidecar']).name('Backend (web|native)').onChange(() => {
+  poseGroup.add(state, 'poseBackend', ['worker', 'sidecar', 'sidecar-native']).name('Backend (web|native)').onChange(() => {
     // benchmark switch: tear down the running provider so startPose rebuilds with
     // the chosen backend (onnxruntime-web worker vs the native TRT/CUDA sidecar).
     if (poseProvider) { stopPose(); if (state.poseEnabled) startPose(); }
@@ -665,6 +667,11 @@ function buildInspectorControls() {
   // WebCodecs new VideoFrame(video) (sync, no decode/copy); bitmap = createImageBitmap.
   poseGroup.add(state, 'poseReadback', ['bitmap', 'videoframe']).name('Sidecar Capture').onChange((v) => {
     if (poseProvider instanceof SidecarPoseProvider) poseProvider.readback = v;
+  });
+  // Native-capture: the backend owns the camera, so the only way the overlay isn't
+  // blind is a low-res preview pushed back. Toggle live; cost shows in Pose Stats.
+  poseGroup.add(state, 'posePreview').name('Native Preview Feed').onChange((on) => {
+    if (poseProvider instanceof NativeCapturePoseProvider) poseProvider.setPreview(on);
   });
   // Model selection — a reload (swaps the .onnx), so restart pose. Variant applies
   // to the worker backend here; the sidecar picks its model via launch flags.
@@ -713,6 +720,9 @@ function buildInspectorControls() {
   poseStatsGroup.add(poseStats, 'inferenceMs').name('RTMW Inference').listen();
   poseStatsGroup.add(poseStats, 'decodeMs').name('Decode').listen();
   poseStatsGroup.add(poseStats, 'captureMs').name('Capture (sidecar)').listen();
+  poseStatsGroup.add(poseStats, 'previewEncMs').name('Preview enc (native)').listen();
+  poseStatsGroup.add(poseStats, 'previewDecMs').name('Preview dec (native)').listen();
+  poseStatsGroup.add(poseStats, 'previewKb').name('Preview KB (native)').listen();
   poseStatsGroup.add(poseStats, 'readbackMs').name('Readback (sidecar)').listen();
   poseStatsGroup.add(poseStats, 'serverMs').name('Server total (sidecar)').listen();
   poseStatsGroup.add(poseStats, 'transportMs').name('Transport/wire (sidecar)').listen();
@@ -750,6 +760,11 @@ function buildInspectorControls() {
   statsGroup.add(statsState, 'points').name('Points').listen();
   statsGroup.add(statsState, 'geometries').name('Geometries').listen();
   statsGroup.add(statsState, 'textures').name('Textures').listen();
+
+  // Collapse the bulky setup groups by default — focus lands on Pose.
+  performanceGroup.close(); // Scene
+  lightingGroup.close();
+  meshGroup.close();
 }
 
 function applyGlowShadows() {
@@ -1680,6 +1695,9 @@ const poseStats = {
   inferenceMs: 0,
   decodeMs: 0,
   captureMs: 0, // sidecar: main-thread frame snapshot (createImageBitmap vs WebCodecs VideoFrame)
+  previewEncMs: 0, // native: sidecar JPEG encode of the preview
+  previewDecMs: 0, // native: browser decode of the preview
+  previewKb: 0, // native: preview JPEG size
   readbackMs: 0, // sidecar: GPU→CPU frame readback (browser side)
   serverMs: 0, // sidecar: full server handler (recv→reply); serverMs−inference = numpy/json overhead
   transportMs: 0, // sidecar: round−server = WS + browser scheduling lag (this is "wire")
@@ -1825,17 +1843,21 @@ async function startPose() {
     if (state.poseBackend === 'sidecar') {
       poseProvider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide, readback: state.poseReadback });
       poseProvider.debug = state.poseSidecarDebug;
+    } else if (state.poseBackend === 'sidecar-native') {
+      poseProvider = new NativeCapturePoseProvider({ kptThresh: state.poseKptThresh, width: 640, height: 480, preview: state.posePreview });
+      poseProvider.debug = state.poseSidecarDebug;
     } else {
       const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
       poseProvider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh, yoloRes: state.poseYoloRes, rtmwVariant: state.poseRtmwVariant });
     }
     poseStats.backend = state.poseBackend;
     await poseProvider.start();
-    const label = state.poseBackend === 'sidecar' ? `sidecar/${poseProvider.ep}` : `${state.poseWorker ? 'worker' : 'main'}/${state.poseEP}`;
+    const label = state.poseBackend.startsWith('sidecar') ? `${state.poseBackend}/${poseProvider.ep}` : `${state.poseWorker ? 'worker' : 'main'}/${state.poseEP}`;
     console.info(`[pose] ready in ${((performance.now() - t0) / 1000).toFixed(1)}s (${label})`);
     statusEl.textContent = '';
-    poseVideoEl.srcObject = poseProvider.stream;
-    await poseVideoEl.play();
+    // Native mode has no browser camera → no stream to preview; the overlay+mesh are the feedback.
+    if (poseProvider.stream) { poseVideoEl.srcObject = poseProvider.stream; await poseVideoEl.play(); }
+    else { poseVideoEl.srcObject = null; }
     poseOverlayEl.width = poseProvider.video.videoWidth || 1280;
     poseOverlayEl.height = poseProvider.video.videoHeight || 720;
     poseOverlayCtx = poseOverlayEl.getContext('2d');
@@ -1858,7 +1880,8 @@ function consumePoseFrame(frame) {
     if (state.poseOverlay) {
       drawOverlay(poseOverlayCtx, frame, poseOverlayEl.width, poseOverlayEl.height, {
         kptThresh: state.poseKptThresh,
-        mirror: true
+        mirror: true,
+        bg: poseProvider?.preview ?? null // native-capture preview backdrop (no <video> there)
       });
     } else {
       poseOverlayCtx.clearRect(0, 0, poseOverlayEl.width, poseOverlayEl.height);
@@ -1892,6 +1915,9 @@ async function poseLoop(myId) {
       poseStats.inferenceMs = ema(poseStats.inferenceMs, tm.inference);
       poseStats.decodeMs = ema(poseStats.decodeMs, tm.decode);
       poseStats.captureMs = ema(poseStats.captureMs, tm.capture ?? 0);
+      poseStats.previewEncMs = ema(poseStats.previewEncMs, tm.previewEncode ?? 0);
+      poseStats.previewDecMs = ema(poseStats.previewDecMs, tm.previewDecode ?? 0);
+      poseStats.previewKb = ema(poseStats.previewKb, (tm.previewBytes ?? 0) / 1024);
       poseStats.readbackMs = ema(poseStats.readbackMs, tm.readback ?? 0);
       poseStats.serverMs = ema(poseStats.serverMs, tm.serverTotal ?? 0);
       poseStats.transportMs = ema(poseStats.transportMs, tm.transport ?? tm.wire ?? 0);

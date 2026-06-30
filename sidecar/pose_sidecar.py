@@ -100,7 +100,11 @@ def providers_for(ep):
     """EP name → ORT providers list (with options). TRT gets engine caching + fp16,
     and falls back to CUDA (not CPU) for any ops TensorRT can't take."""
     if ep == "TensorrtExecutionProvider":
-        return [(ep, trt_options()), "CUDAExecutionProvider", "CPUExecutionProvider"]
+        opts = trt_options()
+        n = len([f for f in TRT_CACHE.glob("*") if f.is_file()]) if TRT_CACHE.exists() else 0
+        print(f"[sidecar] TRT fp16=ON, engine cache={TRT_CACHE} ({n} cached file(s) — "
+              f"{'HIT, fast start' if n else 'EMPTY, first build will take minutes'})")
+        return [(ep, opts), "CUDAExecutionProvider", "CPUExecutionProvider"]
     if ep == "CPUExecutionProvider":
         return [ep]
     return [ep, "CPUExecutionProvider"]
@@ -313,6 +317,87 @@ class PosePipeline:
 ZERO_TIMINGS = {"detect": 0, "preprocess": 0, "inference": 0, "decode": 0, "total": 0}
 
 
+async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, preview_w):
+    """BACKEND-OWNED capture: the sidecar opens the webcam ITSELF, runs det→crop→pose
+    →decode natively, and PUSHES only keypoints to the browser. No camera frame ever
+    crosses the wire (the browser sends nothing) → zero readback/transport, latency =
+    capture + inference. Latest-frame-wins: BUFFERSIZE=1 + always read the newest.
+    Optional: a LOW-RES JPEG preview (so the frontend's debug overlay isn't blind) is
+    encoded + pushed as a separate binary message — toggleable live, instrumented."""
+    loop = asyncio.get_event_loop()
+    cap = await loop.run_in_executor(None, lambda: cv2.VideoCapture(device))
+    if not cap.isOpened():
+        await ws.send(json.dumps({"type": "error",
+                                  "message": f"sidecar can't open camera {device} — in use by the browser/another app? "
+                                             "Native mode needs the camera free (close other camera tabs/apps)."}))
+        return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # latest-frame-wins (no stale backlog)
+    cap.set(cv2.CAP_PROP_FPS, 60)  # best-effort; falls back to the cam's max
+    print(f"[sidecar] NATIVE capture: camera {device} @ {width}x{height} — keypoints + "
+          f"{'low-res preview' if preview else 'NO preview'}")
+    await ws.send(json.dumps({"type": "native", "ep": pipe.active_ep}))
+
+    cfg = {"preview": preview, "thresh": thresh}
+
+    async def reader():  # live config: toggle preview / kptThresh without a restart
+        try:
+            async for m in ws:
+                if isinstance(m, str):
+                    c = json.loads(m)
+                    if "preview" in c:
+                        cfg["preview"] = bool(c["preview"])
+                    if "kptThresh" in c:
+                        cfg["thresh"] = float(c["kptThresh"])
+        except websockets.ConnectionClosed:
+            pass
+
+    reader_task = asyncio.create_task(reader())
+    pushed = 0
+    try:
+        while True:
+            ok, bgr = await loop.run_in_executor(None, cap.read)
+            if not ok:
+                await asyncio.sleep(0.005)
+                continue
+            t0 = time.perf_counter()
+            rgb = np.ascontiguousarray(bgr[:, :, ::-1])  # BGR→RGB
+            td = time.perf_counter()
+            boxes = pipe.detect(rgb, cfg["thresh"])
+            detect_ms = (time.perf_counter() - td) * 1000
+            frame, timings = pipe.infer(rgb, cfg["thresh"], boxes)
+            timings["detect"] = detect_ms
+            timings["frameW"] = int(rgb.shape[1])
+            timings["frameH"] = int(rgb.shape[0])
+
+            jpg = None
+            timings["previewEncode"] = 0.0
+            timings["previewBytes"] = 0
+            if cfg["preview"]:
+                pe0 = time.perf_counter()
+                ph = max(1, int(preview_w * bgr.shape[0] / bgr.shape[1]))
+                small = cv2.resize(bgr, (preview_w, ph), interpolation=cv2.INTER_AREA)
+                okj, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                if okj:
+                    jpg = buf.tobytes()
+                    timings["previewEncode"] = (time.perf_counter() - pe0) * 1000
+                    timings["previewBytes"] = len(jpg)
+
+            timings["serverTotal"] = timings["total"] = (time.perf_counter() - t0) * 1000
+            pushed += 1
+            await ws.send(json.dumps({"type": "pose", "timestampMs": time.perf_counter() * 1000.0,
+                                      "frame": frame, "timings": timings, "ep": pipe.active_ep}))
+            if jpg is not None:
+                await ws.send(jpg)  # binary preview, decoded by the browser as an ImageBitmap
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        reader_task.cancel()
+        await loop.run_in_executor(None, cap.release)
+        print(f"[sidecar] native capture stopped ({pushed} frames)")
+
+
 async def handle(ws, pipe):
     print("[sidecar] client connected")
     thresh = 0.3
@@ -324,6 +409,11 @@ async def handle(ws, pipe):
             if isinstance(msg, str):  # config (text)
                 cfg = json.loads(msg)
                 thresh = float(cfg.get("kptThresh", thresh))
+                if cfg.get("mode") == "native":  # backend owns the camera, pushes results
+                    await native_capture_loop(ws, pipe, thresh, int(cfg.get("device", 0)),
+                                              int(cfg.get("width", 640)), int(cfg.get("height", 480)),
+                                              bool(cfg.get("preview", True)), int(cfg.get("previewW", 320)))
+                    return
                 await ws.send(json.dumps({"type": "ready", "ep": pipe.active_ep}))
                 continue
             # binary frame: header(20) = ts f64 | w u32 | h u32 | detectEveryN u32 | then RGBA.

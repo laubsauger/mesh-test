@@ -3,8 +3,17 @@
 // flips x to match a CSS-mirrored selfie video.
 import { BODY_BONES, KPT_GROUPS } from './topology.js';
 
-export function drawOverlay(ctx, frame, vidW, vidH, { kptThresh = 0.3, mirror = true } = {}) {
-  ctx.clearRect(0, 0, vidW, vidH);
+export function drawOverlay(ctx, frame, vidW, vidH, { kptThresh = 0.3, mirror = true, bg = null } = {}) {
+  // bg = optional preview image (native-capture mode has no <video>, so the sidecar's
+  // low-res webcam JPEG is the backdrop). Mirror it to match the mirrored skeleton.
+  if (bg) {
+    ctx.save();
+    if (mirror) { ctx.translate(vidW, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(bg, 0, 0, vidW, vidH);
+    ctx.restore();
+  } else {
+    ctx.clearRect(0, 0, vidW, vidH);
+  }
   if (!frame) return;
 
   const k = frame.keypoints2D;
