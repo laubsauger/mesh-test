@@ -28,8 +28,21 @@ export class SidecarPoseProvider {
     // readback/wire = browser-side transport cost (the benchmark lever).
     this.timings = { detect: 0, preprocess: 0, inference: 0, decode: 0, total: 0, readback: 0, wire: 0 };
     this._pending = null;
+    this._pendingTimer = null;
+    this._replyTimeoutMs = 3000; // a frame's reply must arrive within this or we drop it
     this._canvas = null;
     this._ctx = null;
+  }
+
+  // Resolve the single in-flight request exactly once, clearing its timeout. Used
+  // by the reply path, the timeout, and a mid-session disconnect — so a lost reply
+  // (busy box, killed sidecar) drops one frame cleanly instead of deadlocking.
+  _settle(frame) {
+    if (this._pendingTimer) { clearTimeout(this._pendingTimer); this._pendingTimer = null; }
+    const resolve = this._pending;
+    this._pending = null;
+    this.latestFrame = frame;
+    resolve?.(frame);
   }
 
   async start() {
@@ -44,7 +57,7 @@ export class SidecarPoseProvider {
     await new Promise((resolve, reject) => {
       const fail = (e) => reject(new Error(`sidecar ws ${this.url}: ${e?.message || 'connection failed — is `npm run sidecar` running?'}`));
       this.ws.onerror = fail;
-      this.ws.onclose = () => { if (!this.running) fail(); };
+      this.ws.onclose = () => { if (!this.running) fail(); else this._settle(null); };
       this.ws.onopen = () => {
         this._readyResolve = resolve;
         this.ws.send(JSON.stringify({ type: 'config', kptThresh: this.kptThresh }));
@@ -63,6 +76,12 @@ export class SidecarPoseProvider {
       return;
     }
     if (msg.type === 'pose') {
+      // Stale-reply guard (the sidecar echoes the frame's send-timestamp): if this
+      // reply is for a frame that already timed out — so we moved on and a NEWER
+      // frame is now in flight — its keypoints + _sentW/H are wrong for the current
+      // slot. Drop it; the in-flight frame's own reply will arrive. (Prevents the
+      // timeout from cross-wiring one frame's pose onto the next → "desync".)
+      if (msg.timestampMs !== this._sentAt) return;
       const native = msg.timings;
       const t = performance.now();
       const round = t - this._sentAt; // full request→response
@@ -73,10 +92,7 @@ export class SidecarPoseProvider {
         readback: this._readbackMs, wire: Math.max(0, round - native.total)
       };
       this.ep = msg.ep || this.ep;
-      this.latestFrame = msg.frame ? this._toVideoSpace(msg.frame) : null;
-      const resolve = this._pending;
-      this._pending = null;
-      resolve?.(this.latestFrame);
+      this._settle(msg.frame ? this._toVideoSpace(msg.frame) : null);
     }
   }
 
@@ -121,13 +137,23 @@ export class SidecarPoseProvider {
     this._sentW = w; this._sentH = h; this._sentAt = ts;
     return new Promise((resolve) => {
       this._pending = resolve;
-      this.ws.send(buf);
+      // Drop the frame if no reply lands in time — never deadlock the loop.
+      this._pendingTimer = setTimeout(() => {
+        console.warn('[sidecar] reply timeout — dropping frame');
+        this._settle(null);
+      }, this._replyTimeoutMs);
+      try {
+        this.ws.send(buf);
+      } catch {
+        this._settle(null); // send failed (socket closing) → drop, recover
+      }
     });
   }
 
   stop() {
     this.running = false;
     this._pending = null;
+    if (this._pendingTimer) { clearTimeout(this._pendingTimer); this._pendingTimer = null; }
     if (this.ws) { try { this.ws.close(); } catch { /* already closed */ } this.ws = null; }
     stopWebcam(this.stream);
     this.video = null;

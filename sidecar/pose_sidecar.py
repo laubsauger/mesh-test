@@ -255,11 +255,15 @@ class PosePipeline:
         return frame, timings
 
 
+ZERO_TIMINGS = {"detect": 0, "preprocess": 0, "inference": 0, "decode": 0, "total": 0}
+
+
 async def handle(ws, pipe):
     print("[sidecar] client connected")
     thresh = 0.3
     frame_count = 0
     last_boxes = None
+    frame_errs = 0
     try:
         async for msg in ws:
             if isinstance(msg, str):  # config (text)
@@ -267,20 +271,35 @@ async def handle(ws, pipe):
                 thresh = float(cfg.get("kptThresh", thresh))
                 await ws.send(json.dumps({"type": "ready", "ep": pipe.active_ep}))
                 continue
-            # binary frame: header(20) = ts f64 | w u32 | h u32 | detectEveryN u32 | then RGBA
-            ts, w, h, every_n = struct.unpack_from("<dIII", msg, 0)
-            rgba = np.frombuffer(msg, np.uint8, offset=20).reshape(h, w, 4)
-            frame_rgb = np.ascontiguousarray(rgba[:, :, :3])  # drop alpha
-            td = time.perf_counter()
-            frame_count += 1
-            if every_n <= 1 or last_boxes is None or frame_count % every_n == 0:
-                last_boxes = pipe.detect(frame_rgb, thresh)
-            detect_ms = (time.perf_counter() - td) * 1000
-            frame, timings = pipe.infer(frame_rgb, thresh, last_boxes)
-            timings["detect"] = detect_ms
-            timings["total"] += detect_ms
-            await ws.send(json.dumps({"type": "pose", "timestampMs": ts, "frame": frame,
-                                      "timings": timings, "ep": pipe.active_ep}))
+            # binary frame: header(20) = ts f64 | w u32 | h u32 | detectEveryN u32 | then RGBA.
+            # The browser is strictly one-frame-in-flight, so each binary message maps 1:1
+            # to the reply below — but ONE bad frame must NOT kill the stream (else the
+            # browser's pending promise never resolves → permanent freeze / "freak out"
+            # when the box is busy). Validate, process, and ALWAYS reply — on error we
+            # reply frame=null (a clean drop) so the loop self-recovers and stays in sync.
+            ts = 0.0
+            try:
+                ts, w, h, every_n = struct.unpack_from("<dIII", msg, 0)
+                expected = 20 + w * h * 4
+                if len(msg) != expected:
+                    raise ValueError(f"frame bytes {len(msg)} != header expects {expected} (w={w} h={h}) — truncated/garbled, dropping")
+                rgba = np.frombuffer(msg, np.uint8, offset=20).reshape(h, w, 4)
+                frame_rgb = np.ascontiguousarray(rgba[:, :, :3])  # drop alpha
+                td = time.perf_counter()
+                frame_count += 1
+                if every_n <= 1 or last_boxes is None or frame_count % every_n == 0:
+                    last_boxes = pipe.detect(frame_rgb, thresh)
+                detect_ms = (time.perf_counter() - td) * 1000
+                frame, timings = pipe.infer(frame_rgb, thresh, last_boxes)
+                timings["detect"] = detect_ms
+                timings["total"] += detect_ms
+                reply = {"type": "pose", "timestampMs": ts, "frame": frame, "timings": timings, "ep": pipe.active_ep}
+            except Exception as e:  # noqa: BLE001 — one bad frame must not break the stream
+                frame_errs += 1
+                if frame_errs <= 5:
+                    print(f"[sidecar] frame dropped ({frame_errs}): {e}")
+                reply = {"type": "pose", "timestampMs": ts, "frame": None, "timings": dict(ZERO_TIMINGS), "ep": pipe.active_ep}
+            await ws.send(json.dumps(reply))
     except websockets.ConnectionClosed:
         print("[sidecar] client disconnected")
 

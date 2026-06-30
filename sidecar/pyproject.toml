@@ -14,23 +14,22 @@ dependencies = [
     "onnxruntime>=1.18 ; platform_system == 'Darwin'",
 ]
 
-# nvidia CUDA/cuDNN/TensorRT RUNTIME as pip wheels — pulled INTO the uv venv so
-# onnxruntime-gpu finds cublas/cudnn/trt without a global CUDA install (the
-# sidecar calls ort.preload_dlls() to load these). Enable with the `cuda` extra:
+# CUDA/cuDNN/TensorRT runtime as pip wheels INTO the uv venv (no global install),
+# so onnxruntime-gpu finds them via ort.preload_dlls(). Enable with:
 #   npm run sidecar:cuda     (= uv run --extra cuda ...)
-# UNSUFFIXED names: NVIDIA deprecated the `-cu13`/`-cu12` variants — the bare
-# packages now resolve to the current CUDA major (13.x / cuDNN 9.x), which matches
-# the onnxruntime-gpu wheel that asked for "cuDNN 9.* and CUDA 13.*".
-# If the pip libs still don't match your onnxruntime-gpu build, install CUDA + cuDNN
-# + TensorRT system-wide instead (see the sidecar's refusal message).
+#
+# We install ONLY `tensorrt-cu13`, which transitively pulls a COHERENT CUDA-13 set
+# (cudart/cublas/cudnn) with Windows wheels — instead of us pinning each nvidia lib
+# (their PyPI naming is wildly inconsistent: cufft wants unsuffixed, cudnn-unsuffixed
+# is an ancient Linux-only stub, etc.). This covers the TensorRT EP (--ep trt) and
+# the cublas/cudnn that the CUDA EP also needs.
+#
+# If this still mismatches your onnxruntime-gpu build, the RELIABLE path is a
+# system install of CUDA 13.x + cuDNN 9.x + TensorRT on PATH — then plain
+# `npm run sidecar` works (preload finds them). See the sidecar's refusal message.
 [project.optional-dependencies]
 cuda = [
-    "nvidia-cuda-runtime ; platform_system != 'Darwin'",
-    "nvidia-cublas ; platform_system != 'Darwin'",
-    "nvidia-cudnn ; platform_system != 'Darwin'",
-    "nvidia-cufft ; platform_system != 'Darwin'",
-    "nvidia-curand ; platform_system != 'Darwin'",
-    "tensorrt ; platform_system != 'Darwin'",
+    "tensorrt-cu13 ; platform_system != 'Darwin'",
 ]
 
 # Managed entirely by uv — `uv run` creates/locks .venv/ here, never touches global.
