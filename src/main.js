@@ -315,7 +315,9 @@ const state = {
   poseEnabled: true, // dev default: pose on at load
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
   poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS
-  poseSendMaxSide: 512, // sidecar: longest edge of the downscaled frame shipped over the wire
+  poseSendMaxSide: 1280, // sidecar: longest edge shipped over the wire. Default = webcam res
+  // (no downscale) so the sidecar's detect+crop match the WORKER's full-res input → identical
+  // pose quality. Lower it only to trade pose quality for wire bandwidth (loopback rarely needs it).
   poseRtmwVariant: 'l', // rtmw3d size: l(faster, 219MB) | x(largest, 352MB). Both 3D, 384×288, 3-axis.
   // NOTE: rtmw3d only ships as l and x — there is NO 3D "m" (the "m" upstream is 2D rtmw, no depth).
   poseYoloRes: 320, // yolo detector input res: 320/384/512 (files committed)
@@ -638,7 +640,9 @@ function buildInspectorControls() {
     // the chosen backend (onnxruntime-web worker vs the native TRT/CUDA sidecar).
     if (poseProvider) { stopPose(); if (state.poseEnabled) startPose(); }
   });
-  poseGroup.add(state, 'poseSendMaxSide', 256, 1280, 32).name('Sidecar Frame Px').onChange((v) => {
+  // NOT a model resolution — this is the downscaled webcam frame shipped over the
+  // wire to the sidecar (transport only; it letterboxes→yolo and crops→rtmw from it).
+  poseGroup.add(state, 'poseSendMaxSide', 256, 1280, 32).name('Sidecar Wire Frame px').onChange((v) => {
     if (poseProvider instanceof SidecarPoseProvider) poseProvider.sendMaxSide = Math.round(v);
   });
   // Model selection — a reload (swaps the .onnx), so restart pose. Variant applies
@@ -1509,20 +1513,27 @@ function computePoseMatrices(batch) {
   batch.source.updateMatrixWorld(true);
   // Copy each skeleton's matrices (clip walkers re-pose the shared skeleton later
   // in the loop, so snapshot now into stable buffers).
-  return batch.skeletonStates.map((ss) => {
+  const snaps = [];
+  for (const ss of batch.skeletonStates) {
     ss.skeleton.update();
     const src = ss.skeleton.boneMatrices;
+    // Guard the SHARED buffer: a non-finite snapshot (NaN bone from a degenerate
+    // frame) would vanish the whole batch. Bail → writePoseSlices keeps the last
+    // good slice (holds the previous pose) instead of writing garbage.
+    if (!src.every(Number.isFinite)) {
+      if (!batch._poseNaNLogged) {
+        batch._poseNaNLogged = true;
+        console.warn('[pose] non-finite bone matrices — holding last good pose:', batch.mesh?.name);
+      }
+      return null;
+    }
     if (!batch._poseLogged) {
       batch._poseLogged = true;
-      console.log('[pose] driving', batch.mesh?.name, {
-        bones: ss.skeleton.bones.length,
-        retarget: state.poseRetarget,
-        hasCanonical: !!latestCanonical,
-        allFinite: src.every(Number.isFinite)
-      });
+      console.log('[pose] driving', batch.mesh?.name, { bones: ss.skeleton.bones.length, retarget: state.poseRetarget, hasCanonical: !!latestCanonical });
     }
-    return Float32Array.from(src);
-  });
+    snaps.push(Float32Array.from(src));
+  }
+  return snaps;
 }
 
 function writePoseSlices(walker, batch, posed) {

@@ -18,17 +18,19 @@ dependencies = [
 # onnxruntime-gpu finds cublas/cudnn/trt without a global CUDA install (the
 # sidecar calls ort.preload_dlls() to load these). Enable with the `cuda` extra:
 #   npm run sidecar:cuda     (= uv run --extra cuda ...)
-# Pinned to the CUDA-13 line (matches the onnxruntime-gpu wheel that errored asking
-# for "cuDNN 9.* and CUDA 13.*"). If your onnxruntime-gpu is a CUDA-12 build, swap
-# every cu13 → cu12. Check with: python -c "import onnxruntime;print(onnxruntime.get_build_info())"
+# UNSUFFIXED names: NVIDIA deprecated the `-cu13`/`-cu12` variants — the bare
+# packages now resolve to the current CUDA major (13.x / cuDNN 9.x), which matches
+# the onnxruntime-gpu wheel that asked for "cuDNN 9.* and CUDA 13.*".
+# If the pip libs still don't match your onnxruntime-gpu build, install CUDA + cuDNN
+# + TensorRT system-wide instead (see the sidecar's refusal message).
 [project.optional-dependencies]
 cuda = [
-    "nvidia-cuda-runtime-cu13 ; platform_system != 'Darwin'",
-    "nvidia-cublas-cu13 ; platform_system != 'Darwin'",
-    "nvidia-cudnn-cu13 ; platform_system != 'Darwin'",
-    "nvidia-cufft-cu13 ; platform_system != 'Darwin'",
-    "nvidia-curand-cu13 ; platform_system != 'Darwin'",
-    "tensorrt-cu13 ; platform_system != 'Darwin'",
+    "nvidia-cuda-runtime ; platform_system != 'Darwin'",
+    "nvidia-cublas ; platform_system != 'Darwin'",
+    "nvidia-cudnn ; platform_system != 'Darwin'",
+    "nvidia-cufft ; platform_system != 'Darwin'",
+    "nvidia-curand ; platform_system != 'Darwin'",
+    "tensorrt ; platform_system != 'Darwin'",
 ]
 
 # Managed entirely by uv — `uv run` creates/locks .venv/ here, never touches global.

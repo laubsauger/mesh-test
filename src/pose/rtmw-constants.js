@@ -36,9 +36,15 @@ export const YOLO_DET_MODEL = {
 // LOADED session at runtime, so a variant works the moment its file lands —
 // the hardcoded outX/Y/Z above are just the x-export defaults / decode fallback.
 export const RTMW_VARIANTS = ['l', 'x']; // the only RTMW3D (3D) releases — no 3D m/s exist
-export const YOLO_RES_OPTIONS = [320, 384, 512];
+// yolo DETECTOR input size (square, its own export per file). 640 = the native
+// base export (most accurate, slowest); 320/384/512 = faster lower-res variants.
+// This is INDEPENDENT of: (a) the rtmw pose input (fixed 384×288, the model's own
+// shape) and (b) the sidecar wire-frame downscale (poseSendMaxSide, transport only).
+export const YOLO_RES_OPTIONS = [320, 384, 512, 640];
 export const rtmwUrl = (variant) => `inference/rtmw3d-${variant}/inference_model.onnx`;
-export const yoloUrl = (res) => `inference/yolo26n/inference_model_${res}.onnx`;
+export const yoloUrl = (res) => (res === 640
+  ? 'inference/yolo26n/inference_model.onnx' // 640 = the unsuffixed base export
+  : `inference/yolo26n/inference_model_${res}.onnx`);
 
 // ImageNet RGB normalization (pipeline.json, to_rgb=true, 0-255 scale).
 export const POSE_MEAN = [123.675, 116.28, 103.53];

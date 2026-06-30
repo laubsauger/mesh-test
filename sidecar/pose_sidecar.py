@@ -288,13 +288,21 @@ async def handle(ws, pipe):
 def preload_gpu_dlls():
     """Load CUDA/cuDNN/TensorRT from the nvidia-* pip wheels installed in THIS venv
     (the `sidecar:cuda` extra), so onnxruntime-gpu finds them without a global CUDA
-    install. No-op on older ORT / Mac (the function won't exist there)."""
-    if hasattr(ort, "preload_dlls"):
-        try:
-            ort.preload_dlls()  # cuda=True, cudnn=True, tensorrt=True by default
-            print("[sidecar] ort.preload_dlls() loaded CUDA/cuDNN/TRT from venv wheels (if present)")
-        except Exception as e:  # noqa: BLE001 — best-effort; refusal check below catches real failure
-            print(f"[sidecar] preload_dlls skipped: {e}")
+    install. Skipped when those wheels aren't installed — otherwise preload_dlls
+    spams "Failed to load cublas64_*.dll" for libs that legitimately aren't there
+    (plain `npm run sidecar`). No-op on older ORT / Mac (function absent)."""
+    if not hasattr(ort, "preload_dlls"):
+        return
+    import importlib.util
+    have_wheels = (importlib.util.find_spec("nvidia") is not None
+                   or importlib.util.find_spec("tensorrt") is not None)
+    if not have_wheels:
+        return  # no nvidia runtime wheels → don't probe (avoids the DLL-load spam)
+    try:
+        ort.preload_dlls()  # cuda=True, cudnn=True, tensorrt=True by default
+        print("[sidecar] ort.preload_dlls() loaded CUDA/cuDNN/TRT from venv wheels")
+    except Exception as e:  # noqa: BLE001 — best-effort; refusal check below catches real failure
+        print(f"[sidecar] preload_dlls skipped: {e}")
 
 
 async def main():

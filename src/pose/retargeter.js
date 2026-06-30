@@ -173,6 +173,12 @@ export class Retargeter {
   // limit clamp, render-rate slerp (T10·2). gain<1 scales the rotation away from
   // rest (tames over-eager bones, e.g. head pitch).
   _setBoneFromWorld(boneKey, bind, qWorld, maxAngleDeg, follow, gain = 1) {
+    // Singularity guard: a degenerate aim (basisQuat with a near-parallel basis,
+    // or setFromUnitVectors on a ~zero/antiparallel vector) yields a NaN quat.
+    // Writing it would NaN this bone's matrix → the whole shared skinned batch
+    // vanishes. Skip the update — the bone holds its last good smoothed value.
+    if (!Number.isFinite(qWorld.x) || !Number.isFinite(qWorld.y) ||
+        !Number.isFinite(qWorld.z) || !Number.isFinite(qWorld.w)) return;
     const bone = this.rig[boneKey];
     if (bone.parent) {
       bone.parent.getWorldQuaternion(_qParent).invert();
