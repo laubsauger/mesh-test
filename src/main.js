@@ -1901,8 +1901,13 @@ function scanCameras() {
 async function startPose() {
   if (poseProvider) return;
   posePipEl.hidden = false;
-  posePipLabel.textContent = 'pose: loading model…';
-  statusEl.textContent = 'Loading pose model (369MB) — first load compiles GPU shaders, may briefly stutter…';
+  // Sidecar backends load the model NATIVELY (nothing downloads in the browser); only
+  // the in-browser worker compiles the GLB/onnx here.
+  const nativeBackend = state.poseBackend.startsWith('sidecar');
+  posePipLabel.textContent = nativeBackend ? 'pose: connecting sidecar…' : 'pose: loading model…';
+  statusEl.textContent = nativeBackend
+    ? 'Connecting to native sidecar (ws://127.0.0.1:8787)…'
+    : 'Loading pose model (rtmw3d-l ~219MB) — first load compiles GPU shaders, may briefly stutter…';
   const t0 = performance.now();
   try {
     poseSmoother.reset();

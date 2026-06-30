@@ -389,20 +389,20 @@ def enumerate_cameras(max_n=8):
     return out
 
 
-def open_camera(device, width, height):
-    """Open the webcam robustly. Tries both Windows backends and REJECTS black frames
-    (the cam opens but feeds 0s). Warms up ~0.75s/backend to outlast a lagging browser
-    camera release. Returns the VideoCapture, or None if every attempt was black."""
+def _open_device(device, width, height):
+    """Try ONE device index across both Windows backends, warm up ~0.75s/backend, and
+    require non-black frames. Returns the VideoCapture or None."""
     backends = ([(cv2.CAP_DSHOW, "DShow"), (cv2.CAP_MSMF, "MSMF")]
                 if sys.platform == "win32" else [(cv2.CAP_ANY, "default")])
     for be, name in backends:
         cap = cv2.VideoCapture(device, be)
         if not cap.isOpened():
             continue
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, 60)
+        # Do NOT force width/height: a VIRTUAL camera (OBS, etc.) only outputs its fixed
+        # canvas resolution — requesting a different size breaks the stream → BLACK frames
+        # (this is exactly why enumerate, which never sets size, saw it LIVE). We crop the
+        # person bbox from whatever native res it delivers, so the capture size is moot.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # latest-frame-wins (harmless if unsupported)
         for _ in range(15):  # warm up + wait out a lagging browser release; require non-black
             ok, f = cap.read()
             if ok and float(f.mean()) > 5:
@@ -410,7 +410,24 @@ def open_camera(device, width, height):
                 return cap
             time.sleep(0.05)
         cap.release()
-        print(f"[sidecar] camera {device} via {name}: opened but BLACK frames — trying next backend")
+        print(f"[sidecar] camera {device} via {name}: opened but BLACK frames")
+    return None
+
+
+def open_camera(device, width, height):
+    """Open the requested device; if it's black/missing, AUTO-FALL-BACK to any LIVE
+    camera (Windows indices shift, OBS may be off, a consumer may hold it). Logs which
+    index it landed on so you can pin it with --device."""
+    cap = _open_device(device, width, height)
+    if cap is not None:
+        return cap
+    print(f"[sidecar] device {device} black/missing — scanning for ANY live camera…")
+    for c in enumerate_cameras():
+        if c["live"] and c["index"] != device:
+            cap = _open_device(c["index"], width, height)
+            if cap is not None:
+                print(f"[sidecar] AUTO-selected device {c['index']} ({c['w']}x{c['h']}) — pin it with --device {c['index']}")
+                return cap
     return None
 
 
