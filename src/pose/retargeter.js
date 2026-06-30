@@ -45,6 +45,21 @@ function basisQuat(a1, a2, b1, b2, out) {
   out.setFromRotationMatrix(_mTarget);
 }
 
+// Singularity-safe smoothing of a persistent unit axis toward a new candidate.
+// `last.lerp(candidate).normalize()` SNAPS when candidate ≈ -last: the lerp
+// passes through ~zero magnitude and normalize() amplifies noise into a random
+// direction (the 90/180° flip). Guard it: hold the previous axis when the blend
+// collapses, instead of exploding. `lock` hemisphere-aligns candidate to last
+// first — correct for axes whose SIGN carries no meaning (bend-plane normals),
+// wrong for axes where sign IS the signal (facing/yaw → leave lock=false).
+const _blend = new THREE.Vector3();
+function smoothAxis(last, candidate, follow, lock) {
+  if (lock && candidate.dot(last) < 0) candidate.negate();
+  _blend.copy(last).lerp(candidate, follow);
+  if (_blend.lengthSq() < 1e-4) return last; // collapsed (sign flip) → hold, no snap
+  return last.copy(_blend).normalize();
+}
+
 export class Retargeter {
   constructor(skeleton, { restQuats = null } = {}) {
     this.skeleton = skeleton;
@@ -230,7 +245,7 @@ export class Retargeter {
           last = _planeN.clone();
           this.lastPlaneN.set(limb.upper, last);
         } else {
-          last.lerp(_planeN, opts.planeFollow).normalize();
+          smoothAxis(last, _planeN, opts.planeFollow, true); // bend-plane sign carries no info
         }
         plane = last;
       } else {
@@ -274,7 +289,7 @@ export class Retargeter {
           _planeN.divideScalar(len);
           let last = this.lastPlaneN.get(fa.bone);
           if (!last) { last = _planeN.clone(); this.lastPlaneN.set(fa.bone, last); }
-          else last.lerp(_planeN, opts.planeFollow).normalize();
+          else smoothAxis(last, _planeN, opts.planeFollow, true); // forearm-roll plane sign carries no info
           basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
           _q.multiply(bind.bindWorldQuat);
           this._setBoneFromWorld(fa.bone, bind, _q, opts.maxAngleDeg, opts.follow);
@@ -303,15 +318,21 @@ export class Retargeter {
 
     if (opts.yaw && bind.bindAcross && lh.confidence >= opts.kptThresh && rh.confidence >= opts.kptThresh) {
       // hip axis (right). Turning lives in the z-separation, which monocular depth
-      // under-reads → amplify z by yawGain so turns actually register.
-      _planeN.set((rh.x - lh.x) * sx, rh.y - lh.y, (rh.z - lh.z) * opts.yawGain);
+      // under-reads → amplify z by yawGain so turns register. But near frontal that
+      // z is mostly NOISE: amplified, it flips the axis sign frame-to-frame → the
+      // whole body snaps 180°. Deadzone it: ignore depth separation smaller than a
+      // fraction of the (reliable) horizontal hip width, so frontal pose stays put.
+      const rxw = (rh.x - lh.x) * sx;
+      const rzAmp = (rh.z - lh.z) * opts.yawGain;
+      const rz = Math.abs(rzAmp) < Math.abs(rxw) * 0.18 ? 0 : rzAmp;
+      _planeN.set(rxw, rh.y - lh.y, rz);
       _planeN.addScaledVector(_dir, -_dir.dot(_planeN)); // perpendicular to up
       const len = _planeN.length();
       if (len > 0.02) {
         _planeN.divideScalar(len);
         let last = this.lastPlaneN.get('hips');
         if (!last) { last = _planeN.clone(); this.lastPlaneN.set('hips', last); }
-        else last.lerp(_planeN, Math.max(opts.planeFollow, 0.3)).normalize(); // responsive yaw
+        else smoothAxis(last, _planeN, Math.max(opts.planeFollow, 0.3), false); // sign = facing; hold on flip, never snap
         basisQuat(bind.restDirWorld, bind.bindAcross, _dir, last, _q);
         _q.multiply(bind.bindWorldQuat);
         this._setBoneFromWorld('hips', bind, _q, opts.maxAngleDeg, opts.follow);

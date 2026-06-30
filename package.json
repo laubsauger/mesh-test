@@ -5,8 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "predev": "node scripts/check-models.mjs",
     "build": "vite build",
+    "prebuild": "node scripts/check-models.mjs",
     "preview": "vite preview --host 127.0.0.1",
+    "check:models": "node scripts/check-models.mjs",
+    "sidecar": "uv run --project sidecar python sidecar/pose_sidecar.py",
     "prepare:bipeds": "node scripts/prepare-bipeds.mjs",
     "optimize:bipeds": "node scripts/optimize-bipeds.mjs",
     "test": "vitest run"

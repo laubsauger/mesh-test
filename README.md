@@ -16,20 +16,33 @@ design.
 - A **webcam** for pose driving.
 - The **pose ONNX models** (large, git-ignored — see below).
 
-## Models (required, git-ignored)
+## Assets: two separate folders
 
-The character GLBs in `public/models/*.glb` are committed. The **pose models are
-not** — `rtmw3d-x` is ~369 MB (> GitHub's 100 MB limit), so `public/models/**/*.onnx`
-is git-ignored. After cloning you must place them:
+Two kinds of model live under `public/`, kept in **distinct** folders so the
+overloaded word "models" stops being ambiguous:
+
+| Folder | Contents | In git? | Source |
+| --- | --- | --- | --- |
+| `public/models/` | Character **mesh** GLBs (`*_biped.glb`) | ✅ committed | `npm run optimize:bipeds` |
+| `public/inference/` | Pose **inference** ONNX models | ❌ git-ignored | file transfer (see below) |
+
+### Inference models (required for pose, git-ignored)
+
+The pose ONNX models are **not committed** — `rtmw3d-x` is ~352 MB (> GitHub's
+100 MB file limit) — and they are **not regenerable from this repo**: they're
+exported by the separate **`object-detect`** project, which is not vendored
+here. A fresh clone has none. Bring them over by **file transfer** and drop them
+at:
 
 ```
-public/models/rtmw3d-x/inference_model.onnx      # RTMW3D-x 3D pose (≈369 MB)
-public/models/yolo26n/inference_model_384.onnx   # person detector (top-down crop)
+public/inference/rtmw3d-x/inference_model.onnx      # RTMW3D-x 3D pose (≈352 MB)
+public/inference/yolo26n/inference_model_384.onnx   # person detector (top-down crop)
 ```
 
-Generate them with `export_onnx.py` from the companion `object-detect` project, or
-copy an existing `web/public/models/{rtmw3d-x,yolo26n}` folder. The app throws a
-clear "model fetch 404" if they're missing.
+`npm run check:models` verifies they're present (it also runs automatically
+before `dev`/`build`). It's **warn-only**: the crowd renderer runs without them —
+only webcam pose driving needs them, and would otherwise fail with an opaque
+"model fetch 404" at runtime.
 
 ## Run
 

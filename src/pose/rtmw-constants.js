@@ -7,10 +7,10 @@
 
 export const NUM_KPTS = 133;
 
-// rtmw3d-x model meta (public/models/rtmw3d-x). Input is CHW [1,3,resH,resW].
+// rtmw3d-x model meta (public/inference/rtmw3d-x). Input is CHW [1,3,resH,resW].
 export const RTMW3D_MODEL = {
   id: 'rtmw3d-x',
-  url: 'models/rtmw3d-x/inference_model.onnx',
+  url: 'inference/rtmw3d-x/inference_model.onnx',
   resW: 288,
   resH: 384,
   inputName: 'input',
@@ -22,8 +22,8 @@ export const RTMW3D_MODEL = {
 
 export const YOLO_DET_MODEL = {
   id: 'yolo26n',
-  url: 'models/yolo26n/inference_model_384.onnx', // 384 export (512/640 wasteful for this)
-  res: 384,
+  url: 'inference/yolo26n/inference_model_320.onnx', // 320 export — person bbox doesn't need 384/512
+  res: 320,
   inputName: 'images',
   personClassId: 0
 };

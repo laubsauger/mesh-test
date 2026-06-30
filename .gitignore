@@ -2,11 +2,18 @@
 node_modules/
 dist/
 
+# uv-managed sidecar virtualenv + caches — never global, never committed.
+sidecar/.venv/
+**/__pycache__/
+
 # Source archives + unzipped intermediates — large, regenerable, never deployed.
 # The shipped assets are the merged GLBs in public/models/ (committed).
 assets/bipeds/*.zip
 public/bipeds/
 
-# Pose ONNX models — large (rtmw3d ~369MB > GitHub 100MB limit), regenerable
-# from object-detect/export_onnx.py. Committed GLB characters (*.glb) stay.
-public/models/**/*.onnx
+# Pose ONNX inference models — large (rtmw3d ~352MB > GitHub 100MB limit) and NOT
+# regenerable from this repo: they're exported by the separate `object-detect`
+# project (not vendored here). Obtain them via file transfer and drop into
+# public/inference/ (see README "Inference models"). `npm run check:models`
+# verifies they're present. Committed character GLBs in public/models/ stay.
+public/inference/

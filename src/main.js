@@ -36,6 +36,7 @@ import { BODY_BONES } from './pose/topology.js';
 import { probeEPs } from './pose/ep-probe.js';
 import { RTMWPoseProvider } from './pose/rtmw-provider.js';
 import { WorkerPoseProvider } from './pose/worker-pose-provider.js';
+import { SidecarPoseProvider } from './pose/sidecar-pose-provider.js';
 import { drawOverlay } from './pose/overlay-2d.js';
 import { toCanonical, mirrorCanonical } from './pose/observation-adapter.js';
 import { Retargeter } from './pose/retargeter.js';
@@ -313,6 +314,8 @@ const state = {
   poseEP: 'webgpu',
   poseEnabled: true, // dev default: pose on at load
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
+  poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS
+  poseSendMaxSide: 512, // sidecar: longest edge of the downscaled frame shipped over the wire
   poseKptThresh: 0.3,
   poseRetarget: true,
   poseMirrorX: false,
@@ -324,7 +327,8 @@ const state = {
   poseSmoothBeta: 0.02,
   poseJointLimit: 150,
   poseBodyYaw: true,
-  poseYawGain: 2.5, // amplify depth-separation so turning (yaw) registers
+  poseYawGain: 1.2, // amplify hip depth-separation so turning registers — but only modestly:
+  // high gain blows up noisy monocular z near frontal → axis sign-flips → whole-body 180° snap.
   poseFollow: 0.5, // higher = snappier (less laggy/jello)
   poseSwingTwist: true,
   poseWristTwist: true,
@@ -626,6 +630,14 @@ function buildInspectorControls() {
   });
   poseGroup.add(state, 'poseWorker').name('Inference Worker').listen();
   poseGroup.add(state, 'poseEP', POSE_EPS).name('Pose EP');
+  poseGroup.add(state, 'poseBackend', ['worker', 'sidecar']).name('Backend (web|native)').onChange(() => {
+    // benchmark switch: tear down the running provider so startPose rebuilds with
+    // the chosen backend (onnxruntime-web worker vs the native TRT/CUDA sidecar).
+    if (poseProvider) { stopPose(); if (state.poseEnabled) startPose(); }
+  });
+  poseGroup.add(state, 'poseSendMaxSide', 256, 1280, 32).name('Sidecar Frame Px').onChange((v) => {
+    if (poseProvider instanceof SidecarPoseProvider) poseProvider.sendMaxSide = Math.round(v);
+  });
   poseGroup.add(state, 'poseKptThresh', 0, 1, 0.01).name('Kpt Threshold');
   poseGroup.add(state, 'poseRetarget').name('Pose Retarget').listen();
   poseGroup.add(state, 'poseMirror').name('Mirror Pose').listen();
@@ -657,11 +669,14 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseDetectEveryN', 1, 6, 1).name('Detect Every N');
 
   const poseStatsGroup = renderer.inspector.createParameters('VJ Layer / Pose Stats (ms)');
+  poseStatsGroup.add(poseStats, 'backend').name('Backend').listen();
   poseStatsGroup.add(poseStats, 'poseFps').name('Pose FPS').listen();
   poseStatsGroup.add(poseStats, 'detectMs').name('Detect (yolo)').listen();
   poseStatsGroup.add(poseStats, 'preprocessMs').name('Preprocess').listen();
   poseStatsGroup.add(poseStats, 'inferenceMs').name('RTMW Inference').listen();
   poseStatsGroup.add(poseStats, 'decodeMs').name('Decode').listen();
+  poseStatsGroup.add(poseStats, 'readbackMs').name('Readback (sidecar)').listen();
+  poseStatsGroup.add(poseStats, 'wireMs').name('Wire (sidecar)').listen();
   poseStatsGroup.add(poseStats, 'overlayMs').name('Overlay Draw').listen();
   poseStatsGroup.add(poseStats, 'retargetMs').name('Retarget/frame').listen();
   poseGroup.add(state, 'poseRecording').name('Record').listen().onChange((on) => {
@@ -1600,11 +1615,14 @@ let lastPoseFrameAt = 0;
 
 // Per-stage timing breakdown (ms), EMA-smoothed, shown in the Pose Stats panel.
 const poseStats = {
+  backend: 'worker',
   poseFps: 0,
   detectMs: 0,
   preprocessMs: 0,
   inferenceMs: 0,
   decodeMs: 0,
+  readbackMs: 0, // sidecar: GPU→CPU frame readback (browser side)
+  wireMs: 0, // sidecar: WS round-trip minus native work (transport overhead)
   overlayMs: 0,
   retargetMs: 0
 };
@@ -1732,10 +1750,16 @@ async function startPose() {
   const t0 = performance.now();
   try {
     poseSmoother.reset();
-    const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
-    poseProvider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh });
+    if (state.poseBackend === 'sidecar') {
+      poseProvider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide });
+    } else {
+      const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
+      poseProvider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh });
+    }
+    poseStats.backend = state.poseBackend;
     await poseProvider.start();
-    console.info(`[pose] ready in ${((performance.now() - t0) / 1000).toFixed(1)}s (${state.poseWorker ? 'worker' : 'main'}/${state.poseEP})`);
+    const label = state.poseBackend === 'sidecar' ? `sidecar/${poseProvider.ep}` : `${state.poseWorker ? 'worker' : 'main'}/${state.poseEP}`;
+    console.info(`[pose] ready in ${((performance.now() - t0) / 1000).toFixed(1)}s (${label})`);
     statusEl.textContent = '';
     poseVideoEl.srcObject = poseProvider.stream;
     await poseVideoEl.play();
@@ -1743,7 +1767,7 @@ async function startPose() {
     poseOverlayEl.height = poseProvider.video.videoHeight || 720;
     poseOverlayCtx = poseOverlayEl.getContext('2d');
     poseLoopActive = true;
-    posePipLabel.textContent = `pose: ${state.poseEP}`;
+    posePipLabel.textContent = `pose: ${label}`;
     poseLoop(++poseLoopId);
   } catch (error) {
     console.error('pose start failed:', error);
@@ -1794,6 +1818,8 @@ async function poseLoop(myId) {
       poseStats.preprocessMs = ema(poseStats.preprocessMs, tm.preprocess);
       poseStats.inferenceMs = ema(poseStats.inferenceMs, tm.inference);
       poseStats.decodeMs = ema(poseStats.decodeMs, tm.decode);
+      poseStats.readbackMs = ema(poseStats.readbackMs, tm.readback ?? 0);
+      poseStats.wireMs = ema(poseStats.wireMs, tm.wire ?? 0);
       const now = performance.now();
       if (lastPoseFrameAt) poseStats.poseFps = ema(poseStats.poseFps, 1000 / Math.max(1, now - lastPoseFrameAt));
       lastPoseFrameAt = now;

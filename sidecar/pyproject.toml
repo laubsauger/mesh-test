@@ -1,0 +1,20 @@
+[project]
+name = "pose-sidecar"
+version = "0.1.0"
+description = "Native ORT (TensorRT/CUDA/CoreML/CPU) pose inference sidecar for the WebGPU VJ layer"
+requires-python = ">=3.10,<3.13"  # onnxruntime/opencv wheels; uv auto-fetches a managed 3.12 if needed
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "websockets>=12",
+    # Platform-split: the 4090 box (Linux/Windows) gets onnxruntime-gpu, which
+    # carries the CUDA + TensorRT EPs. This Mac dev box gets plain onnxruntime
+    # (CPU/CoreML) for protocol smoke-testing — TRT numbers come from the 4090 box.
+    "onnxruntime-gpu>=1.18 ; platform_system != 'Darwin'",
+    "onnxruntime>=1.18 ; platform_system == 'Darwin'",
+]
+
+# Managed entirely by uv — `uv run` creates/locks .venv/ here, never touches global.
+#   cd sidecar && uv run python pose_sidecar.py          (or: npm run sidecar)
+[tool.uv]
+package = false
