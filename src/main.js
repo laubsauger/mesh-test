@@ -315,6 +315,7 @@ const state = {
   poseEnabled: true, // dev default: pose on at load
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
   poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS
+  poseSidecarDebug: false, // sidecar: console per-frame timing/flow trace
   poseSendMaxSide: 1280, // sidecar: longest edge shipped over the wire. Default = webcam res
   // (no downscale) so the sidecar's detect+crop match the WORKER's full-res input → identical
   // pose quality. Lower it only to trade pose quality for wire bandwidth (loopback rarely needs it).
@@ -645,6 +646,9 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseSendMaxSide', 256, 1280, 32).name('Sidecar Wire Frame px').onChange((v) => {
     if (poseProvider instanceof SidecarPoseProvider) poseProvider.sendMaxSide = Math.round(v);
   });
+  poseGroup.add(state, 'poseSidecarDebug').name('Sidecar Debug (console)').onChange((on) => {
+    if (poseProvider instanceof SidecarPoseProvider) poseProvider.debug = on;
+  });
   // Model selection — a reload (swaps the .onnx), so restart pose. Variant applies
   // to the worker backend here; the sidecar picks its model via launch flags.
   poseGroup.add(state, 'poseRtmwVariant', RTMW_VARIANTS).name('RTMW Variant').onChange(() => {
@@ -691,7 +695,10 @@ function buildInspectorControls() {
   poseStatsGroup.add(poseStats, 'inferenceMs').name('RTMW Inference').listen();
   poseStatsGroup.add(poseStats, 'decodeMs').name('Decode').listen();
   poseStatsGroup.add(poseStats, 'readbackMs').name('Readback (sidecar)').listen();
-  poseStatsGroup.add(poseStats, 'wireMs').name('Wire (sidecar)').listen();
+  poseStatsGroup.add(poseStats, 'serverMs').name('Server total (sidecar)').listen();
+  poseStatsGroup.add(poseStats, 'transportMs').name('Transport/wire (sidecar)').listen();
+  poseStatsGroup.add(poseStats, 'roundMs').name('Round-trip (sidecar)').listen();
+  poseStatsGroup.add(poseStats, 'frames').name('Frames sent/recv').listen();
   poseStatsGroup.add(poseStats, 'overlayMs').name('Overlay Draw').listen();
   poseStatsGroup.add(poseStats, 'retargetMs').name('Retarget/frame').listen();
   poseGroup.add(state, 'poseRecording').name('Record').listen().onChange((on) => {
@@ -1644,7 +1651,11 @@ const poseStats = {
   inferenceMs: 0,
   decodeMs: 0,
   readbackMs: 0, // sidecar: GPU→CPU frame readback (browser side)
-  wireMs: 0, // sidecar: WS round-trip minus native work (transport overhead)
+  serverMs: 0, // sidecar: full server handler (recv→reply); serverMs−inference = numpy/json overhead
+  transportMs: 0, // sidecar: round−server = WS + browser scheduling lag (this is "wire")
+  roundMs: 0, // sidecar: send→reply wall-clock
+  wireMs: 0, // alias of transport
+  frames: '—', // sidecar flow counters: sent/recv drop/stale/timeout @ Hz
   overlayMs: 0,
   retargetMs: 0
 };
@@ -1774,6 +1785,7 @@ async function startPose() {
     poseSmoother.reset();
     if (state.poseBackend === 'sidecar') {
       poseProvider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide });
+      poseProvider.debug = state.poseSidecarDebug;
     } else {
       const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
       poseProvider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh, yoloRes: state.poseYoloRes, rtmwVariant: state.poseRtmwVariant });
@@ -1841,7 +1853,12 @@ async function poseLoop(myId) {
       poseStats.inferenceMs = ema(poseStats.inferenceMs, tm.inference);
       poseStats.decodeMs = ema(poseStats.decodeMs, tm.decode);
       poseStats.readbackMs = ema(poseStats.readbackMs, tm.readback ?? 0);
-      poseStats.wireMs = ema(poseStats.wireMs, tm.wire ?? 0);
+      poseStats.serverMs = ema(poseStats.serverMs, tm.serverTotal ?? 0);
+      poseStats.transportMs = ema(poseStats.transportMs, tm.transport ?? tm.wire ?? 0);
+      poseStats.roundMs = ema(poseStats.roundMs, tm.round ?? 0);
+      poseStats.wireMs = ema(poseStats.wireMs, tm.transport ?? tm.wire ?? 0);
+      const st = poseProvider.stats;
+      if (st) poseStats.frames = `${st.sent}/${st.recv} drop${st.dropped} stale${st.stale} TO${st.timedOut} @${(st.sendHz || 0).toFixed(0)}Hz`;
       const now = performance.now();
       if (lastPoseFrameAt) poseStats.poseFps = ema(poseStats.poseFps, 1000 / Math.max(1, now - lastPoseFrameAt));
       lastPoseFrameAt = now;

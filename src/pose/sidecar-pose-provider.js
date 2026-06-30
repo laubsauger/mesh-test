@@ -24,12 +24,22 @@ export class SidecarPoseProvider {
     this.running = false;
     this.latestFrame = null;
     this.ep = 'sidecar';
-    // detect/preprocess/inference/decode = NATIVE stage times (from sidecar).
-    // readback/wire = browser-side transport cost (the benchmark lever).
-    this.timings = { detect: 0, preprocess: 0, inference: 0, decode: 0, total: 0, readback: 0, wire: 0 };
+    // Full instrumentation. Stage times: detect/preprocess/inference/decode = NATIVE
+    // (sidecar). readback = browser GPU→CPU. serverTotal = whole sidecar handler
+    // (recv→reply). round = send→reply-received. transport = round − serverTotal
+    // (WS + the browser main-thread scheduling lag while it's busy rendering) — the
+    // number to watch when "wire" looks big.
+    this.timings = {
+      detect: 0, preprocess: 0, inference: 0, decode: 0, total: 0,
+      readback: 0, serverDecode: 0, serverTotal: 0, transport: 0, round: 0, wire: 0, bytes: 0
+    };
+    // Frame-flow counters — sent vs received reveals drops/desync at a glance.
+    this.stats = { sent: 0, recv: 0, dropped: 0, stale: 0, timedOut: 0, sendHz: 0 };
+    this.debug = false; // when true, console.logs a per-frame trace + periodic summary
     this._pending = null;
     this._pendingTimer = null;
     this._replyTimeoutMs = 3000; // a frame's reply must arrive within this or we drop it
+    this._lastSentAt = 0;
     this._canvas = null;
     this._ctx = null;
   }
@@ -81,17 +91,23 @@ export class SidecarPoseProvider {
       // frame is now in flight — its keypoints + _sentW/H are wrong for the current
       // slot. Drop it; the in-flight frame's own reply will arrive. (Prevents the
       // timeout from cross-wiring one frame's pose onto the next → "desync".)
-      if (msg.timestampMs !== this._sentAt) return;
+      if (msg.timestampMs !== this._sentAt) { this.stats.stale += 1; return; }
       const native = msg.timings;
-      const t = performance.now();
-      const round = t - this._sentAt; // full request→response
-      // wire = round-trip minus the work the sidecar reported doing on it.
+      const round = performance.now() - this._sentAt; // full send→reply
+      const serverTotal = native.serverTotal ?? native.total ?? 0;
+      const transport = Math.max(0, round - serverTotal); // WS + browser scheduling lag
       this.timings = {
         detect: native.detect, preprocess: native.preprocess, inference: native.inference,
         decode: native.decode, total: native.total,
-        readback: this._readbackMs, wire: Math.max(0, round - native.total)
+        readback: this._readbackMs, serverDecode: native.serverDecode ?? 0,
+        serverTotal, transport, round, wire: transport, bytes: native.bytes ?? this._bytesSent
       };
       this.ep = msg.ep || this.ep;
+      if (msg.frame) this.stats.recv += 1; else this.stats.dropped += 1;
+      if (this.debug) {
+        const tm = this.timings;
+        console.log(`[sidecar] f#${this.stats.sent} ${msg.frame ? 'pose' : 'NULL'} | readback ${tm.readback.toFixed(1)} → wire ${(round - serverTotal).toFixed(1)} → server ${serverTotal.toFixed(1)} (decode ${(native.serverDecode ?? 0).toFixed(1)} det ${native.detect.toFixed(1)} inf ${native.inference.toFixed(1)}) | round ${round.toFixed(1)}ms | ${(tm.bytes / 1024) | 0}KB | sent ${this.stats.sent} recv ${this.stats.recv} drop ${this.stats.dropped} stale ${this.stats.stale} TO ${this.stats.timedOut}`);
+      }
       this._settle(msg.frame ? this._toVideoSpace(msg.frame) : null);
     }
   }
@@ -140,11 +156,16 @@ export class SidecarPoseProvider {
     buf.set(rgba, HEADER_BYTES);
 
     this._sentW = w; this._sentH = h; this._sentAt = ts;
+    this._bytesSent = buf.length;
+    this.stats.sent += 1;
+    if (this._lastSentAt) this.stats.sendHz = 1000 / Math.max(1, ts - this._lastSentAt);
+    this._lastSentAt = ts;
     return new Promise((resolve) => {
       this._pending = resolve;
       // Drop the frame if no reply lands in time — never deadlock the loop.
       this._pendingTimer = setTimeout(() => {
-        console.warn('[sidecar] reply timeout — dropping frame');
+        this.stats.timedOut += 1;
+        console.warn(`[sidecar] reply timeout (${this._replyTimeoutMs}ms) — dropping frame; total timeouts ${this.stats.timedOut}`);
         this._settle(null);
       }, this._replyTimeoutMs);
       try {

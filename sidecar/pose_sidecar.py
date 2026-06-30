@@ -277,6 +277,7 @@ async def handle(ws, pipe):
             # browser's pending promise never resolves → permanent freeze / "freak out"
             # when the box is busy). Validate, process, and ALWAYS reply — on error we
             # reply frame=null (a clean drop) so the loop self-recovers and stays in sync.
+            t_recv = time.perf_counter()  # instrumentation: handler entry for this frame
             ts = 0.0
             try:
                 ts, w, h, every_n = struct.unpack_from("<dIII", msg, 0)
@@ -293,12 +294,19 @@ async def handle(ws, pipe):
                 frame, timings = pipe.infer(frame_rgb, thresh, last_boxes)
                 timings["detect"] = detect_ms
                 timings["total"] += detect_ms
+                # serverDecode = numpy frame decode; serverTotal = whole handler (recv→
+                # reply-build) so the browser can split round-trip into server vs wire.
+                timings["serverDecode"] = (td - t_recv) * 1000
+                timings["serverTotal"] = (time.perf_counter() - t_recv) * 1000
+                timings["bytes"] = len(msg)
                 reply = {"type": "pose", "timestampMs": ts, "frame": frame, "timings": timings, "ep": pipe.active_ep}
             except Exception as e:  # noqa: BLE001 — one bad frame must not break the stream
                 frame_errs += 1
                 if frame_errs <= 5:
                     print(f"[sidecar] frame dropped ({frame_errs}): {e}")
-                reply = {"type": "pose", "timestampMs": ts, "frame": None, "timings": dict(ZERO_TIMINGS), "ep": pipe.active_ep}
+                z = dict(ZERO_TIMINGS)
+                z["serverTotal"] = (time.perf_counter() - t_recv) * 1000
+                reply = {"type": "pose", "timestampMs": ts, "frame": None, "timings": z, "ep": pipe.active_ep}
             await ws.send(json.dumps(reply))
     except websockets.ConnectionClosed:
         print("[sidecar] client disconnected")

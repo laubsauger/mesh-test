@@ -28,7 +28,18 @@ dependencies = [
 # system install of CUDA 13.x + cuDNN 9.x + TensorRT on PATH — then plain
 # `npm run sidecar` works (preload finds them). See the sidecar's refusal message.
 [project.optional-dependencies]
+# Explicit nvidia runtime libs matching the DLL versions onnxruntime-gpu (cu13) asks
+# for: cublas64_13/cublasLt64_13, cudart64_13, cudnn64_9, cufft64_12. The `-cu13`
+# wheels install on Windows EXCEPT cufft (whose `-cu13` is deprecated → unsuffixed).
+# tensorrt-cu13 alone does NOT pull these. If this STILL fails on some package's
+# Windows wheel, use the system install instead (CUDA 13 + cuDNN 9 + TensorRT on
+# PATH) — that's the reliable path; plain `npm run sidecar` then finds them.
 cuda = [
+    "nvidia-cuda-runtime-cu13 ; platform_system != 'Darwin'",
+    "nvidia-cublas-cu13 ; platform_system != 'Darwin'",
+    "nvidia-cudnn-cu13 ; platform_system != 'Darwin'",
+    "nvidia-curand-cu13 ; platform_system != 'Darwin'",
+    "nvidia-cufft ; platform_system != 'Darwin'",
     "tensorrt-cu13 ; platform_system != 'Darwin'",
 ]
 
