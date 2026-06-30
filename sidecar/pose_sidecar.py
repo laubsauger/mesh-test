@@ -85,6 +85,10 @@ def make_session(path, providers):
         raise SystemExit(f"model missing: {path}\n  Bring it over by file transfer (see README 'Inference models').")
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    # Silence WARNING-level spam (e.g. CoreML's per-graph "GetCapability / N partitions"
+    # node-count notes — informational, not problems). ERROR-level still prints, so the
+    # Windows CUDA/TRT DLL-load failures stay visible. 3 = error, 2 = warning.
+    so.log_severity_level = 3
     return ort.InferenceSession(str(path), sess_options=so, providers=providers)
 
 
@@ -303,6 +307,7 @@ async def main():
     ap.add_argument("--rtmw-out", help="comma-sep X,Y,Z output names (else auto-read from the model)")
     args = ap.parse_args()
 
+    ort.set_default_logger_severity(3)  # hide WARNING-level EP partition spam (errors still print)
     preload_gpu_dlls()
     providers = select_providers(args.ep)
     rtmw_out = tuple(args.rtmw_out.split(",")) if args.rtmw_out else None
