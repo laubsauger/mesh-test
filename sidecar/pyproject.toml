@@ -14,7 +14,26 @@ dependencies = [
     "onnxruntime>=1.18 ; platform_system == 'Darwin'",
 ]
 
+# nvidia CUDA/cuDNN/TensorRT RUNTIME as pip wheels — pulled INTO the uv venv so
+# onnxruntime-gpu finds cublas/cudnn/trt without a global CUDA install (the
+# sidecar calls ort.preload_dlls() to load these). Enable with the `cuda` extra:
+#   npm run sidecar:cuda     (= uv run --extra cuda ...)
+# Pinned to the CUDA-13 line (matches the onnxruntime-gpu wheel that errored asking
+# for "cuDNN 9.* and CUDA 13.*"). If your onnxruntime-gpu is a CUDA-12 build, swap
+# every cu13 → cu12. Check with: python -c "import onnxruntime;print(onnxruntime.get_build_info())"
+[project.optional-dependencies]
+cuda = [
+    "nvidia-cuda-runtime-cu13 ; platform_system != 'Darwin'",
+    "nvidia-cublas-cu13 ; platform_system != 'Darwin'",
+    "nvidia-cudnn-cu13 ; platform_system != 'Darwin'",
+    "nvidia-cufft-cu13 ; platform_system != 'Darwin'",
+    "nvidia-curand-cu13 ; platform_system != 'Darwin'",
+    "tensorrt-cu13 ; platform_system != 'Darwin'",
+]
+
 # Managed entirely by uv — `uv run` creates/locks .venv/ here, never touches global.
 #   cd sidecar && uv run python pose_sidecar.py          (or: npm run sidecar)
 [tool.uv]
 package = false
+# tensorrt / some nvidia wheels live on NVIDIA's index, not plain PyPI.
+extra-index-url = ["https://pypi.nvidia.com"]

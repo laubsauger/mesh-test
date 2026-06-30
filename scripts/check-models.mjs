@@ -13,16 +13,18 @@
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative } from 'node:path';
-import { RTMW3D_MODEL, YOLO_DET_MODEL } from '../src/pose/rtmw-constants.js';
+import { rtmwUrl, yoloUrl } from '../src/pose/rtmw-constants.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const MIN_BYTES = 1_000_000; // catch truncated / empty transfers, not just absence
 
-// The app fetches these from `public/` via assetUrl(MODEL.url) — derive the
-// expected disk paths from the same constants so this never drifts.
+// Mirror the app's DEFAULT selection (src/main.js state: poseRtmwVariant / poseYoloRes).
+// The variant file is the one that must be file-transferred; yolo res files are committed.
+const DEFAULT_VARIANT = 'l';
+const DEFAULT_YOLO_RES = 320;
 const expected = [
-  { label: 'RTMW3D-x 3D pose', url: RTMW3D_MODEL.url },
-  { label: 'yolo26n detector', url: YOLO_DET_MODEL.url }
+  { label: `RTMW3D-${DEFAULT_VARIANT} 3D pose (default variant)`, url: rtmwUrl(DEFAULT_VARIANT) },
+  { label: `yolo26n detector @${DEFAULT_YOLO_RES}`, url: yoloUrl(DEFAULT_YOLO_RES) }
 ].map((m) => ({ ...m, path: join(repoRoot, 'public', m.url) }));
 
 const missing = expected.filter((m) => {

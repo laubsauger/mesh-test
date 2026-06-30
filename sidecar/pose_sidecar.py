@@ -30,43 +30,53 @@ import websockets
 
 # --- Constants — MIRROR src/pose/rtmw-constants.js (single source of truth there) ---
 REPO = Path(__file__).resolve().parent.parent
-RTMW_URL = REPO / "public/inference/rtmw3d-x/inference_model.onnx"
-YOLO_URL = REPO / "public/inference/yolo26n/inference_model_320.onnx"
 
-# rtmw3d-x I/O. NOTE: outY/outZ ('1554'/'1556') are EXPORT-SPECIFIC graph node
-# names — they differ for the -m / fp16 exports. Override via --rtmw-out if you
-# swap models (read them from the printed session outputs).
-RTMW_RES_W, RTMW_RES_H = 288, 384
-RTMW_IN = "input"
-RTMW_OUT_X, RTMW_OUT_Y, RTMW_OUT_Z = "output", "1554", "1556"
+# Model selection is a LAUNCH flag (--rtmw-variant l|x, --yolo-res 320/384/512).
+# Only l and x are real RTMW3D (3D) releases — there is no 3D m/s.
+# Unlike the web path, the sidecar AUTO-READS the rtmw input res + output node names
+# from the loaded session, so any variant/fp16 export works with no hardcoding.
+def rtmw_path(variant):
+    return REPO / f"public/inference/rtmw3d-{variant}/inference_model.onnx"
+
+def yolo_path(res):
+    return REPO / f"public/inference/yolo26n/inference_model_{res}.onnx"
+
+RTMW_RES_W, RTMW_RES_H = 288, 384  # fallback only (used if input dims are symbolic)
 POSE_MEAN = np.float32([123.675, 116.28, 103.53])
 POSE_STD = np.float32([58.395, 57.12, 57.375])
 POSE_PADDING = 1.25
 Z_RANGE = 2.1744869
 
-YOLO_RES = 320
-YOLO_IN = "images"
-YOLO_OUT = "output0"
 PERSON_CLASS = 0
 
+# Proper per-platform GPU device:
+#   nvidia (Linux/Win) → TensorRT or CUDA   |   Apple (Mac) → CoreML (ANE/GPU/MPS)
+# NOTE: MLX and "MPS" are NOT ONNX Runtime EPs — CoreML IS the Apple-GPU path in
+# ORT (it dispatches to ANE/GPU internally). torch is irrelevant to ORT inference.
 EP_MAP = {
     "trt": "TensorrtExecutionProvider",
     "cuda": "CUDAExecutionProvider",
+    "coreml": "CoreMLExecutionProvider",
     "cpu": "CPUExecutionProvider",
 }
 
 
 def select_providers(ep):
-    """auto → TRT→CUDA→CPU (skips any not installed). A named EP is STRICT:
-    error if unavailable (no silent fallback — matches the project EP rule)."""
+    """auto → TRT→CUDA→CoreML→CPU (skips any not installed → picks the best GPU
+    device present on THIS box). A named EP is STRICT: error if unavailable
+    (no silent fallback — matches the project EP rule)."""
     available = ort.get_available_providers()
     if ep == "auto":
-        order = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
-        return [p for p in order if p in available]
+        order = ["TensorrtExecutionProvider", "CUDAExecutionProvider",
+                 "CoreMLExecutionProvider", "CPUExecutionProvider"]
+        chosen = [p for p in order if p in available]
+        if not chosen:
+            raise SystemExit(f"no usable EP in {available}")
+        return chosen
     want = EP_MAP[ep]
     if want not in available:
         raise SystemExit(f"EP '{ep}' ({want}) not available. Installed: {available}. "
-                         f"Use onnxruntime-gpu for trt/cuda, or --ep cpu.")
+                         f"Use onnxruntime-gpu for trt/cuda; CoreML/CPU ship with onnxruntime on Mac.")
     return [want, "CPUExecutionProvider"] if want != "CPUExecutionProvider" else [want]
 
 
@@ -140,24 +150,67 @@ def decode3d(out_x, out_y, out_z, rect, res_w=RTMW_RES_W, res_h=RTMW_RES_H):
     return k2d, k3d
 
 
+GPU_EPS = {"TensorrtExecutionProvider", "CUDAExecutionProvider", "CoreMLExecutionProvider"}
+
+
+def available_rtmw_variants():
+    base = REPO / "public/inference"
+    if not base.exists():
+        return []
+    return sorted(p.name[len("rtmw3d-"):] for p in base.glob("rtmw3d-*")
+                  if (p / "inference_model.onnx").exists())
+
+
 class PosePipeline:
-    def __init__(self, providers, rtmw_out=None):
+    def __init__(self, providers, variant="l", yolo_res=320, rtmw_out=None, allow_cpu=False):
         t = time.perf_counter()
-        self.det = make_session(YOLO_URL, providers)
-        self.pose = make_session(RTMW_URL, providers)
-        self.out_x, self.out_y, self.out_z = rtmw_out or (RTMW_OUT_X, RTMW_OUT_Y, RTMW_OUT_Z)
+        rp = rtmw_path(variant)
+        if not rp.exists():
+            have = available_rtmw_variants()
+            hint = (f"on disk now: {have} → run `npm run sidecar -- --rtmw-variant {have[0]}`"
+                    if have else "no rtmw3d variant on disk — file-transfer one (see README 'Inference models').")
+            raise SystemExit(f"[sidecar] rtmw3d-{variant} missing at {rp}\n  {hint}")
+        self.yolo_res = yolo_res
+        self.det = make_session(yolo_path(yolo_res), providers)
+        self.pose = make_session(rp, providers)
+
+        # Auto-read rtmw I/O from the loaded model → variant/fp16-agnostic.
+        pin = self.pose.get_inputs()[0]
+        self.in_name = pin.name
+        self.res_h = pin.shape[2] if isinstance(pin.shape[2], int) else RTMW_RES_H
+        self.res_w = pin.shape[3] if isinstance(pin.shape[3], int) else RTMW_RES_W
+        outs = [o.name for o in self.pose.get_outputs()]
+        self.out_x, self.out_y, self.out_z = rtmw_out or outs[:3]  # graph order = [X,Y,Z]
+        self.det_in = self.det.get_inputs()[0].name
+        self.det_out = self.det.get_outputs()[0].name
+
         self.active_ep = self.pose.get_providers()[0]
         print(f"[sidecar] sessions ready in {time.perf_counter()-t:.1f}s")
         print(f"[sidecar] ACTIVE EP: {self.active_ep}   (det={self.det.get_providers()[0]})")
-        print(f"[sidecar] rtmw outputs: {[o.name for o in self.pose.get_outputs()]}")
-        if self.active_ep == "CPUExecutionProvider":
-            print("[sidecar] ⚠  running on CPU — install onnxruntime-gpu + use --ep trt/cuda for real numbers.")
+        print(f"[sidecar] rtmw3d-{variant} {self.res_w}x{self.res_h} in={self.in_name} out={outs[:3]} | yolo {yolo_res}")
+
+        # No SILENT CPU fallback. ORT registers a GPU EP but then quietly drops to
+        # CPU when its runtime DLLs (cublas/cudnn/tensorrt) can't load — refuse and
+        # surface the exact fix, unless the user opted into CPU.
+        if self.active_ep == "CPUExecutionProvider" and not allow_cpu:
+            registered_gpu = [e for e in ort.get_available_providers() if e in GPU_EPS]
+            if registered_gpu:
+                raise SystemExit(
+                    f"[sidecar] GPU EP(s) {registered_gpu} are registered but FAILED to load → ORT fell back to "
+                    "CPU. Almost always the CUDA/cuDNN/TensorRT runtime libs (e.g. cublas64_*.dll) aren't found.\n"
+                    "  Fix (keeps it in the uv venv, no global install):\n"
+                    "    npm run sidecar:cuda        # pulls nvidia-* + tensorrt wheels into .venv; sidecar preloads them\n"
+                    "  Or install CUDA 13.x + cuDNN 9.x (+ TensorRT for --ep trt) system-wide and put them on PATH.\n"
+                    "  Or run on CPU anyway:  npm run sidecar -- --allow-cpu")
+            raise SystemExit(
+                "[sidecar] no GPU EP available on this box (only CPU). Pass --allow-cpu to run on CPU, "
+                "or install onnxruntime-gpu (nvidia) / use Mac CoreML.")
 
     def detect(self, frame_rgb, thresh):
         h, w = frame_rgb.shape[:2]
-        lb, scale, ox, oy = letterbox(frame_rgb, YOLO_RES)
+        lb, scale, ox, oy = letterbox(frame_rgb, self.yolo_res)
         x = (lb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]  # 1,3,R,R RGB
-        out = self.det.run([YOLO_OUT], {YOLO_IN: x})[0]
+        out = self.det.run([self.det_out], {self.det_in: x})[0]
         rows = out[0]  # (N, stride): x1,y1,x2,y2,score,cls,...
         boxes = []
         for r in rows:
@@ -180,13 +233,13 @@ class PosePipeline:
         if not boxes:
             return None, {"detect": 0, "preprocess": 0, "inference": 0, "decode": 0, "total": (t1 - t0) * 1000}
         box = boxes[0]
-        rect = bbox_to_rect(box[:4])
-        crop = crop_affine(frame_rgb, rect)
+        rect = bbox_to_rect(box[:4], self.res_w, self.res_h)
+        crop = crop_affine(frame_rgb, rect, self.res_w, self.res_h)
         chw = ((crop.astype(np.float32) - POSE_MEAN) / POSE_STD).transpose(2, 0, 1)[None]
         t2 = time.perf_counter()
-        ox, oy, oz = self.pose.run([self.out_x, self.out_y, self.out_z], {RTMW_IN: chw})
+        ox, oy, oz = self.pose.run([self.out_x, self.out_y, self.out_z], {self.in_name: chw})
         t3 = time.perf_counter()
-        k2d, k3d = decode3d(ox, oy, oz, rect)
+        k2d, k3d = decode3d(ox, oy, oz, rect, self.res_w, self.res_h)
         t4 = time.perf_counter()
         frame = {
             "keypoints2D": k2d,
@@ -228,17 +281,34 @@ async def handle(ws, pipe):
         print("[sidecar] client disconnected")
 
 
+def preload_gpu_dlls():
+    """Load CUDA/cuDNN/TensorRT from the nvidia-* pip wheels installed in THIS venv
+    (the `sidecar:cuda` extra), so onnxruntime-gpu finds them without a global CUDA
+    install. No-op on older ORT / Mac (the function won't exist there)."""
+    if hasattr(ort, "preload_dlls"):
+        try:
+            ort.preload_dlls()  # cuda=True, cudnn=True, tensorrt=True by default
+            print("[sidecar] ort.preload_dlls() loaded CUDA/cuDNN/TRT from venv wheels (if present)")
+        except Exception as e:  # noqa: BLE001 — best-effort; refusal check below catches real failure
+            print(f"[sidecar] preload_dlls skipped: {e}")
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--ep", choices=["auto", "trt", "cuda", "cpu"], default="auto")
-    ap.add_argument("--rtmw-out", help="comma-sep X,Y,Z output names if you swapped the rtmw export")
+    ap.add_argument("--ep", choices=["auto", "trt", "cuda", "coreml", "cpu"], default="auto")
+    ap.add_argument("--rtmw-variant", choices=["l", "x"], default="l", help="rtmw3d 3D size: l=faster(219MB), x=largest(352MB)")
+    ap.add_argument("--yolo-res", type=int, choices=[320, 384, 512], default=320)
+    ap.add_argument("--allow-cpu", action="store_true", help="permit CPU fallback instead of refusing")
+    ap.add_argument("--rtmw-out", help="comma-sep X,Y,Z output names (else auto-read from the model)")
     args = ap.parse_args()
 
+    preload_gpu_dlls()
     providers = select_providers(args.ep)
     rtmw_out = tuple(args.rtmw_out.split(",")) if args.rtmw_out else None
-    print(f"[sidecar] requested EP={args.ep} → providers {providers}")
-    pipe = PosePipeline(providers, rtmw_out)
+    print(f"[sidecar] requested EP={args.ep} variant={args.rtmw_variant} yolo={args.yolo_res} → providers {providers}")
+    pipe = PosePipeline(providers, variant=args.rtmw_variant, yolo_res=args.yolo_res,
+                        rtmw_out=rtmw_out, allow_cpu=(args.allow_cpu or args.ep == "cpu"))
 
     async with websockets.serve(lambda ws: handle(ws, pipe), "127.0.0.1", args.port, max_size=16 * 1024 * 1024):
         print(f"[sidecar] listening ws://127.0.0.1:{args.port}")

@@ -22,11 +22,23 @@ export const RTMW3D_MODEL = {
 
 export const YOLO_DET_MODEL = {
   id: 'yolo26n',
-  url: 'inference/yolo26n/inference_model_320.onnx', // 320 export — person bbox doesn't need 384/512
+  url: 'inference/yolo26n/inference_model_320.onnx', // default (see yoloUrl/YOLO_RES_OPTIONS)
   res: 320,
   inputName: 'images',
   personClassId: 0
 };
+
+// --- Live-selectable model choices (UI: Pose panel) ---------------------------
+// rtmw3d size variants: m/s/l/x trade speed for accuracy (m = fast, x = largest).
+// Each lives in public/inference/rtmw3d-<v>/inference_model.onnx (file-transfer,
+// gitignored). Switching needs a pose restart. NOTE: only the file you select
+// must be present; output node names + (ideally) input res are read from the
+// LOADED session at runtime, so a variant works the moment its file lands —
+// the hardcoded outX/Y/Z above are just the x-export defaults / decode fallback.
+export const RTMW_VARIANTS = ['l', 'x']; // the only RTMW3D (3D) releases — no 3D m/s exist
+export const YOLO_RES_OPTIONS = [320, 384, 512];
+export const rtmwUrl = (variant) => `inference/rtmw3d-${variant}/inference_model.onnx`;
+export const yoloUrl = (res) => `inference/yolo26n/inference_model_${res}.onnx`;
 
 // ImageNet RGB normalization (pipeline.json, to_rgb=true, 0-255 scale).
 export const POSE_MEAN = [123.675, 116.28, 103.53];

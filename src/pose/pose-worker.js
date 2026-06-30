@@ -3,16 +3,20 @@
 // the three renderer, so inference no longer contends with rendering. Receives an
 // ImageBitmap per frame, returns an RTMWPoseFrame + stage timings.
 import { ort, createPoseSession } from './ort-session.js';
-import { RTMW3D_MODEL, YOLO_DET_MODEL, POSE_MEAN, POSE_STD } from './rtmw-constants.js';
+import { RTMW3D_MODEL, YOLO_DET_MODEL, POSE_MEAN, POSE_STD, yoloUrl, rtmwUrl } from './rtmw-constants.js';
 import { bboxToRect, decode3d, letterboxRect } from './decode.js';
 import { assetUrl } from '../asset-url.js';
 
-const R = YOLO_DET_MODEL.res;
+// yolo res is selectable (msg.yoloRes); rtmw input res stays the export default
+// (288×384) — the web session doesn't reliably expose input dims; the native
+// sidecar auto-reads them. Variant only changes the URL + output node names.
+let R = YOLO_DET_MODEL.res;
 const resW = RTMW3D_MODEL.resW;
 const resH = RTMW3D_MODEL.resH;
 
 let kptThresh = 0.3;
 let poseSession = null;
+let poseOutNames = null; // live session output order [X,Y,Z] → variant-agnostic decode
 let detSession = null;
 let detCtx;
 let detBuf;
@@ -24,10 +28,14 @@ let busy = false;
 
 async function init(msg) {
   kptThresh = msg.kptThresh ?? 0.3;
-  const detBytes = await (await fetch(assetUrl(YOLO_DET_MODEL.url))).arrayBuffer();
+  R = msg.yoloRes ?? YOLO_DET_MODEL.res;
+  const detUrl = msg.yoloRes ? yoloUrl(msg.yoloRes) : YOLO_DET_MODEL.url;
+  const poseModelUrl = msg.rtmwVariant ? rtmwUrl(msg.rtmwVariant) : RTMW3D_MODEL.url;
+  const detBytes = await (await fetch(assetUrl(detUrl))).arrayBuffer();
   detSession = await createPoseSession(detBytes, msg.ep);
-  const poseBytes = await (await fetch(assetUrl(RTMW3D_MODEL.url))).arrayBuffer();
+  const poseBytes = await (await fetch(assetUrl(poseModelUrl))).arrayBuffer();
   poseSession = await createPoseSession(poseBytes, msg.ep);
+  poseOutNames = poseSession.outputNames; // graph node names differ per export
 
   detCtx = new OffscreenCanvas(R, R).getContext('2d', { willReadFrequently: true });
   detBuf = new Float32Array(3 * R * R);
@@ -112,7 +120,7 @@ async function infer(msg) {
   const out = await poseSession.run({ [RTMW3D_MODEL.inputName]: tensor });
   tensor.dispose();
   const t3 = performance.now();
-  const { k2d, k3d } = decode3d(out, rect, resW, resH);
+  const { k2d, k3d } = decode3d(out, rect, resW, resH, poseOutNames);
   for (const k in out) out[k].dispose();
   const t4 = performance.now();
 

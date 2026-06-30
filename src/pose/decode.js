@@ -31,10 +31,13 @@ export function letterboxRect(vidW, vidH, R) {
 // 3-axis SimCC argmax decode. `out` = { [outX]:{data,dims}, [outY]:..., [outZ]:... }.
 // Returns k2d (source-frame px + score) for overlays and k3d (root-relative
 // normalized + score) for driving. resW/resH = model input W/H.
-export function decode3d(out, rect, resW = RTMW3D_MODEL.resW, resH = RTMW3D_MODEL.resH) {
-  const tx = out[RTMW3D_MODEL.outX];
-  const ty = out[RTMW3D_MODEL.outY];
-  const tz = out[RTMW3D_MODEL.outZ];
+export function decode3d(out, rect, resW = RTMW3D_MODEL.resW, resH = RTMW3D_MODEL.resH,
+  outNames = [RTMW3D_MODEL.outX, RTMW3D_MODEL.outY, RTMW3D_MODEL.outZ]) {
+  // outNames = the loaded session's output order [X,Y,Z]. Default = the x-export
+  // names so swapping rtmw variant (whose graph node names differ) still decodes.
+  const tx = out[outNames[0]];
+  const ty = out[outNames[1]];
+  const tz = out[outNames[2]];
   const sx = tx.data;
   const sy = ty.data;
   const sz = tz.data;

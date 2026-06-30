@@ -40,7 +40,7 @@ import { SidecarPoseProvider } from './pose/sidecar-pose-provider.js';
 import { drawOverlay } from './pose/overlay-2d.js';
 import { toCanonical, mirrorCanonical } from './pose/observation-adapter.js';
 import { Retargeter } from './pose/retargeter.js';
-import { KPT, NUM_KPTS } from './pose/rtmw-constants.js';
+import { KPT, NUM_KPTS, RTMW_VARIANTS, YOLO_RES_OPTIONS } from './pose/rtmw-constants.js';
 import { CanonicalSmoother } from './pose/one-euro.js';
 import { PoseRecorder, PosePlayer } from './pose/recorder.js';
 
@@ -316,6 +316,9 @@ const state = {
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
   poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS
   poseSendMaxSide: 512, // sidecar: longest edge of the downscaled frame shipped over the wire
+  poseRtmwVariant: 'l', // rtmw3d size: l(faster, 219MB) | x(largest, 352MB). Both 3D, 384×288, 3-axis.
+  // NOTE: rtmw3d only ships as l and x — there is NO 3D "m" (the "m" upstream is 2D rtmw, no depth).
+  poseYoloRes: 320, // yolo detector input res: 320/384/512 (files committed)
   poseKptThresh: 0.3,
   poseRetarget: true,
   poseMirrorX: false,
@@ -637,6 +640,14 @@ function buildInspectorControls() {
   });
   poseGroup.add(state, 'poseSendMaxSide', 256, 1280, 32).name('Sidecar Frame Px').onChange((v) => {
     if (poseProvider instanceof SidecarPoseProvider) poseProvider.sendMaxSide = Math.round(v);
+  });
+  // Model selection — a reload (swaps the .onnx), so restart pose. Variant applies
+  // to the worker backend here; the sidecar picks its model via launch flags.
+  poseGroup.add(state, 'poseRtmwVariant', RTMW_VARIANTS).name('RTMW Variant').onChange(() => {
+    if (poseProvider) { stopPose(); if (state.poseEnabled) startPose(); }
+  });
+  poseGroup.add(state, 'poseYoloRes', YOLO_RES_OPTIONS).name('YOLO Res').onChange(() => {
+    if (poseProvider) { stopPose(); if (state.poseEnabled) startPose(); }
   });
   poseGroup.add(state, 'poseKptThresh', 0, 1, 0.01).name('Kpt Threshold');
   poseGroup.add(state, 'poseRetarget').name('Pose Retarget').listen();
@@ -1754,7 +1765,7 @@ async function startPose() {
       poseProvider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide });
     } else {
       const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
-      poseProvider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh });
+      poseProvider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh, yoloRes: state.poseYoloRes, rtmwVariant: state.poseRtmwVariant });
     }
     poseStats.backend = state.poseBackend;
     await poseProvider.start();

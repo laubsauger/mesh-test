@@ -10,7 +10,9 @@ import pose_sidecar as P
 def main():
     providers = P.select_providers("cpu")
     print(f"[smoke] providers: {providers}")
-    pipe = P.PosePipeline(providers)
+    # variant 'x' = the only file on disk locally; CPU intentional for the smoke test.
+    pipe = P.PosePipeline(providers, variant="x", yolo_res=320, allow_cpu=True)
+    print(f"[smoke] auto-read rtmw res {pipe.res_w}x{pipe.res_h}, outputs {pipe.out_x},{pipe.out_y},{pipe.out_z}")
 
     # synthetic 480x640 RGB frame (no real person — detect may return []).
     h, w = 480, 640

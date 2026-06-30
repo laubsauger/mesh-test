@@ -400,11 +400,20 @@ export class Retargeter {
     // LOWEST (support) foot returns to its rest floor height — so squats lower the
     // body with feet planted, instead of the pelvis floating + legs pulling up.
     if (grounding) {
+      // Refresh the whole hips subtree: foot bones are world-updated only when
+      // their SEGMENTS aim runs, which is SKIPPED on low foot/toe confidence —
+      // leaving foot.matrixWorld stale relative to the moved upper-leg/knee.
+      // Reading a stale foot Y here makes grounding bob/sink through the floor.
+      this.rig.hips.updateWorldMatrix(false, true);
       _boneW.setFromMatrixPosition(this.rig.leftFoot.matrixWorld);
       _childW.setFromMatrixPosition(this.rig.rightFoot.matrixWorld);
       const lowestFootY = Math.min(_boneW.y, _childW.y);
       const targetDelta = this.restFootMinY - lowestFootY; // + to lift body so foot sits on floor
       this.groundOffsetY += (targetDelta - this.groundOffsetY) * groundFollow; // smooth the bob
+      // Hard floor invariant: lowest foot may never sink below rest floor. The EMA
+      // lags on the lift direction (foot dropped → needs raising NOW) → clamp up so
+      // lifting is instant; lowering (squat, offset > target) stays smoothed.
+      if (this.groundOffsetY < targetDelta) this.groundOffsetY = targetDelta;
       this.rig.hips.position.y = this.hipsRestPosY + this.groundOffsetY / this.hipsParentScaleY; // world→local
     } else {
       this.groundOffsetY = 0;

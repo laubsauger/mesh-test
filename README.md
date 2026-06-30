@@ -32,17 +32,42 @@ The pose ONNX models are **not committed** — `rtmw3d-x` is ~352 MB (> GitHub's
 100 MB file limit) — and they are **not regenerable from this repo**: they're
 exported by the separate **`object-detect`** project, which is not vendored
 here. A fresh clone has none. Bring them over by **file transfer** and drop them
-at:
+at (the **variant** + **yolo res** are selectable in the Pose panel — only the
+file you select must be present):
 
 ```
-public/inference/rtmw3d-x/inference_model.onnx      # RTMW3D-x 3D pose (≈352 MB)
-public/inference/yolo26n/inference_model_384.onnx   # person detector (top-down crop)
+public/inference/rtmw3d-<m|s|l|x>/inference_model.onnx   # RTMW3D 3D pose; default = m (fast)
+public/inference/yolo26n/inference_model_<320|384|512>.onnx  # person detector; default = 320
 ```
 
-`npm run check:models` verifies they're present (it also runs automatically
-before `dev`/`build`). It's **warn-only**: the crowd renderer runs without them —
-only webcam pose driving needs them, and would otherwise fail with an opaque
-"model fetch 404" at runtime.
+`npm run check:models` verifies the **default** selection (rtmw3d-**m** + yolo
+320) is present (also runs before `dev`/`build`). It's **warn-only**: the crowd
+renderer runs without them — only webcam pose driving needs them, and would
+otherwise fail with an opaque "model fetch 404" at runtime.
+
+### Inference backends (Pose panel → Backend)
+
+Two interchangeable inference paths, both feeding the same retargeter — switch
+live to benchmark (Pose Stats panel breaks down each stage in ms):
+
+- **`worker`** (default) — onnxruntime-**web**, webgpu EP, in a Web Worker. No
+  native deps. Can't reach TensorRT/CUDA, so rtmw3d-x ≈ 50 ms.
+- **`sidecar`** — native ORT in a **Python sidecar** (`sidecar/`, run with
+  `npm run sidecar`). Uses the best GPU device on the box: **TensorRT → CUDA**
+  on nvidia (Linux/Win), **CoreML** (ANE/GPU) on Mac, CPU last. The browser
+  downscales each frame and ships raw RGBA over a localhost WebSocket; the
+  sidecar does detect→crop→pose→decode and returns keypoints.
+
+```bash
+npm run sidecar          # uv-managed venv (no global install); auto-picks the GPU EP
+npm run sidecar:cuda     # nvidia box: also pulls CUDA/cuDNN/TensorRT wheels into the venv
+```
+
+The sidecar **refuses to run silently on CPU** when a GPU EP is registered but
+its runtime libs are missing — it prints the exact fix. Its model is chosen by
+launch flags (`--rtmw-variant m --yolo-res 320`), and it **auto-reads** the input
+resolution + output node names from the loaded model, so any variant/fp16 export
+just works. See `sidecar/pyproject.toml` for the CUDA-13 vs CUDA-12 wheel note.
 
 ## Run
 

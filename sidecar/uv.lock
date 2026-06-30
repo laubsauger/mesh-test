@@ -132,6 +132,66 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-cublas"
+version = "13.6.0.2"
+source = { registry = "https://pypi.nvidia.com/" }
+dependencies = [
+    { name = "nvidia-cuda-nvrtc" },
+]
+wheels = [
+    { url = "https://pypi.nvidia.com/nvidia-cublas/nvidia_cublas-13.6.0.2-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:946f6a252b1cc72d8de912c75975fd6d8ba44f67d4e5044fe764ddb909f4a688" },
+    { url = "https://pypi.nvidia.com/nvidia-cublas/nvidia_cublas-13.6.0.2-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:b82c80c886cea6da6e149a5c3bdba274f12b7e4ec4b00a050b916b0446fb4153" },
+    { url = "https://pypi.nvidia.com/nvidia-cublas/nvidia_cublas-13.6.0.2-py3-none-win_amd64.whl", hash = "sha256:3b5bcd6bfb6f65010ebf195851bcb9b2aa34b9fe08479432002991c1fe84b67d" },
+]
+
+[[package]]
+name = "nvidia-cublas-cu13"
+version = "0.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/5c/4ceff3e57d5983ae04a5373e6420af5d851c7a0345d4b5e5423e23d540e5/nvidia_cublas_cu13-0.0.1.tar.gz", hash = "sha256:e764674f139a681595b708fc67c4ae370d610214bddf3916145b7d05a354a94f", size = 1371, upload-time = "2025-10-31T20:27:56.474Z" }
+
+[[package]]
+name = "nvidia-cuda-nvrtc"
+version = "13.3.33"
+source = { registry = "https://pypi.nvidia.com/" }
+wheels = [
+    { url = "https://pypi.nvidia.com/nvidia-cuda-nvrtc/nvidia_cuda_nvrtc-13.3.33-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:82530788b8c6164a54d3fd9ae8bcca8893d397c4aeb998861982a03bbe41e204" },
+    { url = "https://pypi.nvidia.com/nvidia-cuda-nvrtc/nvidia_cuda_nvrtc-13.3.33-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7b05ecda494c6dabc44231a608b060a71008a730d9dfda932cc508e6d29159e0" },
+    { url = "https://pypi.nvidia.com/nvidia-cuda-nvrtc/nvidia_cuda_nvrtc-13.3.33-py3-none-win_amd64.whl", hash = "sha256:7d2af818851c0c224d5f92221e9226e51ee23c236df4b51f9194563979c888be" },
+]
+
+[[package]]
+name = "nvidia-cuda-runtime-cu13"
+version = "0.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/83/52/6cd70adb2e690815e5e91d5c81943652ae33020f7f405482a095fb3339ae/nvidia_cuda_runtime_cu13-0.0.1.tar.gz", hash = "sha256:65a96efb265c833d0f68ecd834b2c9a74ddc91182ad13dbfce8a76cdfe438442", size = 1379, upload-time = "2025-10-31T20:40:49.389Z" }
+
+[[package]]
+name = "nvidia-cudnn-cu13"
+version = "9.23.2.1"
+source = { registry = "https://pypi.nvidia.com/" }
+dependencies = [
+    { name = "nvidia-cublas" },
+]
+wheels = [
+    { url = "https://pypi.nvidia.com/nvidia-cudnn-cu13/nvidia_cudnn_cu13-9.23.2.1-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:d826a14b848a719ff744c19891b6bcbe0a62cc01cd1d426d7cfd759c67d8d7b8" },
+    { url = "https://pypi.nvidia.com/nvidia-cudnn-cu13/nvidia_cudnn_cu13-9.23.2.1-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:0c38408c043d67ea8a3cbe61fe272c3cf5c7f5ec466adfe8ac63e91d4f11cdc7" },
+    { url = "https://pypi.nvidia.com/nvidia-cudnn-cu13/nvidia_cudnn_cu13-9.23.2.1-py3-none-win_amd64.whl", hash = "sha256:03d164905021b64acf429f55e1bbbc26be9151299c2b55e71293c5cf2f1a13e6" },
+]
+
+[[package]]
+name = "nvidia-cufft-cu13"
+version = "0.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/03/53/68b2d29ed3adcdc22ce6388e4a882e98651c86cec35c453ac419dbefb365/nvidia_cufft_cu13-0.0.1.tar.gz", hash = "sha256:323b2b92cc3d0f47fe81ad52bff57839461db3075f2697663f4d2ec8b5d60f38", size = 1361, upload-time = "2025-10-31T20:42:03.515Z" }
+
+[[package]]
+name = "nvidia-curand-cu13"
+version = "0.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/32/12/d4fe33a6860bdd04551edda8ff523802688f49080ba0f063ae61e26fa1f4/nvidia_curand_cu13-0.0.1.tar.gz", hash = "sha256:e8c35db375075280fbac38ee52b145cefaf9221b52b03c639626c8e18964e984", size = 1369, upload-time = "2025-10-31T20:43:23.21Z" }
+
+[[package]]
 name = "onnxruntime"
 version = "1.24.3"
 source = { registry = "https://pypi.org/simple" }
@@ -258,14 +318,31 @@ dependencies = [
     { name = "websockets" },
 ]
 
+[package.optional-dependencies]
+cuda = [
+    { name = "nvidia-cublas-cu13", marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-cuda-runtime-cu13", marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-cufft-cu13", marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-curand-cu13", marker = "sys_platform != 'darwin'" },
+    { name = "tensorrt-cu13", marker = "sys_platform != 'darwin'" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
+    { name = "nvidia-cublas-cu13", marker = "sys_platform != 'darwin' and extra == 'cuda'" },
+    { name = "nvidia-cuda-runtime-cu13", marker = "sys_platform != 'darwin' and extra == 'cuda'" },
+    { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin' and extra == 'cuda'" },
+    { name = "nvidia-cufft-cu13", marker = "sys_platform != 'darwin' and extra == 'cuda'" },
+    { name = "nvidia-curand-cu13", marker = "sys_platform != 'darwin' and extra == 'cuda'" },
     { name = "onnxruntime", marker = "sys_platform == 'darwin'", specifier = ">=1.18" },
     { name = "onnxruntime-gpu", marker = "sys_platform != 'darwin'", specifier = ">=1.18" },
     { name = "opencv-python-headless", specifier = ">=4.9" },
+    { name = "tensorrt-cu13", marker = "sys_platform != 'darwin' and extra == 'cuda'" },
     { name = "websockets", specifier = ">=12" },
 ]
+provides-extras = ["cuda"]
 
 [[package]]
 name = "protobuf"
@@ -292,6 +369,42 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/83/d3/803453b36afefb7c2bb238361cd4ae6125a569b4db67cd9e79846ba2d68c/sympy-1.14.0.tar.gz", hash = "sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517", size = 7793921, upload-time = "2025-04-27T18:05:01.611Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/09/77d55d46fd61b4a135c444fc97158ef34a095e5681d0a6c10b75bf356191/sympy-1.14.0-py3-none-any.whl", hash = "sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5", size = 6299353, upload-time = "2025-04-27T18:04:59.103Z" },
+]
+
+[[package]]
+name = "tensorrt-cu13"
+version = "11.1.0.106"
+source = { registry = "https://pypi.nvidia.com/" }
+dependencies = [
+    { name = "tensorrt-cu13-bindings" },
+    { name = "tensorrt-cu13-libs" },
+]
+sdist = { url = "https://pypi.nvidia.com/tensorrt-cu13/tensorrt_cu13-11.1.0.106.tar.gz", hash = "sha256:7511c9fa102306c5841a3a261a18a99eab3a5e4bf2e1f64a34f3331475f8e804" }
+
+[[package]]
+name = "tensorrt-cu13-bindings"
+version = "11.1.0.106"
+source = { registry = "https://pypi.nvidia.com/" }
+wheels = [
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp310-none-manylinux_2_28_x86_64.whl", hash = "sha256:5f1d858e2c3c9e02ee36c79fac71e5c2833ccbb321c266a28da157f874f99a40" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp310-none-manylinux_2_35_aarch64.whl", hash = "sha256:01ac12974571a7cce63b967cb70fbb0b171f07fefb236b8e3ce879df7199a440" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp310-none-win_amd64.whl", hash = "sha256:b1b0532de92135c03ac0e2faebcd8d25441715144288c9482dd3be076aaf2bc8" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp311-none-manylinux_2_28_x86_64.whl", hash = "sha256:14b6073352fddc66fc859956b86a8e601f9a35ce15e8d331026a7f7947e4e683" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp311-none-manylinux_2_35_aarch64.whl", hash = "sha256:91f8c83f4c8a8e793479d5a619996073d53487dae2ea58cdffbb06744ded8b8f" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp311-none-win_amd64.whl", hash = "sha256:32a961b9c262d2fba49b63433f855ac11921e83495c29c48b57e14ae3280bdb7" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp312-none-manylinux_2_28_x86_64.whl", hash = "sha256:c02e93843a7bbe0b1cba15fb1fa01424d240f9037326e66d21628a2f1fcf2bf2" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp312-none-manylinux_2_35_aarch64.whl", hash = "sha256:2b34be566802da851f9fd6cb86428431e5d14ea527405ee86d0e3d3551ea41d3" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-bindings/tensorrt_cu13_bindings-11.1.0.106-cp312-none-win_amd64.whl", hash = "sha256:42864885cfc87f904ee30eb817a3aa8062608a6b5b0cb3cea72feb557d83c047" },
+]
+
+[[package]]
+name = "tensorrt-cu13-libs"
+version = "11.1.0.106"
+source = { registry = "https://pypi.nvidia.com/" }
+wheels = [
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-libs/tensorrt_cu13_libs-11.1.0.106-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:eeb8bb436c80976d920db56c7ef27b8dd07c3203619a2c1ef18fe042525b6d6d" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-libs/tensorrt_cu13_libs-11.1.0.106-py3-none-manylinux_2_35_aarch64.whl", hash = "sha256:01b5ce582c2f72a0e24a72f7ed959458d20fb2353c1d1bbbbdc3a326e072a74a" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu13-libs/tensorrt_cu13_libs-11.1.0.106-py3-none-win_amd64.whl", hash = "sha256:b727cb67d272d0b6d8eedba560a9ab6f5edc06057e82bafe7952a58c611488c7" },
 ]
 
 [[package]]

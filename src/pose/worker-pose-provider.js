@@ -5,10 +5,12 @@
 import { startWebcam, stopWebcam } from './webcam.js';
 
 export class WorkerPoseProvider {
-  constructor({ ep, kptThresh = 0.3 } = {}) {
+  constructor({ ep, kptThresh = 0.3, yoloRes, rtmwVariant } = {}) {
     if (!ep) throw new Error('WorkerPoseProvider needs an explicit EP');
     this.ep = ep;
     this.kptThresh = kptThresh;
+    this.yoloRes = yoloRes;
+    this.rtmwVariant = rtmwVariant;
     this.detectEveryN = 1;
     this.video = null;
     this.stream = null;
@@ -30,7 +32,7 @@ export class WorkerPoseProvider {
     await new Promise((resolve, reject) => {
       this._readyResolve = resolve;
       this.worker.onerror = (err) => reject(new Error(`pose worker: ${err.message}`));
-      this.worker.postMessage({ type: 'init', ep: this.ep, kptThresh: this.kptThresh });
+      this.worker.postMessage({ type: 'init', ep: this.ep, kptThresh: this.kptThresh, yoloRes: this.yoloRes, rtmwVariant: this.rtmwVariant });
     });
     this.running = true;
   }
