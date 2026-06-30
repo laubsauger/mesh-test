@@ -20,11 +20,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# TensorRT EP on top of the CUDA base. `tensorrt-cu12` matches the CUDA-12 ORT build
-# above and pulls TensorRT 10.x + its CUDA deps. Enable with `npm run sidecar:cuda`.
-# (CUDA EP alone — base install — already gives full GPU; TRT is the extra speedup.)
+# TensorRT EP on top of the CUDA base. onnxruntime-gpu 1.22 needs TensorRT **10**
+# (it loads nvinfer_10.dll) — pin to 10.x or pip resolves a bindings-only stub that
+# lacks the libs. `tensorrt-cu12-libs` carries the actual nvinfer_10.dll.
+# NOTE: CUDA EP (the BASE install) already gives full GPU (~10-15ms on a 4090). TRT
+# is an optional further speedup and the finickiest piece — if it won't resolve,
+# just use `npm run sidecar` (CUDA). Enable TRT with `npm run sidecar:cuda`.
 trt = [
-    "tensorrt-cu12 ; platform_system != 'Darwin'",
+    "tensorrt-cu12>=10,<11 ; platform_system != 'Darwin'",
+    "tensorrt-cu12-libs>=10,<11 ; platform_system != 'Darwin'",
 ]
 
 # Managed entirely by uv — `uv run` creates/locks .venv/ here, never touches global.

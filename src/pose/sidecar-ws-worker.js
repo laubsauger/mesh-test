@@ -25,7 +25,10 @@ function postPose(seq, frame, native, w, h, vidW, vidH, readbackMs, sentAt) {
   if (frame) {
     const fx = (vidW || 1) / w;
     const fy = (vidH || 1) / h;
-    out = { ...frame, keypoints2D: frame.keypoints2D.map((p) => ({ x: p.x * fx, y: p.y * fy, confidence: p.confidence })) };
+    // timestampMs is REQUIRED downstream: the one-euro smoother computes dt from it.
+    // Without it dt → NaN → NaN canonical → the retarget NaN-guard freezes the mesh.
+    // Stamp with the frame's send time (worker-clock monotonic ms; only deltas matter).
+    out = { ...frame, timestampMs: sentAt, keypoints2D: frame.keypoints2D.map((p) => ({ x: p.x * fx, y: p.y * fy, confidence: p.confidence })) };
   }
   const round = performance.now() - sentAt;             // send→reply, measured OFF main thread
   const serverTotal = native?.serverTotal ?? native?.total ?? 0;

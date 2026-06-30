@@ -73,7 +73,9 @@ export class CanonicalSmoother {
   smooth(canon) {
     let dt = this.prevT === null ? 0 : (canon.timestampMs - this.prevT) / 1000;
     this.prevT = canon.timestampMs;
-    if (dt <= 0 || dt > 1) dt = 1 / 30; // first frame / stale → assume ~30fps
+    // `!(dt > 0)` (not `dt <= 0`) so a NaN/undefined timestamp also falls back — NaN
+    // comparisons are false, so the old guard let NaN dt through → NaN-poisoned output.
+    if (!(dt > 0) || dt > 1) dt = 1 / 30; // first frame / stale / missing ts → ~30fps
 
     const joints = canon.joints.map((j, i) => ({
       x: this.fx[i].filter(j.x, dt),

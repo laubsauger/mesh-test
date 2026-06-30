@@ -80,6 +80,29 @@ def select_providers(ep):
     return [want, "CPUExecutionProvider"] if want != "CPUExecutionProvider" else [want]
 
 
+def probe_ep(test_path, candidates):
+    """Return the first GPU EP that ACTUALLY activates, probed on the small yolo
+    model. Why not just pass the whole ordered list to InferenceSession? ORT has a
+    nasty quirk: if TensorRT is in the list and its plugin registration throws
+    (e.g. nvinfer_*.dll missing), ORT falls back STRAIGHT TO CPU — skipping CUDA,
+    even though CUDA would work. Probing each EP alone sidesteps that → we get CUDA
+    when only TRT is broken."""
+    for ep in candidates:
+        if ep == "CPUExecutionProvider":
+            return "CPUExecutionProvider"
+        try:
+            so = ort.SessionOptions()
+            so.log_severity_level = 3
+            s = ort.InferenceSession(str(test_path), sess_options=so, providers=[ep, "CPUExecutionProvider"])
+            active = s.get_providers()[0]
+            if active == ep:
+                return ep
+            print(f"[sidecar] EP probe: {ep} registered but inactive (libs missing) → trying next")
+        except Exception as e:  # noqa: BLE001
+            print(f"[sidecar] EP probe: {ep} failed ({str(e)[:80]}) → trying next")
+    return "CPUExecutionProvider"
+
+
 def make_session(path, providers):
     if not path.exists():
         raise SystemExit(f"model missing: {path}\n  Bring it over by file transfer (see README 'Inference models').")
@@ -348,6 +371,13 @@ async def main():
     ort.set_default_logger_severity(3)  # hide WARNING-level EP partition spam (errors still print)
     preload_gpu_dlls()
     providers = select_providers(args.ep)
+    # AUTO: probe each candidate (on the small yolo model) and pin the one that
+    # actually activates — so a broken/absent TensorRT can't drag us to CPU past a
+    # working CUDA EP (ORT's TRT-fail→CPU quirk). Explicit --ep stays strict.
+    if args.ep == "auto":
+        winner = probe_ep(yolo_path(args.yolo_res), providers)
+        providers = [winner] if winner == "CPUExecutionProvider" else [winner, "CPUExecutionProvider"]
+        print(f"[sidecar] auto-EP probe → {winner}")
     rtmw_out = tuple(args.rtmw_out.split(",")) if args.rtmw_out else None
     print(f"[sidecar] requested EP={args.ep} variant={args.rtmw_variant} yolo={args.yolo_res} → providers {providers}")
     pipe = PosePipeline(providers, variant=args.rtmw_variant, yolo_res=args.yolo_res,
