@@ -51,6 +51,8 @@ import { KPT, NUM_KPTS, RTMW_VARIANTS, YOLO_RES_OPTIONS } from './pose/rtmw-cons
 import { CanonicalSmoother } from './pose/one-euro.js';
 import { PoseRecorder, PosePlayer } from './pose/recorder.js';
 import { PoseSkeleton3D } from './pose/skeleton-3d.js';
+import { MediaPipeProvider } from './pose/mediapipe-provider.js';
+import { toCanonicalFromMediaPipe, blendshapesToExpr } from './pose/mediapipe-adapter.js';
 
 const canvas = document.querySelector('#scene');
 const statusEl = document.querySelector('#status');
@@ -124,6 +126,13 @@ controls.screenSpacePanning = true;
 controls.panSpeed = 1.0;
 controls.zoomSpeed = 1.2;
 const cameraOffset = new THREE.Vector3();
+
+// T29: face-mask editor pointer handlers (paint the edit head when edit mode is on;
+// handlers are no-ops otherwise). Right-click erases → suppress its context menu.
+renderer.domElement.addEventListener('pointerdown', (e) => onFaceEditDown(e));
+renderer.domElement.addEventListener('pointermove', (e) => onFaceEditMove(e));
+window.addEventListener('pointerup', () => onFaceEditUp());
+renderer.domElement.addEventListener('contextmenu', (e) => { if (faceEditor.active) e.preventDefault(); });
 
 // 3D debug overlay: the canonical pose (what drives the rig) drawn as a line
 // skeleton at the pose performer, to spot retarget discrepancies vs the mesh.
@@ -347,7 +356,8 @@ const state = {
   poseEP: 'webgpu',
   poseEnabled: true, // dev default: pose on at load
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
-  poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS
+  poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS | 'mediapipe' = in-browser BlazePose+Face
+  poseMediaPipeHands: false, // mediapipe: also run the 21-pt hand landmarker (extra cost)
   poseSidecarDebug: false, // sidecar: console per-frame timing/flow trace
   poseReadback: 'bitmap', // sidecar frame snapshot: 'bitmap'(createImageBitmap) | 'videoframe'(WebCodecs)
   posePreview: true, // sidecar-native: push a low-res webcam JPEG so the overlay isn't blind
@@ -703,10 +713,13 @@ function buildInspectorControls() {
   });
   poseGroup.add(state, 'poseWorker').name('Inference Worker').listen();
   poseGroup.add(state, 'poseEP', POSE_EPS).name('Pose EP');
-  poseGroup.add(state, 'poseBackend', ['worker', 'sidecar', 'sidecar-native']).name('Backend (web|native)').onChange(() => {
+  poseGroup.add(state, 'poseBackend', ['worker', 'sidecar', 'sidecar-native', 'mediapipe']).name('Backend (web|native)').onChange(() => {
     // benchmark switch: tear down the running provider so startPose rebuilds with
     // the chosen backend (onnxruntime-web worker vs the native TRT/CUDA sidecar).
     if (poseProvider) { stopPose(); if (state.poseEnabled) startPose(); }
+  });
+  poseGroup.add(state, 'poseMediaPipeHands').name('MediaPipe Hands').onChange(() => {
+    if (poseProvider instanceof MediaPipeProvider) { stopPose(); if (state.poseEnabled) startPose(); }
   });
   // NOT a model resolution — the downscaled webcam frame shipped to the sidecar
   // (transport only; it letterboxes→yolo@≤640 and crops→rtmw 384×288 from it). Nothing
@@ -842,6 +855,18 @@ function buildInspectorControls() {
   faceGroup.add(state, 'faceMaskDebug').name('Mask Debug (verts)').onChange(refreshFaceMaskOverlays);
   faceGroup.add(state, 'faceMaskRegion', FACE_REGIONS).name('Mask Region').onChange(refreshFaceMaskOverlays);
   faceGroup.add({ download: downloadFaceMasks }, 'download').name('Download Face Masks (.bin)');
+  // T29: mask editor — paint region weights on a dedicated edit-head, fix auto-gen.
+  faceGroup.add(faceEditor, 'active').name('Edit Mode').listen().onChange(setFaceEditMode);
+  faceGroup.add(faceEditor, 'batchIndex', 0, 6, 1).name('Edit Model #').onChange(() => { if (faceEditor.active) setFaceEditMode(true); });
+  faceGroup.add(faceEditor, 'region', FACE_REGIONS).name('Paint Region').onChange(recolorEditHead);
+  faceGroup.add(faceEditor, 'radius', 0.005, 0.3, 0.005).name('Brush Radius');
+  faceGroup.add(faceEditor, 'strength', 0.05, 1, 0.05).name('Brush Strength');
+  faceGroup.add(faceEditor, 'erase').name('Erase (or right-drag)');
+  faceGroup.add(faceEditor, 'symmetric').name('Symmetric Paint');
+  faceGroup.add(faceEditor, 'hingeMode').name('Set Jaw Hinge (click)');
+  faceGroup.add({ reseed: () => faceEditReseed(false) }, 'reseed').name('Re-seed Auto-gen');
+  faceGroup.add({ flip: () => faceEditReseed(true) }, 'flip').name('Flip Forward Axis');
+  faceGroup.add({ clear: faceEditClearRegion }, 'clear').name('Clear Region');
 
   const statsGroup = renderer.inspector.createParameters('VJ Layer / Render Stats');
   statsGroup.add(statsState, 'fps').name('FPS').listen();
@@ -1338,7 +1363,8 @@ async function buildFaceMask(batch, mesh, skinnedMeshes) {
       skinIndices: flatAttr(geom.getAttribute('skinIndex'), 4, Uint16Array),
       skinWeights: flatAttr(geom.getAttribute('skinWeight'), 4, Float32Array),
       count: vertexCount,
-      headBoneIndex
+      headBoneIndex,
+      forwardSign: 1
     });
   }
 
@@ -1349,16 +1375,10 @@ async function buildFaceMask(batch, mesh, skinnedMeshes) {
   batch.faceExprNode = storage(batch.faceExpr, 'vec4', nWalkers * 2).toReadOnly();
 
   // Per-vertex mask buffer: 2 vec4/vertex = [jaw,lowerLip,mouthCorner,upperLidL |
-  // upperLidR,browL,browR,_], normalized 0..1. Static (fill once).
+  // upperLidR,browL,browR,_], normalized 0..1. Filled from mask.data; re-uploaded live
+  // when the editor (T29) repaints/re-seeds.
   const maskAttr = new StorageBufferAttribute(vertexCount * 2, 4);
-  const arr = maskAttr.array;
-  const D = mask.data; const N = vertexCount;
-  for (let i = 0; i < N; i += 1) {
-    const o = i * 8;
-    arr[o] = D[0 * N + i] / 255; arr[o + 1] = D[1 * N + i] / 255; arr[o + 2] = D[2 * N + i] / 255; arr[o + 3] = D[3 * N + i] / 255;
-    arr[o + 4] = D[4 * N + i] / 255; arr[o + 5] = D[5 * N + i] / 255; arr[o + 6] = D[6 * N + i] / 255; arr[o + 7] = 0;
-  }
-  maskAttr.needsUpdate = true;
+  uploadMaskBuffer(mask, maskAttr);
   const maskNode = storage(maskAttr, 'vec4', vertexCount * 2).toReadOnly();
 
   // Hinge + amount uniforms (amounts driven live from state each frame; 0 when
@@ -1376,9 +1396,21 @@ async function buildFaceMask(batch, mesh, skinnedMeshes) {
     browRaise: uniform(0)
   };
 
-  batch.faceMask = { mask, headMesh, headBoneIndex, vertexCount, source, maskNode };
+  batch.faceMask = { mask, headMesh, headBoneIndex, vertexCount, source, maskNode, maskAttr, geom, forwardSign: 1 };
   console.log(`[face] ${mesh.name}: mask ${source}, ${vertexCount} verts, head bone ${headBoneIndex}`);
   buildFaceMaskOverlay(batch);
+}
+
+// Fill the GPU mask buffer from mask.data (region-major uint8 → per-vertex 2×vec4).
+function uploadMaskBuffer(mask, maskAttr) {
+  const arr = maskAttr.array;
+  const D = mask.data; const N = mask.vertexCount;
+  for (let i = 0; i < N; i += 1) {
+    const o = i * 8;
+    arr[o] = D[i] / 255; arr[o + 1] = D[N + i] / 255; arr[o + 2] = D[2 * N + i] / 255; arr[o + 3] = D[3 * N + i] / 255;
+    arr[o + 4] = D[4 * N + i] / 255; arr[o + 5] = D[5 * N + i] / 255; arr[o + 6] = D[6 * N + i] / 255; arr[o + 7] = 0;
+  }
+  maskAttr.needsUpdate = true;
 }
 
 // Face deform (T28 / V29): displace the BIND-space head vertex before skinning, so the
@@ -1480,6 +1512,202 @@ function downloadFaceMasks() {
     n += 1;
   }
   statusEl.textContent = n ? `Downloaded ${n} face mask(s) → commit into public/models/` : 'No face masks to download.';
+}
+
+// --- T29: face-mask EDITOR — paint region weights on a dedicated edit-head -----------
+// The crowd is GPU-instanced (no per-instance geometry to click), so the editor spawns
+// ONE static head (the model's own head geometry) beside the crowd as a paint target.
+// Raycast it → brush weights into the region → live-update the GPU mask (crowd deforms
+// immediately) → download the .bin. Also re-seeds / flips the auto-gen forward axis and
+// re-places the jaw hinge — the fixes for the wrong-region failures on stylized heads.
+const faceEditor = {
+  active: false, batchIndex: 0, region: 'jaw', radius: 0.04, strength: 0.5,
+  erase: false, symmetric: true, hingeMode: false, editHead: null, batch: null, painting: false
+};
+const REGION_MIRROR = { upperLidL: 'upperLidR', upperLidR: 'upperLidL', browL: 'browR', browR: 'browL' };
+const _rayNDC = new THREE.Vector2();
+const _raycaster = new THREE.Raycaster();
+const _vLocal = new THREE.Vector3();
+const _vTmp = new THREE.Vector3();
+
+function editBatch() {
+  const list = crowdBatches.filter((b) => b.faceMask);
+  return list[Math.min(faceEditor.batchIndex, list.length - 1)] || null;
+}
+
+function setFaceEditMode(on) {
+  faceEditor.active = on;
+  if (faceEditor.editHead) {
+    scene.remove(faceEditor.editHead);
+    faceEditor.editHead.geometry.dispose(); faceEditor.editHead.material.dispose();
+    faceEditor.editHead = null;
+  }
+  faceEditor.batch = null;
+  if (!on) return;
+  const batch = editBatch();
+  if (!batch) { statusEl.textContent = 'Face editor: no model with a face mask.'; faceEditor.active = false; return; }
+  faceEditor.batch = batch;
+  buildEditHead(batch);
+  frameEditHead();
+  statusEl.textContent = `Face editor: ${batch.mesh.name} — click the head to paint "${faceEditor.region}" (Erase/Symmetric in panel).`;
+}
+
+// Static clone of the head geometry, placed to the left of the crowd, scaled to a
+// comfortable size, vertex-colored by the current region weight.
+function buildEditHead(batch) {
+  const src = batch.faceMask.geom;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', src.getAttribute('position').clone());
+  if (src.index) g.setIndex(src.index.clone());
+  g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(batch.faceMask.vertexCount * 3), 3));
+  g.computeBoundingBox();
+  const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  mesh.name = 'face-edit-head';
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 2000;
+  const size = new THREE.Vector3(); g.boundingBox.getSize(size);
+  const s = 1.2 / (size.y || 1); // fit ~1.2 world units tall
+  mesh.scale.setScalar(s);
+  const center = new THREE.Vector3(); g.boundingBox.getCenter(center);
+  mesh.position.set(-1.8 - center.x * s, 1.2 - center.y * s, -center.z * s); // left of the crowd, eye level
+  scene.add(mesh);
+  faceEditor.editHead = mesh;
+  recolorEditHead();
+}
+
+function frameEditHead() {
+  const mesh = faceEditor.editHead; if (!mesh) return;
+  const box = new THREE.Box3().setFromObject(mesh);
+  const c = new THREE.Vector3(); box.getCenter(c);
+  const sz = new THREE.Vector3(); box.getSize(sz);
+  const r = Math.max(sz.x, sz.y, sz.z) || 1;
+  controls.target.copy(c);
+  camera.position.set(c.x + r * 0.2, c.y, c.z + r * 2.6);
+  controls.update();
+}
+
+// Edit head color: grey base, current region weight → hot red/yellow.
+function recolorEditHead() {
+  const mesh = faceEditor.editHead; const batch = faceEditor.batch;
+  if (!mesh || !batch) return;
+  const N = batch.faceMask.vertexCount;
+  const r = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
+  const D = batch.faceMask.mask.data;
+  const col = mesh.geometry.getAttribute('color');
+  for (let i = 0; i < N; i += 1) {
+    const w = D[r * N + i] / 255;
+    col.setXYZ(i, 0.12 + 0.88 * w, 0.12 * (1 - w) + 0.5 * w * w, 0.12 * (1 - w));
+  }
+  col.needsUpdate = true;
+}
+
+// Write one vertex's region weight → mask.data (uint8) + GPU maskAttr (normalized).
+function setMaskWeight(batch, region, i, w01) {
+  const N = batch.faceMask.vertexCount;
+  const v = Math.max(0, Math.min(255, Math.round(w01 * 255)));
+  batch.faceMask.mask.data[region * N + i] = v;
+  batch.faceMask.maskAttr.array[i * 8 + region] = v / 255;
+}
+
+// Brush at a WORLD point: all edit-head verts within radius get add/erase × falloff.
+// Symmetric mirrors across the head center-x (and swaps L/R regions for lids/brows).
+function faceEditPaint(worldPoint, erase) {
+  const batch = faceEditor.batch; const mesh = faceEditor.editHead;
+  if (!batch || !mesh) return;
+  const region = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
+  const pos = mesh.geometry.getAttribute('position');
+  const N = batch.faceMask.vertexCount;
+  const D = batch.faceMask.mask.data;
+  mesh.worldToLocal(_vLocal.copy(worldPoint)); // → geometry-local coords
+  const R = faceEditor.radius; const R2 = R * R;
+  const str = faceEditor.strength * (erase ? -1 : 1);
+  const cx = batch.faceMask.mask.hinge.origin[0];
+  const paintAt = (px, py, pz, reg) => {
+    for (let i = 0; i < N; i += 1) {
+      const dx = pos.getX(i) - px; const dy = pos.getY(i) - py; const dz = pos.getZ(i) - pz;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 > R2) continue;
+      const fall = 1 - Math.sqrt(d2) / R;
+      setMaskWeight(batch, reg, i, D[reg * N + i] / 255 + str * fall);
+    }
+  };
+  paintAt(_vLocal.x, _vLocal.y, _vLocal.z, region);
+  if (faceEditor.symmetric) {
+    const mreg = FACE_REGIONS.indexOf(REGION_MIRROR[faceEditor.region] || faceEditor.region);
+    paintAt(2 * cx - _vLocal.x, _vLocal.y, _vLocal.z, mreg);
+  }
+  batch.faceMask.maskAttr.needsUpdate = true;
+  recolorEditHead();
+}
+
+function applyHingeUniforms(batch) {
+  const u = batch.faceUniforms; const h = batch.faceMask.mask.hinge;
+  u.hingeOrigin.value.set(h.origin[0], h.origin[1], h.origin[2]);
+  const ax = _vTmp.set(h.axis[0], h.axis[1], h.axis[2]);
+  if (ax.lengthSq() < 1e-8) ax.set(1, 0, 0); else ax.normalize();
+  u.hingeAxis.value.copy(ax);
+  u.headHeight.value = batch.faceMask.mask.headHeight || 1;
+}
+
+// Re-run auto-gen (optionally flipping the assumed +z forward), re-upload, recolor.
+function faceEditReseed(flipForward) {
+  const batch = faceEditor.batch || editBatch(); if (!batch) return;
+  const fm = batch.faceMask;
+  if (flipForward) fm.forwardSign = -(fm.forwardSign || 1);
+  const geom = fm.geom;
+  fm.mask = generateFaceMask({
+    positions: flatAttr(geom.getAttribute('position'), 3, Float32Array),
+    skinIndices: flatAttr(geom.getAttribute('skinIndex'), 4, Uint16Array),
+    skinWeights: flatAttr(geom.getAttribute('skinWeight'), 4, Float32Array),
+    count: fm.vertexCount, headBoneIndex: fm.headBoneIndex, forwardSign: fm.forwardSign
+  });
+  uploadMaskBuffer(fm.mask, fm.maskAttr);
+  applyHingeUniforms(batch);
+  recolorEditHead();
+  if (batch.faceMaskOverlay) recolorFaceMaskOverlay(batch.faceMaskOverlay);
+  statusEl.textContent = `Re-seeded ${batch.mesh.name} (forward ${fm.forwardSign > 0 ? '+z' : '-z'}).`;
+}
+
+function faceEditClearRegion() {
+  const batch = faceEditor.batch; if (!batch) return;
+  const region = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
+  const N = batch.faceMask.vertexCount;
+  for (let i = 0; i < N; i += 1) setMaskWeight(batch, region, i, 0);
+  batch.faceMask.maskAttr.needsUpdate = true;
+  recolorEditHead();
+}
+
+function faceEditRaycast(e) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  _rayNDC.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+  _raycaster.setFromCamera(_rayNDC, camera);
+  return _raycaster.intersectObject(faceEditor.editHead, false)[0] || null;
+}
+
+function onFaceEditDown(e) {
+  if (!faceEditor.active || !faceEditor.editHead) return;
+  const hit = faceEditRaycast(e);
+  if (!hit) return; // missed head → let OrbitControls handle it (orbit empty space)
+  controls.enabled = false; // paint, don't orbit
+  if (faceEditor.hingeMode) {
+    faceEditor.editHead.worldToLocal(_vLocal.copy(hit.point));
+    faceEditor.batch.faceMask.mask.hinge.origin = [_vLocal.x, _vLocal.y, _vLocal.z];
+    applyHingeUniforms(faceEditor.batch);
+    statusEl.textContent = 'Jaw hinge set.';
+    return;
+  }
+  faceEditor.painting = true;
+  faceEditPaint(hit.point, e.button === 2 || faceEditor.erase);
+}
+
+function onFaceEditMove(e) {
+  if (!faceEditor.painting) return;
+  const hit = faceEditRaycast(e);
+  if (hit) faceEditPaint(hit.point, faceEditor.erase || (e.buttons === 2));
+}
+
+function onFaceEditUp() {
+  if (faceEditor.painting || !controls.enabled) { faceEditor.painting = false; controls.enabled = true; }
 }
 
 function createPerformerLightRig(index) {
@@ -1800,7 +2028,10 @@ function writeFaceExpr(walker, batch) {
   if (!batch.faceExpr) return;
   const arr = batch.faceExpr.array;
   const o = walker.batchIndex * 8;
-  const e = (walker.boneSource === 'pose' && state.faceDrive && latestFaceExpr) ? latestFaceExpr : null;
+  // debugFaceOverride (dev/CDP): force an expression on EVERY instance, independent of
+  // webcam/pose — lets the test harness drive the deform without a live face.
+  const e = debugFaceOverride
+    || ((walker.boneSource === 'pose' && state.faceDrive && latestFaceExpr) ? latestFaceExpr : null);
   if (e) {
     arr[o] = e.jawOpen; arr[o + 1] = e.smile; arr[o + 2] = e.pucker; arr[o + 3] = e.blinkL;
     arr[o + 4] = e.blinkR; arr[o + 5] = e.browL; arr[o + 6] = e.browR; arr[o + 7] = 0;
@@ -2112,6 +2343,7 @@ const poseSmoother = new CanonicalSmoother(NUM_KPTS, {
 // re-binding can't break the display).
 const faceExpr = new FaceExpressionExtractor();
 let latestFaceExpr = null;
+let debugFaceOverride = null; // dev/CDP: forced expression (see writeFaceExpr / window.__vj.setFace)
 let faceExprPrevT = null;
 const faceStats = { jawOpen: 0, smile: 0, pucker: 0, blinkL: 0, blinkR: 0, browL: 0, browR: 0, neutral: 'auto…' };
 const poseRecorder = new PoseRecorder();
@@ -2223,7 +2455,9 @@ function coreJumped(raw, now) {
 }
 
 function updateCanonical(frame) {
-  const raw = frame ? toCanonical(frame) : null;
+  // Adapter boundary: MediaPipe frames carry their own topology/axis convention → their
+  // own canonical builder. RTMW (worker/sidecar/native) uses toCanonical.
+  const raw = frame ? (frame.source === 'mediapipe' ? toCanonicalFromMediaPipe(frame) : toCanonical(frame)) : null;
   const now = performance.now();
 
   if (raw) {
@@ -2257,9 +2491,16 @@ function updateCanonical(frame) {
     // frame timestamp (pose-rate); the extractor's own One Euro smooths per scalar.
     const faceDt = faceExprPrevT === null ? 0 : (latestCanonical.timestampMs - faceExprPrevT) / 1000;
     faceExprPrevT = latestCanonical.timestampMs;
-    latestFaceExpr = faceExpr.update(latestCanonical, faceDt, { thresh: state.poseKptThresh });
+    // MediaPipe gives ARKit blendshapes directly (richer + already neutral-relative);
+    // RTMW extracts the 7 scalars from the sparse face landmarks.
+    if (frame.faceBlendshapes) {
+      latestFaceExpr = blendshapesToExpr(frame.faceBlendshapes);
+      faceStats.neutral = 'blendshapes';
+    } else {
+      latestFaceExpr = faceExpr.update(latestCanonical, faceDt, { thresh: state.poseKptThresh });
+      faceStats.neutral = faceExpr.neutral ? 'set' : 'capturing…';
+    }
     Object.assign(faceStats, latestFaceExpr);
-    faceStats.neutral = faceExpr.neutral ? 'set' : 'capturing…';
 
     // Calibration: collect bone-length samples during the capture phase (finalize
     // + countdown are driven by updateCalibration in the render loop).
@@ -2324,6 +2565,8 @@ async function startPose() {
     } else if (state.poseBackend === 'sidecar-native') {
       provider = new NativeCapturePoseProvider({ kptThresh: state.poseKptThresh, width: 640, height: 480, preview: state.posePreview, device: state.poseNativeDevice });
       provider.debug = state.poseSidecarDebug;
+    } else if (state.poseBackend === 'mediapipe') {
+      provider = new MediaPipeProvider({ kptThresh: state.poseKptThresh, face: true, hands: state.poseMediaPipeHands });
     } else {
       const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
       provider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh, yoloRes: state.poseYoloRes, rtmwVariant: state.poseRtmwVariant });
@@ -2697,4 +2940,26 @@ function resize() {
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
   renderer.setSize(width, height);
+}
+
+// Dev-only debug bridge (T28/T29): lets the CDP test harness read live face state and
+// flip inspector toggles from outside the module. Stripped from production builds.
+if (import.meta.env.DEV) {
+  window.__vj = {
+    state,
+    get batches() { return crowdBatches; },
+    faceExpr,
+    get face() { return latestFaceExpr; },
+    camera,
+    controls,
+    refreshFaceMaskOverlays,
+    setFace(o) { debugFaceOverride = o; },
+    clearFace() { debugFaceOverride = null; },
+    faceEditor,
+    setFaceEditMode,
+    faceEditReseed,
+    faceEditPaint,
+    faceEditClearRegion,
+    THREE
+  };
 }

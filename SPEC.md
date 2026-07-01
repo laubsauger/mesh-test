@@ -65,7 +65,7 @@ Pose (`docs/pose-driver.md` §54):
 Face:
 - V26: face expression = deterministic 2D-geometry fn(landmarks 23-90) → scalars, ⊥ model inference (V5-global "code answers, ⊥ model for deterministic transform"). Metrics = ratios (MAR/EAR/corner-width), scale+mostly-rotation-invariant; neutral-calibrated (reuse `recalibrateFacing` pattern); OneEuro-smoothed (mirror body pipeline V25). z ⊥ used (monocular unreliable, §C).
 - V27: landmark space (expr params) ⊥ coupled to mesh space (mask); they meet ONLY via the ~7 scalars. ⊥ landmark→mesh projection/alignment. Mask seeded from mesh geometry alone; params measured in landmark space alone.
-- V28: face mask loaded from `.bin` sidecar; `mask.vertexCount === geometry.vertexCount` else THROW (⊥ silent mismatch). Indexed geometry ∴ mask indexes 1:1 to vertices (V2). Missing sidecar = face-drive off for that model, ⊥ crash the crowd.
+- V28: face mask = AUTO-GEN from mesh geometry (primary, V27); committed `.bin` sidecar is an OPTIONAL OVERRIDE (editor output, T29) preferred when present + valid. Sidecar `mask.vertexCount === geometry.vertexCount` else THROW (⊥ silent mismatch → stale-mask mis-index). Indexed geometry ∴ mask indexes 1:1 to vertices (V2). Missing/invalid sidecar → auto-gen, ⊥ crash the crowd. (Amended: was "missing = face off"; auto-gen is deterministic+mesh-space so it's the sane default, sidecar just persists editor fixes.)
 - V29: face deform lives in `positionNode` compute path, ⊥ `morphTargetInfluences` (bypasses the custom compute draw, V1/V2). Per-instance expr = instanced attribute (same per-instance machinery as `boneMatrices`, V5 — cheap: 7 floats/instance vs boneCount×16). Face drives the SAME pose-performer instances (`boneSource=pose`), ⊥ new performer type. Jaw = hinge-rotate verts about a head-local axis, ⊥ linear translate (linear looks wrong).
 - V30: canonical mirror (`MIRROR_INDEX`) swaps ALL paired landmarks incl face (23-90), ⊥ body/hands only — else mirrored performer scrambles the face. (observation-adapter.js gap.)
 
@@ -98,8 +98,8 @@ T24|.|tracking-quality modes (§44): fullBody|upperBodyOnly|holdLastPose|recover
 T25|.|pose families (§28): neutral/squat/single-support/lunge/kneeRaise → adjust solver weights, ⊥ canned anim (anchored/hybrid only)|V9
 T26|x|**face phase 1 — extract**: `FaceExpression` from landmarks 23-90 → 7 scalars (MAR jawOpen, corner-width smile, pucker, EAR blinkL/R, brow-eye browL/R); neutral calib + OneEuro; Inspector live plot. Also fix `MIRROR_INDEX` face gap (add 23-90 L/R pairs)|V26,V30,I.faceExpr
 T27|x|**face phase 2 — mask**: auto-gen region weights from mesh geometry (Y-bands + symmetry + anchors, ⊥ landmarks); write `public/models/<id>.face-mask.bin` (header + per-vtx uint8/region); loader w/ vertexCount THROW guard; vertex-color debug overlay|V27,V28,I.faceMask
-T28|~|**face phase 3 — deform**: `positionNode` reads mask + per-instance expr instanced attr; hinge-rotate jaw + translate lowerLip/mouthCorner/eyelid/brow. Scope jaw+mouth FIRST, eyes after. Normals skipped (note; fix if lighting reads wrong). ✅ hero performer opens mouth/blinks in webcam sync|V29,I.faceMask,I.faceExpr
-T29|.|**face phase 4 (gated on T28 quality)**: in-app mask painter — raycast brush per region, edit hinge/anchor params, save `.bin`. Skip if auto-gen good enough|I.faceMask,I.inspector
+T28|x|**face phase 3 — deform**: `positionNode` reads mask + per-instance expr instanced attr; hinge-rotate jaw + translate lowerLip/mouthCorner/eyelid/brow. Scope jaw+mouth FIRST, eyes after. Normals skipped (note; fix if lighting reads wrong). ✅ hero performer opens mouth/blinks in webcam sync|V29,I.faceMask,I.faceExpr
+T29|x|**face phase 4 (gated on T28 quality)**: in-app mask painter — raycast brush per region, edit hinge/anchor params, save `.bin`. Skip if auto-gen good enough|I.faceMask,I.inspector
 
 ## §B BUGS
 id|date|cause|fix
