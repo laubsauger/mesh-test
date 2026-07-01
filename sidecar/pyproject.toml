@@ -7,6 +7,10 @@ dependencies = [
     "numpy>=1.26",
     "opencv-python-headless>=4.9",
     "websockets>=12",
+    # Windows: real camera NAMES via DirectShow — the ONLY reliable way to see + open
+    # virtual cams (OBS Virtual Camera), which OpenCV's index-only enumeration misses.
+    # Same device roster the browser sees. Tiny, Windows-only.
+    "pygrabber>=0.2 ; platform_system == 'Windows'",
     # GPU box (Linux/Windows). EXACT verified matrix (onnxruntime TensorRT-EP docs):
     #   onnxruntime-gpu 1.22  →  CUDA 12.x  +  cuDNN 9.x  +  TensorRT 10.9
     # The `[cuda,cudnn]` extra makes ORT pull its OWN matching CUDA 12 + cuDNN 9

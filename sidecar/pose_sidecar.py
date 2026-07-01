@@ -362,14 +362,47 @@ def annotate(timings, frame, box):
         print(f"[sidecar] f{_diag['n']} conf={timings['poseConf']} span={span} box={timings['box']}")
 
 
+def named_cameras():
+    """Windows: real device NAMES via DirectShow (pygrabber), in cv2 CAP_DSHOW index order.
+    This is how the browser sees 'OBS Virtual Camera' — OpenCV's index-only enumeration
+    often misses virtual cams entirely. Returns {index: name}, or {} (non-Windows / no
+    pygrabber). The list index == the index you pass to cv2.VideoCapture(i, CAP_DSHOW)."""
+    if sys.platform != "win32":
+        return {}
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        return {i: n for i, n in enumerate(FilterGraph().get_input_devices())}
+    except Exception as e:  # noqa: BLE001 — pygrabber missing/failed → fall back to index-only
+        print(f"[sidecar] camera NAMES unavailable ({e}) — pygrabber not installed? Names skipped.")
+        return {}
+
+
+def resolve_device(spec):
+    """--device may be an INDEX ('5') or a NAME substring ('obs'). Name → matched against
+    the DirectShow roster (case-insensitive). Returns an int index, or -1 if unresolved."""
+    if spec is None:
+        return -1
+    if spec.lstrip("-").isdigit():
+        return int(spec)
+    for i, n in named_cameras().items():
+        if spec.lower() in n.lower():
+            print(f"[sidecar] --device '{spec}' → index {i} ('{n}')")
+            return i
+    print(f"[sidecar] --device '{spec}' matched no camera NAME — check `--list-cameras`. Using default.")
+    return -1
+
+
 def enumerate_cameras(max_n=8, save_dir=None):
     """Probe indices 0..max_n: which OPEN + deliver LIVE (non-black) frames, at what res.
     Index-based (OpenCV can't read device names portably) — find your OBS/real cam here.
     If save_dir given, WRITE the grabbed frame to cam-<i>.jpg so you can SEE each feed."""
     out = []
+    names = named_cameras()  # {index: "OBS Virtual Camera", ...} on Windows, else {}
+    # Scan at least as far as the named roster reaches (OBS can sit past index 7).
+    hi = max(max_n, (max(names) + 1) if names else 0)
     backends = ([(cv2.CAP_DSHOW, "DShow"), (cv2.CAP_MSMF, "MSMF")]
                 if sys.platform == "win32" else [(cv2.CAP_ANY, "default")])
-    for i in range(max_n):
+    for i in range(hi):
         for be, name in backends:
             cap = cv2.VideoCapture(i, be)
             if not cap.isOpened():
@@ -391,7 +424,8 @@ def enumerate_cameras(max_n=8, save_dir=None):
             if save_dir is not None and snap is not None:
                 path = os.path.abspath(os.path.join(save_dir, f"cam-{i}.jpg"))
                 cv2.imwrite(path, snap)  # open this to SEE what the device shows
-            out.append({"index": i, "backend": name, "live": live, "w": w, "h": h, "mean": round(mean, 1), "path": path})
+            out.append({"index": i, "backend": name, "name": names.get(i, "?"),
+                        "live": live, "w": w, "h": h, "mean": round(mean, 1), "path": path})
             break  # one working backend per index is enough to report
     return out
 
@@ -678,18 +712,18 @@ async def main():
                     default="CPUAndGPU", help="Mac CoreML compute units. Default excludes the ANE (fixes the trash); ALL = old behaviour")
     ap.add_argument("--rtmw-out", help="comma-sep X,Y,Z output names (else auto-read from the model)")
     ap.add_argument("--list-cameras", action="store_true", help="probe + print camera indices (find your OBS/real cam), then exit")
-    ap.add_argument("--device", type=int, default=-1, help="native camera index — OVERRIDES the UI 'Native Device'. e.g. -- --device 5")
+    ap.add_argument("--device", default=None, help="native camera INDEX ('5') or NAME substring ('obs') — OVERRIDES the UI 'Native Device'")
     args = ap.parse_args()
 
     global NATIVE_DEVICE
-    NATIVE_DEVICE = args.device
+    NATIVE_DEVICE = resolve_device(args.device)
 
     if args.list_cameras:  # discovery — no model load, no server. Saves a JPG per device.
-        print("[sidecar] scanning cameras (this opens each index briefly)…")
+        print("[sidecar] scanning cameras (opens each index briefly; NAMES via DirectShow)…")
         for c in enumerate_cameras(save_dir="."):
             tag = "LIVE ✓" if c["live"] else "black/none ✗"
-            print(f"  device {c['index']} ({c['backend']}): {tag}  {c['w']}x{c['h']}  mean={c['mean']}  ->  {c['path'] or '(no frame)'}")
-        print("[sidecar] OPEN the cam-<N>.jpg files to SEE each feed. Pick a LIVE index → Native Device.")
+            print(f"  device {c['index']} '{c['name']}' ({c['backend']}): {tag}  {c['w']}x{c['h']}  mean={c['mean']}  ->  {c['path'] or '(no frame)'}")
+        print("[sidecar] OPEN the cam-<N>.jpg files to SEE each feed. Use --device <index|name> (e.g. --device obs).")
         return
 
     global FP16, COREML_UNITS

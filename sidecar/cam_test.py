@@ -23,7 +23,18 @@ def _backends():
             if sys.platform == "win32" else [(cv2.CAP_ANY, "default")])
 
 
-def grab(idx, n=1):
+def _names():
+    """Windows device names via DirectShow (how the browser sees OBS Virtual Camera)."""
+    if sys.platform != "win32":
+        return {}
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        return {i: n for i, n in enumerate(FilterGraph().get_input_devices())}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def grab(idx, n=1, dev_name="?"):
     """Open device idx, warm up, save n frames as cam-<idx>[-k].jpg. Reports res + mean
     brightness (0=black … 255=white) + the file path so you can open and look."""
     for be, name in _backends():
@@ -55,23 +66,34 @@ def grab(idx, n=1):
         cap.release()
         for path, w, h, mean in saved:
             tag = "BLACK/dark" if mean <= 5 else ("dark" if mean < 20 else "OK")
-            print(f"  device {idx} ({name}): {w}x{h} mean={mean:5.1f} [{tag}] -> {path}")
+            print(f"  device {idx} '{dev_name}' ({name}): {w}x{h} mean={mean:5.1f} [{tag}] -> {path}")
         return True
-    print(f"  device {idx}: no frames on any backend")
+    print(f"  device {idx} '{dev_name}': no frames on any backend")
     return False
 
 
 def main():
     args = sys.argv[1:]
+    names = _names()
+    if names:
+        print("[cam_test] DirectShow devices (browser sees these by NAME):")
+        for i, nm in names.items():
+            print(f"    index {i}: {nm}")
+    idx_of = lambda spec: (int(spec) if spec.lstrip("-").isdigit()
+                           else next((i for i, nm in names.items() if spec.lower() in nm.lower()), None))
     if args:
-        idx = int(args[0])
+        idx = idx_of(args[0])
+        if idx is None:
+            print(f"[cam_test] '{args[0]}' matched no device name. Names above.")
+            return
         n = int(args[1]) if len(args) > 1 else 5
-        print(f"[cam_test] device {idx}, {n} frame(s) — open the cam-{idx}*.jpg files to LOOK")
-        grab(idx, n)
+        print(f"[cam_test] device {idx} '{names.get(idx, '?')}', {n} frame(s) — open cam-{idx}*.jpg to LOOK")
+        grab(idx, n, names.get(idx, "?"))
     else:
-        print("[cam_test] snapshotting devices 0..7 — open the cam-N.jpg files to LOOK")
-        for i in range(8):
-            grab(i, 1)
+        hi = max(8, (max(names) + 1) if names else 8)
+        print(f"[cam_test] snapshotting devices 0..{hi - 1} — open the cam-N.jpg files to LOOK")
+        for i in range(hi):
+            grab(i, 1, names.get(i, "?"))
     print("[cam_test] done. Open the cam-*.jpg files to SEE each feed.")
 
 
