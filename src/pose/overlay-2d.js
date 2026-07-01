@@ -47,8 +47,8 @@ export function drawOverlay(ctx, frame, vidW, vidH, { kptThresh = 0.3, mirror = 
   if (frame.faceLandmarks2D) {
     const fl = frame.faceLandmarks2D;
     if (frame.faceEdges) {
-      ctx.strokeStyle = 'rgba(0,229,255,0.45)';
-      ctx.lineWidth = 0.6;
+      ctx.strokeStyle = 'rgba(0,255,255,0.9)';
+      ctx.lineWidth = 1.4;
       ctx.beginPath();
       for (const e of frame.faceEdges) {
         const a = fl[e.start];
