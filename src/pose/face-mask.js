@@ -20,11 +20,15 @@ export const FACE_REGIONS = ['jaw', 'lowerLip', 'mouthCorner', 'upperLidL', 'upp
 export const EXPR_KEYS = ['jawOpen', 'smile', 'pucker', 'blinkL', 'blinkR', 'browL', 'browR'];
 export const DEFORM_TYPES = ['translate', 'hinge']; // 0 = translate along dir, 1 = hinge-rotate about axis
 
+/** @typedef {import('../face/types.js').FaceMask} FaceMask */
+/** @typedef {import('../face/types.js').RegionConfig} RegionConfig */
+
 // Per-region deform config (aligned to FACE_REGIONS). `driver` indexes EXPR_KEYS;
 // `type` indexes DEFORM_TYPES; `amount` = radians (hinge) or fraction-of-headHeight
 // (translate); `dir` = local translate direction; `mirrorX` flips dir.x by the vertex's
 // side (mouth corners spread ±X); hinge origin/axis for type=hinge. Defaults reproduce
 // the original hardcoded T28 behavior; the editor makes every field tunable.
+/** @returns {RegionConfig[]} */
 export function defaultRegionConfig(hinge) {
   const O = hinge?.origin ? hinge.origin.slice(0, 3) : [0, 0, 0];
   const A = hinge?.axis ? hinge.axis.slice(0, 3) : [1, 0, 0];
@@ -64,6 +68,7 @@ const smooth = (t) => { const x = clamp01(t); return x * x * (3 - 2 * x); };
 // (4×count), `skinWeights` (4×count) are the raw attribute arrays; `headBoneIndex` is
 // the skeleton index of the 'Head' bone. `forwardSign` = which z hemisphere the face
 // points down (+1 = +z, Mixamo default). Returns {vertexCount, regions, data, hinge}.
+/** @returns {FaceMask} */
 export function generateFaceMask({ positions, skinIndices, skinWeights, count, headBoneIndex, forwardSign = 1 }) {
   if (!Number.isInteger(headBoneIndex) || headBoneIndex < 0) {
     throw new Error(`generateFaceMask: invalid headBoneIndex ${headBoneIndex}`);
@@ -141,6 +146,7 @@ export function generateFaceMask({ positions, skinIndices, skinWeights, count, h
 }
 
 // Serialize to the `.bin` sidecar layout (see HEADER_BYTES). Returns an ArrayBuffer.
+/** @param {FaceMask} mask @returns {ArrayBuffer} */
 export function encodeFaceMask(mask) {
   const { vertexCount, data, hinge, headHeight = 1 } = mask;
   const R = FACE_REGIONS.length;
@@ -173,6 +179,7 @@ export function encodeFaceMask(mask) {
 
 // Parse a `.bin` sidecar. Throws on bad magic / version / region count (fail loud,
 // no silent accept of a stale or corrupt file).
+/** @param {ArrayBuffer} arrayBuffer @returns {FaceMask} */
 export function decodeFaceMask(arrayBuffer) {
   const dv = new DataView(arrayBuffer);
   if (arrayBuffer.byteLength < HEADER_BYTES) throw new Error('decodeFaceMask: buffer smaller than header');

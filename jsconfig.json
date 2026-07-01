@@ -1,0 +1,27 @@
+{
+  "// T33": "TypeScript readiness (V35). checkJs ON, scoped to the already-typed face/editor",
+  "// modules": "so the untyped legacy (main.js) isn't flooded. Migration order in src/face/types.js.",
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": []
+  },
+  "// scope": "the PURE data/logic modules (no three, no JSX) get checked now. The",
+  "// three": "and JSX modules (deform/editor/UI) join once @types/three + @types/react",
+  "// are": "added — see the migration order in src/face/types.js.",
+  "include": [
+    "src/face/types.js",
+    "src/face/face-runtime.js",
+    "src/pose/face-mask.js",
+    "src/pose/face-expression.js",
+    "src/pose/one-euro.js",
+    "src/editor/editor-store.js"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

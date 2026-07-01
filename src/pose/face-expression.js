@@ -114,6 +114,7 @@ export class FaceExpressionExtractor {
   // canon = CanonicalPoseObservation (joints indexed by COCO-WholeBody id). dt in
   // seconds. Returns the smoothed FaceExpression (also stored on .value). Low face
   // confidence or missing neutral → holds the last value.
+  /** @returns {import('../face/types.js').FaceExpression} */
   update(canon, dt, { thresh = 0.3 } = {}) {
     const m = rawMetrics(canon.joints, thresh);
     if (!m) return this.value; // face not confident → hold last

@@ -2,6 +2,53 @@
 // UI and the vanilla three app (main.js). main.js owns the scene + registers actions;
 // React reads `editorState` (via useEditorState) and calls `actions.*`. Pub/sub keeps
 // the two in sync without either importing the other's internals.
+
+/**
+ * The reactive editor state React renders (T33 / V35).
+ * @typedef {Object} EditorState
+ * @property {boolean} open
+ * @property {{ index: number, name: string }[]} models
+ * @property {number} modelIndex
+ * @property {string} region
+ * @property {'camera'|'brush'} tool
+ * @property {'paint'|'erase'|'hinge'} mode
+ * @property {number} radius
+ * @property {number} strength
+ * @property {boolean} symmetric
+ * @property {{ editHead: boolean, wireframe: boolean, maskCloud: boolean, crowd: boolean, texAlpha: number }} overlays
+ * @property {boolean} canUndo
+ * @property {boolean} canRedo
+ * @property {import('../face/types.js').FaceExpression} expr
+ * @property {import('../face/types.js').RegionConfig} regionConfig
+ * @property {string} status
+ */
+
+/**
+ * The action registry main.js fills (registerActions) + React calls (I.editorUI).
+ * @typedef {Object} EditorActions
+ * @property {(v: boolean) => void} setOpen
+ * @property {(i: number) => void} setModel
+ * @property {(r: string) => void} setRegion
+ * @property {(t: 'camera'|'brush') => void} setTool
+ * @property {(m: 'paint'|'erase'|'hinge') => void} setMode
+ * @property {(v: number) => void} setRadius
+ * @property {(v: number) => void} setStrength
+ * @property {(v: boolean) => void} setSymmetric
+ * @property {(patch: Partial<import('../face/types.js').RegionConfig>) => void} setRegionConfig
+ * @property {(flip: boolean) => void} reseed
+ * @property {() => void} clearRegion
+ * @property {() => void} undo
+ * @property {() => void} redo
+ * @property {() => void} save
+ * @property {(buf: ArrayBuffer) => void} loadMask
+ * @property {(expr: import('../face/types.js').FaceExpression) => void} setExpr
+ * @property {() => void} resetExpr
+ * @property {(v: string) => void} frameView
+ * @property {(v: number) => void} setTexAlpha
+ * @property {(k: string, v: boolean) => void} setOverlay
+ */
+
+/** @type {EditorState} */
 export const editorState = {
   open: false,
   models: [],            // [{ index, name }]
@@ -21,6 +68,7 @@ export const editorState = {
 };
 
 // Registered by main.js. React calls these; it never touches three directly.
+/** @type {Partial<EditorActions>} */
 export const actions = {};
 
 const listeners = new Set();
