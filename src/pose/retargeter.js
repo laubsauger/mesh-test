@@ -379,7 +379,7 @@ export class Retargeter {
         this._flipHold.set(boneKey, 0); // target settled near cur → reset
       }
     }
-    cur.slerp(_qLocal, follow >= 1 ? 1 : follow);
+    cur.slerp(_qLocal, this._blendAlpha); // frame-rate-independent blend (set in apply)
     bone.quaternion.copy(cur);
     bone.updateWorldMatrix(false, false);
   }
@@ -663,10 +663,17 @@ export class Retargeter {
   // the yaw estimator learns THIS person/distance's frontal shoulder/ear width).
   recalibrateFacing() { this.torsoFacing.r0 = 0; this.headFacing.r0 = 0; }
 
-  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, facingDeadzone = 0.17, facingSmooth = 0.15, facingBodyGain = 1, headPitchGain = 2, flipReject = 70, clavicle = false } = {}) {
+  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, facingDeadzone = 0.17, facingSmooth = 0.15, facingBodyGain = 1, headPitchGain = 2, flipReject = 70, dt = 1 / 60, smoothMs = 35, clavicle = false } = {}) {
     this._fresh = canonical !== this._lastCanon; // new pose-frame vs a repeated render-frame
     this._lastCanon = canonical;
     this.flipRejectDeg = flipReject;
+    // Frame-rate-INDEPENDENT rig blend (Driscoll/lisyarus): close half the gap to the new
+    // pose every `smoothMs`, driven by RENDER dt — NOT a fixed per-frame fraction (which
+    // snaps at high render-fps and lags at low, stepping at the pose rate). Smooths the
+    // pose→render stepping with ~one-frame lag, no input-side delay. smoothMs≤0 = snap.
+    this._blendAlpha = smoothMs > 0
+      ? Math.max(0, Math.min(1, 1 - Math.pow(2, -(dt * 1000) / smoothMs)))
+      : (follow >= 1 ? 1 : follow);
     this.restPose();
     this.rig.hips.position.y = this.hipsRestPosY; // reset (restPose only touches rotations)
     this.clampStats.clear(); // V19: only THIS frame's aimed bones report clamps

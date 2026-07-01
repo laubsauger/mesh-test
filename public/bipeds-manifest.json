@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-28T16:28:29.543Z",
+  "generatedAt": "2026-07-01T20:20:54.898Z",
   "animations": [
     "Walking",
     "Running"
@@ -63,6 +63,15 @@
       "id": "Meshy_AI_Neon_Jellybrain_biped",
       "name": "Neon Jellybrain",
       "url": "models/Meshy_AI_Neon_Jellybrain_biped.glb",
+      "animations": [
+        "Walking",
+        "Running"
+      ]
+    },
+    {
+      "id": "Meshy_AI_T_Pose_Hero_biped",
+      "name": "T Pose Hero",
+      "url": "models/Meshy_AI_T_Pose_Hero_biped.glb",
       "animations": [
         "Walking",
         "Running"

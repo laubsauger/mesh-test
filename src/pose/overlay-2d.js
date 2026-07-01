@@ -41,4 +41,14 @@ export function drawOverlay(ctx, frame, vidW, vidH, { kptThresh = 0.3, mirror = 
       ctx.fill();
     }
   }
+
+  // Dense face mesh (MediaPipe 478) — a separate dot cloud, not COCO-indexed. px coords.
+  if (frame.faceLandmarks2D) {
+    ctx.fillStyle = '#ff5cf0';
+    for (const p of frame.faceLandmarks2D) {
+      ctx.beginPath();
+      ctx.arc(X(p.x), p.y, 1, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
 }

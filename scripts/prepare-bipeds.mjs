@@ -1,7 +1,12 @@
-import { mkdir, readdir, rm } from 'node:fs/promises';
+import { mkdir, readdir, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+
+// INCREMENTAL: only unzip a zip whose public/bipeds/<id>/ folder is missing or older
+// than the zip. --force re-unzips all.
+const FORCE = process.argv.includes('--force');
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const sourceDir = join(root, 'assets', 'bipeds');
@@ -32,8 +37,7 @@ async function walk(dir) {
   return files;
 }
 
-await rm(publicDir, { recursive: true, force: true });
-await mkdir(publicDir, { recursive: true });
+await mkdir(publicDir, { recursive: true }); // no wipe — incremental keeps unzipped folders
 
 const zipFiles = (await readdir(sourceDir))
   .filter((file) => file.endsWith('.zip'))
@@ -43,9 +47,17 @@ if (zipFiles.length === 0) {
   throw new Error(`No Meshy biped zip files found in ${sourceDir}`);
 }
 
+let unzipped = 0;
 for (const zip of zipFiles) {
+  const folder = join(publicDir, zip.replace(/\.zip$/, ''));
+  if (!FORCE && existsSync(folder) && (await stat(folder)).mtimeMs >= (await stat(join(sourceDir, zip))).mtimeMs) {
+    console.log(`skip ${zip} (already unzipped)`);
+    continue;
+  }
   await unzip(join(sourceDir, zip));
+  unzipped += 1;
 }
+console.log(`Unzipped ${unzipped} new/changed archive(s).`);
 
 const glbs = (await walk(publicDir)).filter((file) => file.endsWith('.glb'));
 

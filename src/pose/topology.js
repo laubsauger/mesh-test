@@ -15,6 +15,17 @@ export const FOOT_EDGES = [
 
 export const BODY_BONES = BODY_EDGES.concat(FOOT_EDGES);
 
+// 21-point hand finger connectivity, relative to a hand's base keypoint index (wrist=0).
+// COCO-WholeBody hands: left base 91, right base 112.
+const HAND_FINGER = [
+  [0, 1], [1, 2], [2, 3], [3, 4], // thumb
+  [0, 5], [5, 6], [6, 7], [7, 8], // index
+  [0, 9], [9, 10], [10, 11], [11, 12], // middle
+  [0, 13], [13, 14], [14, 15], [15, 16], // ring
+  [0, 17], [17, 18], [18, 19], [19, 20] // pinky
+];
+export const handEdges = (base) => HAND_FINGER.map(([a, b]) => [base + a, base + b]);
+
 // Keypoint groups → color + index range [lo,hi) for dot rendering.
 export const KPT_GROUPS = [
   { key: 'body', lo: 0, hi: 23, color: '#00e5ff' },

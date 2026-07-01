@@ -11,7 +11,8 @@ export const editorState = {
   radius: 0.04,
   strength: 0.5,
   symmetric: true,
-  overlays: { editHead: true, wireframe: false, maskCloud: false, crowd: true },
+  overlays: { editHead: true, wireframe: false, maskCloud: false, crowd: true, texAlpha: 0 },
+  canUndo: false, canRedo: false,
   expr: { jawOpen: 0, smile: 0, pucker: 0, blinkL: 0, blinkR: 0, browL: 0, browR: 0 },
   // Current region's deform config (T30 configurable regions), mirrored from main.js.
   regionConfig: { driver: 0, type: 0, amount: 0, dir: [0, -1, 0], mirrorX: false, hingeOrigin: [0, 0, 0], hingeAxis: [1, 0, 0] },

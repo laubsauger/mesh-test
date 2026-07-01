@@ -1,9 +1,10 @@
 import './styles.css';
 import * as THREE from 'three';
-import { RenderPipeline, StorageBufferAttribute, WebGPURenderer } from 'three/webgpu';
+import { MeshBasicNodeMaterial, RenderPipeline, StorageBufferAttribute, WebGPURenderer } from 'three/webgpu';
 import {
   Fn,
   add,
+  attribute,
   attributeArray,
   cos,
   emissive,
@@ -12,6 +13,7 @@ import {
   mix,
   sign,
   sin,
+  texture,
   mrt,
   normalView,
   output,
@@ -35,7 +37,7 @@ import { CHOREOGRAPHIES, computeWalkerPhase } from './choreography.js';
 import { boneSourceForIndex } from './bone-source.js';
 import { assetUrl } from './asset-url.js';
 import { POSE_EPS } from './pose/ep.js';
-import { BODY_BONES } from './pose/topology.js';
+import { BODY_BONES, handEdges } from './pose/topology.js';
 import { probeEPs } from './pose/ep-probe.js';
 import { RTMWPoseProvider } from './pose/rtmw-provider.js';
 import { WorkerPoseProvider } from './pose/worker-pose-provider.js';
@@ -135,6 +137,16 @@ renderer.domElement.addEventListener('pointerdown', (e) => onFaceEditDown(e));
 renderer.domElement.addEventListener('pointermove', (e) => onFaceEditMove(e));
 window.addEventListener('pointerup', () => onFaceEditUp());
 renderer.domElement.addEventListener('contextmenu', (e) => { if (faceEditor.active) e.preventDefault(); });
+// Undo/redo: mouse back/forward (buttons 3/4) + Cmd/Ctrl+Z / Shift+Z / Y (editor only).
+window.addEventListener('pointerdown', (e) => {
+  if (!faceEditor.active) return;
+  if (e.button === 3) { faceEditUndo(); e.preventDefault(); } else if (e.button === 4) { faceEditRedo(); e.preventDefault(); }
+});
+window.addEventListener('keydown', (e) => {
+  if (!faceEditor.active || !(e.metaKey || e.ctrlKey)) return;
+  const k = e.key.toLowerCase();
+  if (k === 'z') { if (e.shiftKey) faceEditRedo(); else faceEditUndo(); e.preventDefault(); } else if (k === 'y') { faceEditRedo(); e.preventDefault(); }
+});
 
 // 3D debug overlay: the canonical pose (what drives the rig) drawn as a line
 // skeleton at the pose performer, to spot retarget discrepancies vs the mesh.
@@ -359,7 +371,7 @@ const state = {
   poseEnabled: true, // dev default: pose on at load
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
   poseBackend: 'mediapipe', // default: in-browser BlazePose+Face (no sidecar). 'worker' = onnxruntime-web | 'sidecar'/'sidecar-native' = native ORT over WS
-  poseMediaPipeHands: false, // mediapipe: also run the 21-pt hand landmarker (extra cost)
+  poseMediaPipeHands: true, // mediapipe: run the 21-pt hand landmarker → drives wrist/forearm roll + hand overlay
   poseSidecarDebug: false, // sidecar: console per-frame timing/flow trace
   poseReadback: 'bitmap', // sidecar frame snapshot: 'bitmap'(createImageBitmap) | 'videoframe'(WebCodecs)
   posePreview: true, // sidecar-native: push a low-res webcam JPEG so the overlay isn't blind
@@ -385,7 +397,7 @@ const state = {
   poseMirrorX: false,
   poseMirror: true,
   poseDepthScale: 1, // 1 = accurate (>1 exaggerates depth → arms over-rotate)
-  poseArmLimit: 110, // tighter joint limit for arms (over-rotation guard)
+  poseArmLimit: 178, // arms need near-full range to reach head/face/behind-head. Over-rotation glitches are now caught by the per-bone flip-reject, so the old tight 110° guard just blocked real reaches. 180 = fully free (clamp off).
   poseSmoothing: true,
   poseSmoothMinCutoff: 2,
   poseSmoothBeta: 0.02,
@@ -1529,7 +1541,8 @@ function downloadFaceMasks() {
 const faceEditor = {
   active: false, batchIndex: 0, region: 'jaw', radius: 0.04, strength: 0.5,
   erase: false, symmetric: true, hingeMode: false, editHead: null, batch: null, painting: false,
-  hingeStage: 0, hingeGizmo: null // two-click hinge (0=origin next, 1=axis next); axis line
+  hingeStage: 0, hingeGizmo: null, // two-click hinge (0=origin next, 1=axis next); axis line
+  history: [], histIndex: -1, lastSnapT: 0, lastSnapTag: '' // undo/redo ring
 };
 const REGION_MIRROR = { upperLidL: 'upperLidR', upperLidR: 'upperLidL', browL: 'browR', browR: 'browL' };
 const _rayNDC = new THREE.Vector2();
@@ -1557,21 +1570,40 @@ function setFaceEditMode(on) {
   faceEditor.batch = batch;
   buildEditHead(batch);
   frameEditHead();
+  faceEditResetHistory();
   statusEl.textContent = `Face editor: ${batch.mesh.name} — click the head to paint "${faceEditor.region}" (Erase/Symmetric in panel).`;
 }
 
 // Static clone of the head geometry, placed to the left of the crowd, scaled to a
 // comfortable size, vertex-colored by the current region weight.
+function editHeadMap(headMesh) { // pull the base color map off the head material (may be array)
+  const m = Array.isArray(headMesh.material) ? headMesh.material[0] : headMesh.material;
+  return m && m.map ? m.map : null;
+}
+
 function buildEditHead(batch) {
   const src = batch.faceMask.geom;
+  const N = batch.faceMask.vertexCount;
   const g = new THREE.BufferGeometry();
   const posAttr = src.getAttribute('position').clone();
   g.setAttribute('position', posAttr);
   faceEditor.bindPositions = Float32Array.from(posAttr.array); // bind copy for CPU preview deform
   if (src.index) g.setIndex(src.index.clone());
-  g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(batch.faceMask.vertexCount * 3), 3));
+  if (src.getAttribute('uv')) g.setAttribute('uv', src.getAttribute('uv').clone()); // for texture blend
+  g.setAttribute('aWeight', new THREE.BufferAttribute(new Float32Array(N), 1)); // selected-region weight
   g.computeBoundingBox();
-  const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+
+  // Node material: base = mix(grey, model texture, texAlpha); the selected region's
+  // weight highlights over it in hot orange. So you can paint against the real face
+  // texture (alpha slider) or a flat grey, + wireframe.
+  const mat = new MeshBasicNodeMaterial({ side: THREE.DoubleSide });
+  faceEditor.texAlpha = uniform(0);
+  const map = editHeadMap(batch.faceMask.headMesh);
+  const texRGB = map ? texture(map).rgb : vec3(0.16, 0.16, 0.18);
+  const base = mix(vec3(0.14, 0.14, 0.16), texRGB, faceEditor.texAlpha);
+  const w = attribute('aWeight', 'float');
+  mat.colorNode = mix(base, vec3(1.0, 0.36, 0.1), w.mul(0.9));
+  const mesh = new THREE.Mesh(g, mat);
   mesh.name = 'face-edit-head';
   mesh.frustumCulled = false;
   mesh.renderOrder = 2000;
@@ -1596,19 +1628,16 @@ function frameEditHead() {
   controls.update();
 }
 
-// Edit head color: grey base, current region weight → hot red/yellow.
+// Write the selected region's per-vertex weight into aWeight (the material highlights it).
 function recolorEditHead() {
   const mesh = faceEditor.editHead; const batch = faceEditor.batch;
   if (!mesh || !batch) return;
   const N = batch.faceMask.vertexCount;
   const r = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
   const D = batch.faceMask.mask.data;
-  const col = mesh.geometry.getAttribute('color');
-  for (let i = 0; i < N; i += 1) {
-    const w = D[r * N + i] / 255;
-    col.setXYZ(i, 0.12 + 0.88 * w, 0.12 * (1 - w) + 0.5 * w * w, 0.12 * (1 - w));
-  }
-  col.needsUpdate = true;
+  const wa = mesh.geometry.getAttribute('aWeight');
+  for (let i = 0; i < N; i += 1) wa.setX(i, D[r * N + i] / 255);
+  wa.needsUpdate = true;
 }
 
 // Write one vertex's region weight → mask.data (uint8) + GPU maskAttr (normalized).
@@ -1653,6 +1682,7 @@ function faceEditPaint(worldPoint, erase) {
 // Re-run auto-gen (optionally flipping the assumed +z forward), re-upload, recolor.
 function faceEditReseed(flipForward) {
   const batch = faceEditor.batch || editBatch(); if (!batch) return;
+  faceEditSnapshot('reseed');
   const fm = batch.faceMask;
   if (flipForward) fm.forwardSign = -(fm.forwardSign || 1);
   const geom = fm.geom;
@@ -1673,6 +1703,7 @@ function faceEditReseed(flipForward) {
 
 function faceEditClearRegion() {
   const batch = faceEditor.batch; if (!batch) return;
+  faceEditSnapshot('clear');
   const region = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
   const N = batch.faceMask.vertexCount;
   for (let i = 0; i < N; i += 1) setMaskWeight(batch, region, i, 0);
@@ -1689,10 +1720,12 @@ function faceEditRaycast(e) {
 
 function onFaceEditDown(e) {
   if (!faceEditor.active || !faceEditor.editHead) return;
+  if (e.button === 3 || e.button === 4) return; // aux = undo/redo (window listener)
   const hit = faceEditRaycast(e);
   if (!hit) return; // missed head → let OrbitControls handle it (orbit empty space)
   controls.enabled = false; // paint, don't orbit
-  if (faceEditor.hingeMode) { faceEditSetHinge(hit.point); return; }
+  if (faceEditor.hingeMode) { faceEditSnapshot('hinge'); faceEditSetHinge(hit.point); return; }
+  faceEditSnapshot('paint'); // one undo step per stroke
   faceEditor.painting = true;
   faceEditPaint(hit.point, e.button === 2 || faceEditor.erase);
 }
@@ -1766,6 +1799,40 @@ function pushRegionConfigToStore() {
   setEditorState({ regionConfig: { ...batch.faceMask.mask.config[r] } });
 }
 
+// --- Undo/redo (T30 polish): commit the RESULTING mask (weights + config) AFTER each
+// mutation → history[histIndex] is always the current state, so undo/redo just restore a
+// neighbour. Continuous edits (amount-slider drag, tag 'config') coalesce into one step.
+const cloneConfig = (cfg) => cfg.map((c) => ({ ...c, dir: c.dir.slice(), hingeOrigin: c.hingeOrigin.slice(), hingeAxis: c.hingeAxis.slice() }));
+function faceEditCommit(tag) {
+  const batch = faceEditor.batch; if (!batch) return;
+  const now = performance.now();
+  const coalesce = tag === 'config' && tag === faceEditor.lastSnapTag && now - faceEditor.lastSnapT < 700 && faceEditor.histIndex >= 0;
+  faceEditor.lastSnapTag = tag; faceEditor.lastSnapT = now;
+  const m = batch.faceMask.mask;
+  const snap = { data: Uint8Array.from(m.data), config: cloneConfig(m.config) };
+  if (coalesce) { faceEditor.history[faceEditor.histIndex] = snap; return; } // replace top (no new step)
+  faceEditor.history = faceEditor.history.slice(0, faceEditor.histIndex + 1); // drop redo tail
+  faceEditor.history.push(snap);
+  if (faceEditor.history.length > 60) faceEditor.history.shift();
+  faceEditor.histIndex = faceEditor.history.length - 1;
+  updateUndoState();
+}
+function faceEditRestore(snap) {
+  const batch = faceEditor.batch; if (!batch || !snap) return;
+  const m = batch.faceMask.mask;
+  m.data.set(snap.data);
+  m.config = cloneConfig(snap.config);
+  uploadMaskBuffer(m, batch.faceMask.maskAttr);
+  syncConfigUniforms(batch); recolorEditHead(); deformEditHead(); updateHingeGizmo(); pushRegionConfigToStore();
+  if (batch.faceMaskOverlay) recolorFaceMaskOverlay(batch.faceMaskOverlay);
+}
+function faceEditUndo() { if (faceEditor.histIndex > 0) { faceEditor.histIndex -= 1; faceEditRestore(faceEditor.history[faceEditor.histIndex]); updateUndoState(); } }
+function faceEditRedo() { if (faceEditor.histIndex < faceEditor.history.length - 1) { faceEditor.histIndex += 1; faceEditRestore(faceEditor.history[faceEditor.histIndex]); updateUndoState(); } }
+function updateUndoState() {
+  setEditorState({ canUndo: faceEditor.histIndex > 0, canRedo: faceEditor.histIndex < faceEditor.history.length - 1 });
+}
+function faceEditResetHistory() { faceEditor.history = []; faceEditor.histIndex = -1; faceEditor.lastSnapTag = ''; faceEditSnapshot('init'); }
+
 // CPU preview deform for the edit-head (T30 test-drive): the SAME config-driven form as
 // the GPU faceDeformNode, on the static edit-head so sliders show the effect WYSIWYG.
 const ZERO_EXPR = { jawOpen: 0, smile: 0, pucker: 0, blinkL: 0, blinkR: 0, browL: 0, browR: 0 };
@@ -1833,6 +1900,7 @@ function faceEditFrameView(preset) {
 function faceEditLoadMask(arrayBuffer) {
   const batch = faceEditor.batch; if (!batch) return;
   try {
+    faceEditSnapshot('load');
     const mask = assertMaskFits(decodeFaceMask(arrayBuffer), batch.faceMask.vertexCount);
     batch.faceMask.mask = mask;
     uploadMaskBuffer(mask, batch.faceMask.maskAttr);
@@ -1861,17 +1929,21 @@ function registerEditorActions() {
     // Patch the CURRENT region's deform config (driver/type/amount/dir/mirrorX) live.
     setRegionConfig(patch) {
       const batch = faceEditor.batch; if (!batch) return;
+      faceEditSnapshot('config');
       const r = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
       Object.assign(batch.faceMask.mask.config[r], patch);
       syncConfigUniforms(batch); deformEditHead(); updateHingeGizmo(); pushRegionConfigToStore();
     },
     reseed(flip) { faceEditReseed(flip); },
     clearRegion() { faceEditClearRegion(); deformEditHead(); },
+    undo() { faceEditUndo(); },
+    redo() { faceEditRedo(); },
     save() { downloadFaceMasks(); },
     loadMask(buf) { faceEditLoadMask(buf); },
     setExpr(expr) { debugFaceOverride = expr; deformEditHead(); setEditorState({ expr }); },
     resetExpr() { debugFaceOverride = null; deformEditHead(); setEditorState({ expr: { ...ZERO_EXPR } }); },
     frameView(v) { faceEditFrameView(v); },
+    setTexAlpha(v) { if (faceEditor.texAlpha) faceEditor.texAlpha.value = v; setEditorState({ overlays: { ...editorState.overlays, texAlpha: v } }); },
     setOverlay(k, v) {
       const o = { ...editorState.overlays, [k]: v };
       if (k === 'wireframe' && faceEditor.editHead) faceEditor.editHead.material.wireframe = v;
@@ -1959,7 +2031,7 @@ function updatePerformerLightRig(walker, elapsed) {
 // Per-model emissive trim: some GLBs bake a HOTTER neon map (T Pose Hero) → too much
 // bloom at the global Emissive=1. Scale that model's emissive down without dimming the
 // others. 1 = as-authored; tune per id here.
-const EMISSIVE_SCALE = { Meshy_AI_T_Pose_Hero_biped: 0.5 };
+const EMISSIVE_SCALE = { Meshy_AI_T_Pose_Hero_biped: 0.15 }; // human: subtle glow only — high emissive full-body washed out the shading/shadows
 
 function applyEmissiveBoost(model, meshId) {
   const scale = EMISSIVE_SCALE[meshId] ?? 1;
@@ -2451,10 +2523,12 @@ scene.add(facingArrowBody, facingArrowHead);
 // 3D pose skeleton as octahedron bones + joint markers, fed WORLD-aligned joint
 // positions by updatePoseDebug3D (same mesh anchoring as the green line skeleton) — so
 // it lands on the mesh instead of floating. Replaces the 1px green pose lines.
-const poseSkeleton3D = new PoseSkeleton3D();
+const SKEL_JOINTS = [...Array.from({ length: 23 }, (_, i) => i), ...Array.from({ length: 42 }, (_, i) => 91 + i)]; // body 0-22 + hands 91-132
+const SKEL_EDGES = [...BODY_BONES, ...handEdges(91), ...handEdges(112)];
+const poseSkeleton3D = new PoseSkeleton3D(SKEL_JOINTS, SKEL_EDGES);
 poseSkeleton3D.visible = false;
 scene.add(poseSkeleton3D);
-const _skelJoints = new Array(23).fill(null); // reused world-position buffer
+const _skelJoints = new Array(133).fill(null); // reused world-position buffer (body + hands)
 
 const _faceDir = new THREE.Vector3();
 function updateFacingArrows(retargeter, anchor) {
@@ -2969,7 +3043,7 @@ function updatePoseDebug3D() {
   const oz = hipsW ? hipsW.z : walker.position.z;
   // Per-keypoint world positions → octahedron skeleton. z damped ×0.4 (z is Z_RANGE-
   // scaled, ~larger than x/y — undamped it blows the depth out).
-  for (let i = 0; i < 23; i += 1) {
+  for (const i of SKEL_JOINTS) { // body 0-22 + hands 91-132
     const j = J[i];
     _skelJoints[i] = (j && j.confidence >= state.poseKptThresh)
       ? { x: ox + j.x * s, y: oy + j.y * s, z: oz + j.z * s * 0.4 }

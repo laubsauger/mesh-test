@@ -5,9 +5,14 @@
 //
 // Reads the unzipped source under public/bipeds/, writes public/models/<id>.glb
 // and rewrites public/bipeds-manifest.json. Run: npm run optimize:bipeds
-import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// INCREMENTAL by default: a character whose public/models/<id>.glb is already newer than
+// its source clips is skipped (kept in the manifest, not rebuilt). --force rebuilds all.
+const FORCE = process.argv.includes('--force');
 
 // gltf-transform is NOT a project dependency — it pulls native deps (sharp) that
 // break cross-platform CI lockfiles, and it's only needed for this one-off asset
@@ -75,8 +80,7 @@ function addClip(io, base, root, baseNodes, clipName, sourceDoc) {
 }
 
 const io = new NodeIO();
-await rm(outDir, { recursive: true, force: true });
-await mkdir(outDir, { recursive: true });
+await mkdir(outDir, { recursive: true }); // no wipe — incremental keeps already-built GLBs
 
 const folders = (await readdir(sourceDir, { withFileTypes: true }))
   .filter((entry) => entry.isDirectory())
@@ -98,6 +102,18 @@ for (const folder of folders) {
     continue;
   }
 
+  const outPath = join(outDir, `${folder}.glb`);
+  // INCREMENTAL: reuse the existing GLB if it's newer than every source clip.
+  if (!FORCE && existsSync(outPath)) {
+    const outM = (await stat(outPath)).mtimeMs;
+    const srcM = Math.max(...await Promise.all(present.map(async (n) => (await stat(byAnimation.get(n))).mtimeMs)));
+    if (outM >= srcM) {
+      meshes.push({ id: folder, name: cleanName(folder), url: `models/${folder}.glb`, animations: present });
+      console.log(`skip ${folder} (up to date)`);
+      continue;
+    }
+  }
+
   const base = await io.read(byAnimation.get(present[0]));
   const baseRoot = base.getRoot();
   baseRoot.listAnimations()[0].setName(present[0]);
@@ -117,7 +133,7 @@ for (const folder of folders) {
   for (const accessor of baseRoot.listAccessors()) accessor.setBuffer(main);
   for (let i = 1; i < buffers.length; i += 1) buffers[i].dispose();
 
-  await io.write(join(outDir, `${folder}.glb`), base);
+  await io.write(outPath, base);
   meshes.push({ id: folder, name: cleanName(folder), url: `models/${folder}.glb`, animations: present });
   console.log(`built ${folder} (${present.join(' + ')})`);
 }
