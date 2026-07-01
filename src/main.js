@@ -1716,6 +1716,13 @@ function reportAssetProgress() {
 
 let poseProvider = null;
 let poseOverlayCtx = null;
+// Match the PiP box aspect to the actual overlay-canvas dims (native crop = 3:4 model
+// aspect, worker webcam = 4:3/16:9). Without this the fixed 16:9 CSS box clips the feed.
+function syncPipAspect() {
+  if (poseOverlayEl.width && poseOverlayEl.height) {
+    posePipEl.style.aspectRatio = `${poseOverlayEl.width} / ${poseOverlayEl.height}`;
+  }
+}
 let poseLoopActive = false;
 let poseLoopId = 0; // generation guard — only the latest loop runs (no stacking)
 let latestCanonical = null;
@@ -1931,6 +1938,7 @@ async function startPose() {
     else { poseVideoEl.srcObject = null; }
     poseOverlayEl.width = poseProvider.video.videoWidth || 1280;
     poseOverlayEl.height = poseProvider.video.videoHeight || 720;
+    syncPipAspect();
     poseOverlayCtx = poseOverlayEl.getContext('2d');
     poseLoopActive = true;
     posePipLabel.textContent = `pose: ${label}`;
@@ -1975,6 +1983,7 @@ async function poseLoop(myId) {
       if (vw && poseOverlayEl.width !== vw) {
         poseOverlayEl.width = vw;
         poseOverlayEl.height = vh;
+        syncPipAspect(); // match the pip box to the feed/crop aspect so nothing is clipped
       }
       poseRecorder.capture(frame);
       consumePoseFrame(frame);
@@ -2026,6 +2035,7 @@ function startReplay() {
   const meta = poseRecorder.metadata ?? {};
   poseOverlayEl.width = meta.inputWidth || poseOverlayEl.width || 1280;
   poseOverlayEl.height = meta.inputHeight || poseOverlayEl.height || 720;
+  syncPipAspect();
   poseOverlayCtx = poseOverlayEl.getContext('2d');
   posePipEl.hidden = false;
   posePipLabel.textContent = `replay: ${poseRecorder.length}f`;
