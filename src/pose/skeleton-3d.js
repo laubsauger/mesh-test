@@ -41,39 +41,23 @@ export class PoseSkeleton3D extends THREE.Group {
     }
   }
 
-  // canonical = CanonicalPoseObservation (pelvis-centered, +y up). The raw canonical is
-  // NOT scale-stable (bbox jitter pulses the keypoint magnitudes), so we normalize per
-  // frame by the TORSO length (pelvis→shoulder-center) to a fixed world size, smoothed —
-  // the bones stay a constant length instead of scaling up/down. `targetTorso` = world
-  // torso length. Octahedron stretched along its length → tapered bone.
-  update(canonical, kptThresh, targetTorso = 0.5, width = 0.02) {
-    const j = canonical?.joints;
-    if (!j) { this.visible = false; return; }
-    this.visible = true;
-    const ls = j[5]; const rs = j[6]; // shoulders (pelvis = origin)
-    // Scale from the 2D torso (x/y ONLY): x/y are crop-normalized, but z is a DIFFERENT
-    // normalization (Z_RANGE, ~4× bigger) that jitters separately — mixing them made the
-    // skeleton scale/distort on all axes. Damp z (ZD) so depth matches the x/y scale.
-    const torso2d = ls && rs ? Math.hypot((ls.x + rs.x) / 2, (ls.y + rs.y) / 2) : 0;
-    const raw = torso2d > 1e-3 ? targetTorso / torso2d : (this._scale || 1);
-    this._scale = this._scale ? this._scale + (raw - this._scale) * 0.12 : raw; // smooth
-    const scale = this._scale;
-    const ZD = 0.35; // depth damp → z in the same visual scale as x/y
-    const put = (v, p) => v.set(p.x * scale, p.y * scale, p.z * scale * ZD);
+  // worldJoints = array indexed by keypoint (0..22): {x,y,z} in WORLD coords (already
+  // mesh-aligned + scaled by the caller), or null/undefined if not confident. The helper
+  // just draws spheres at the joints + a stretched octahedron along each bone edge.
+  update(worldJoints, width = 0.022) {
     for (let i = 0; i < 23; i += 1) {
-      const p = j[i];
-      const vis = !!(p && p.confidence >= kptThresh);
-      this.joints[i].visible = vis;
-      if (vis) put(this.joints[i].position, p);
+      const p = worldJoints[i];
+      this.joints[i].visible = !!p;
+      if (p) this.joints[i].position.set(p.x, p.y, p.z);
     }
     for (const b of this.bones) {
-      const pa = j[b.a];
-      const pb = j[b.b];
-      const vis = !!(pa && pb && pa.confidence >= kptThresh && pb.confidence >= kptThresh);
+      const pa = worldJoints[b.a];
+      const pb = worldJoints[b.b];
+      const vis = !!(pa && pb);
       b.m.visible = vis;
       if (!vis) continue;
-      put(_va, pa);
-      put(_vb, pb);
+      _va.set(pa.x, pa.y, pa.z);
+      _vb.set(pb.x, pb.y, pb.z);
       b.m.position.copy(_va).add(_vb).multiplyScalar(0.5);
       _dir.copy(_vb).sub(_va);
       const len = _dir.length();

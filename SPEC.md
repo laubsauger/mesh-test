@@ -97,8 +97,8 @@ T23|.|correction-measurement + diagnostics debug (§45, §2488): per-stage delta
 T24|.|tracking-quality modes (§44): fullBody|upperBodyOnly|holdLastPose|recovering|lost; degrade region ⊥ whole avatar|V18
 T25|.|pose families (§28): neutral/squat/single-support/lunge/kneeRaise → adjust solver weights, ⊥ canned anim (anchored/hybrid only)|V9
 T26|x|**face phase 1 — extract**: `FaceExpression` from landmarks 23-90 → 7 scalars (MAR jawOpen, corner-width smile, pucker, EAR blinkL/R, brow-eye browL/R); neutral calib + OneEuro; Inspector live plot. Also fix `MIRROR_INDEX` face gap (add 23-90 L/R pairs)|V26,V30,I.faceExpr
-T27|.|**face phase 2 — mask**: auto-gen region weights from mesh geometry (Y-bands + symmetry + anchors, ⊥ landmarks); write `public/models/<id>.face-mask.bin` (header + per-vtx uint8/region); loader w/ vertexCount THROW guard; vertex-color debug overlay|V27,V28,I.faceMask
-T28|.|**face phase 3 — deform**: `positionNode` reads mask + per-instance expr instanced attr; hinge-rotate jaw + translate lowerLip/mouthCorner/eyelid/brow. Scope jaw+mouth FIRST, eyes after. Normals skipped (note; fix if lighting reads wrong). ✅ hero performer opens mouth/blinks in webcam sync|V29,I.faceMask,I.faceExpr
+T27|x|**face phase 2 — mask**: auto-gen region weights from mesh geometry (Y-bands + symmetry + anchors, ⊥ landmarks); write `public/models/<id>.face-mask.bin` (header + per-vtx uint8/region); loader w/ vertexCount THROW guard; vertex-color debug overlay|V27,V28,I.faceMask
+T28|~|**face phase 3 — deform**: `positionNode` reads mask + per-instance expr instanced attr; hinge-rotate jaw + translate lowerLip/mouthCorner/eyelid/brow. Scope jaw+mouth FIRST, eyes after. Normals skipped (note; fix if lighting reads wrong). ✅ hero performer opens mouth/blinks in webcam sync|V29,I.faceMask,I.faceExpr
 T29|.|**face phase 4 (gated on T28 quality)**: in-app mask painter — raycast brush per region, edit hinge/anchor params, save `.bin`. Skip if auto-gen good enough|I.faceMask,I.inspector
 
 ## §B BUGS

@@ -173,6 +173,10 @@ export class Retargeter {
     this.clampPeak = new Map(); // V19: boneKey → worst { raw°, max°, over° } since reset
     this.torsoFacing = new FacingEstimator(); // 2D-foreshortening yaw (flip-safe, no z-sign spin)
     this.headFacing = new FacingEstimator();
+    this._flipHold = new Map(); // boneKey → consecutive pose-frames a big jump has persisted
+    this._lastCanon = null; // reference → detect a NEW pose frame (vs a repeated render frame)
+    this._fresh = false;
+    this.flipRejectDeg = 180; // per-bone jump gate (deg); 180 = off. Set from apply().
     this._captureBind();
   }
 
@@ -355,6 +359,25 @@ export class Retargeter {
     if (!cur) {
       cur = bind.restLocalQuat.clone();
       this.smoothed.set(boneKey, cur);
+    }
+    // PER-BONE JUMP REJECT: a single bone flipping huge in one pose-frame (a leg twisting
+    // 180° while you stand still, a hand spinning) is a monocular glitch the whole-pose
+    // gate can't see. If the target is a big jump from the held value, DON'T chase it —
+    // only accept once it has PERSISTED a couple pose-frames (= real fast motion). Held
+    // across render frames (cur doesn't move → the jump stays big); the counter advances
+    // only on a fresh pose-frame.
+    if (this.flipRejectDeg < 180) {
+      const stepDeg = 2 * Math.acos(Math.min(1, Math.abs(cur.dot(_qLocal)))) / DEG2RAD;
+      if (stepDeg > this.flipRejectDeg) {
+        if (this._fresh) this._flipHold.set(boneKey, (this._flipHold.get(boneKey) || 0) + 1);
+        if ((this._flipHold.get(boneKey) || 0) <= 2) { // hold up to 2 pose-frames, then trust it
+          bone.quaternion.copy(cur); // suppress: hold last good
+          bone.updateWorldMatrix(false, false);
+          return;
+        }
+      } else if (this._fresh) {
+        this._flipHold.set(boneKey, 0); // target settled near cur → reset
+      }
     }
     cur.slerp(_qLocal, follow >= 1 ? 1 : follow);
     bone.quaternion.copy(cur);
@@ -640,7 +663,10 @@ export class Retargeter {
   // the yaw estimator learns THIS person/distance's frontal shoulder/ear width).
   recalibrateFacing() { this.torsoFacing.r0 = 0; this.headFacing.r0 = 0; }
 
-  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, facingDeadzone = 0.17, facingSmooth = 0.15, facingBodyGain = 1, headPitchGain = 2, clavicle = false } = {}) {
+  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, facingDeadzone = 0.17, facingSmooth = 0.15, facingBodyGain = 1, headPitchGain = 2, flipReject = 70, clavicle = false } = {}) {
+    this._fresh = canonical !== this._lastCanon; // new pose-frame vs a repeated render-frame
+    this._lastCanon = canonical;
+    this.flipRejectDeg = flipReject;
     this.restPose();
     this.rig.hips.position.y = this.hipsRestPosY; // reset (restPose only touches rotations)
     this.clampStats.clear(); // V19: only THIS frame's aimed bones report clamps

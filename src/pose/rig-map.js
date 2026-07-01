@@ -94,8 +94,10 @@ export const SEGMENTS = [
   { bone: 'rightFoot', from: kpt(KPT.rightAnkle), to: kpt(KPT.rightBigToe), zTrust: 0.4 },
   // Hands: wrist → middle-finger base. Leaf bones (no child) — bind dir captured
   // from forearm→hand. Drives wrist bend; twist (pronation) is a follow-up.
-  { bone: 'leftHand', from: kpt(KPT.leftWrist), to: kpt(KPT.leftMiddleBase), zTrust: 1 },
-  { bone: 'rightHand', from: kpt(KPT.rightWrist), to: kpt(KPT.rightMiddleBase), zTrust: 1 },
+  // z DAMPED (0.35): the hand keypoints (middle-finger base) are the noisiest, and full
+  // z-trust spun the hand wildly. The wrist bend reads mostly from x/y anyway.
+  { bone: 'leftHand', from: kpt(KPT.leftWrist), to: kpt(KPT.leftMiddleBase), zTrust: 0.35 },
+  { bone: 'rightHand', from: kpt(KPT.rightWrist), to: kpt(KPT.rightMiddleBase), zTrust: 0.35 },
   // NOTE: no 'spine' segment — the Meshy 'Spine' bone's child sits BELOW it
   // (Spine→Spine01 = -y), so aiming it up is a ~180° flip → degenerate chest roll
   // (one shoulder up/down, see §B). Torso lean is driven via Hips instead.

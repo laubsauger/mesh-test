@@ -5,10 +5,13 @@ import {
   Fn,
   add,
   attributeArray,
+  cos,
   emissive,
   float,
   instanceIndex,
   mix,
+  sign,
+  sin,
   mrt,
   normalView,
   output,
@@ -42,6 +45,8 @@ import { drawOverlay } from './pose/overlay-2d.js';
 import { toCanonical, mirrorCanonical } from './pose/observation-adapter.js';
 import { Retargeter } from './pose/retargeter.js';
 import { FaceExpressionExtractor } from './pose/face-expression.js';
+import { generateFaceMask, decodeFaceMask, encodeFaceMask, assertMaskFits, FACE_REGIONS } from './pose/face-mask.js';
+import { MESHY_BONES } from './pose/rig-map.js';
 import { KPT, NUM_KPTS, RTMW_VARIANTS, YOLO_RES_OPTIONS } from './pose/rtmw-constants.js';
 import { CanonicalSmoother } from './pose/one-euro.js';
 import { PoseRecorder, PosePlayer } from './pose/recorder.js';
@@ -356,6 +361,14 @@ const state = {
   // NOTE: rtmw3d only ships as l and x — there is NO 3D "m" (the "m" upstream is 2D rtmw, no depth).
   poseYoloRes: 320, // yolo detector input res: 320/384/512 (files committed)
   poseKptThresh: 0.3,
+  faceMaskDebug: false, // T27: show face-mask region weights as a colored vertex cloud
+  faceMaskRegion: 'jaw', // which region the overlay colors
+  faceDrive: true, // T28: apply face deform (jaw/lips/lids/brows) from expression scalars
+  faceJawAngle: 0.5, // max jaw hinge open (radians, ~28°) at jawOpen=1
+  faceLipDrop: 0.06, // lower-lip drop as a fraction of head height at jawOpen=1
+  faceCornerMove: 0.05, // mouth-corner spread(smile)/narrow(pucker), fraction of head height
+  faceLidDrop: 0.06, // upper-lid close travel, fraction of head height at blink=1
+  faceBrowRaise: 0.04, // brow raise, fraction of head height at brow=1
   poseRetarget: true,
   poseMirrorX: false,
   poseMirror: true,
@@ -381,8 +394,8 @@ const state = {
   poseTwistSmooth: 0.12,
   poseHeadGain: 0.7,
   poseFacingDebug: false, // draw detected body/head facing as arrows (PiP compass + 3D on performer)
-  poseSkeleton3D: false, // draw the detected pose as 3D octahedron bones + joint markers on the performer
   poseRejectOutliers: true,
+  poseFlipReject: 70, // per-bone: a target jump > this° in one pose-frame is held unless it persists (kills leg/hand 180° flips). 180 = off
   poseMaxJump: 0.5,
   poseHoldMs: 2000,
   poseBoneGate: false, // OFF: 3D limb-length gate rejects 32-40% of TURNED frames (monocular z varies) → freeze. Velocity gate covers teleports.
@@ -390,7 +403,7 @@ const state = {
   poseGroundFollow: 0.3,
   poseOverlay: true,
   poseDebug3D: false,
-  poseDebugScale: 3,
+  poseDebugScale: 1, // fine-tune on top of the auto mesh-height scale (1 = matched to the rig)
   poseDebugHeight: 1,
   poseDetectEveryN: 2,
   poseRecording: false,
@@ -748,6 +761,7 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseWristTwist').name('Wrist Twist (hands)').listen();
   poseGroup.add(state, 'poseHeadGain', 0.1, 1.5, 0.01).name('Head Gain');
   poseGroup.add(state, 'poseRejectOutliers').name('Reject Jumps').listen();
+  poseGroup.add(state, 'poseFlipReject', 20, 180, 5).name('Bone Flip Reject (°)');
   poseGroup.add(state, 'poseMaxJump', 0.1, 1.5, 0.01).name('Max Jump');
   poseGroup.add(state, 'poseHoldMs', 200, 6000, 50).name('Hold Last (ms)');
   poseGroup.add(state, 'calibratePose').name('Calibrate (hold A-pose)');
@@ -758,9 +772,6 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseOverlay').name('2D Overlay').listen();
   poseGroup.add(state, 'poseFacingDebug').name('Facing Debug (arrows)').listen().onChange((on) => {
     if (!on) { facingArrowBody.visible = false; facingArrowHead.visible = false; }
-  });
-  poseGroup.add(state, 'poseSkeleton3D').name('3D Pose Skeleton').listen().onChange((on) => {
-    if (!on) poseSkeleton3D.visible = false;
   });
   poseGroup.add(state, 'poseDebug3D').name('Pose Debug 3D').listen();
   poseGroup.add(state, 'poseDebugScale', 0.2, 3, 0.01).name('Debug Scale');
@@ -820,6 +831,17 @@ function buildInspectorControls() {
   faceGroup.add(faceStats, 'browL').name('Brow L').listen();
   faceGroup.add(faceStats, 'browR').name('Brow R').listen();
   faceGroup.add({ recalibrate: () => faceExpr.recalibrateNeutral() }, 'recalibrate').name('Recalibrate Neutral (rest face)');
+  // T28: face deform toggle + amount tuning (live uniforms, no rebuild).
+  faceGroup.add(state, 'faceDrive').name('Face Drive (deform)');
+  faceGroup.add(state, 'faceJawAngle', 0, 1.2, 0.01).name('Jaw Angle (rad)');
+  faceGroup.add(state, 'faceLipDrop', 0, 0.2, 0.005).name('Lip Drop');
+  faceGroup.add(state, 'faceCornerMove', 0, 0.2, 0.005).name('Mouth Corner');
+  faceGroup.add(state, 'faceLidDrop', 0, 0.2, 0.005).name('Lid Close');
+  faceGroup.add(state, 'faceBrowRaise', 0, 0.2, 0.005).name('Brow Raise');
+  // T27: region-mask debug + persistence.
+  faceGroup.add(state, 'faceMaskDebug').name('Mask Debug (verts)').onChange(refreshFaceMaskOverlays);
+  faceGroup.add(state, 'faceMaskRegion', FACE_REGIONS).name('Mask Region').onChange(refreshFaceMaskOverlays);
+  faceGroup.add({ download: downloadFaceMasks }, 'download').name('Download Face Masks (.bin)');
 
   const statsGroup = renderer.inspector.createParameters('VJ Layer / Render Stats');
   statsGroup.add(statsState, 'fps').name('FPS').listen();
@@ -1053,6 +1075,10 @@ async function loadCrowdBatch(mesh, animationAsset, batchWalkers) {
   }
 
   source.updateMatrixWorld(true);
+  // T27/T28: build the face mask + its GPU buffers (expr + mask storage, hinge/amount
+  // uniforms) BEFORE the compute nodes, so createComputedSkinnedMesh can inject the
+  // face deform for the head mesh (reads batch.faceExprNode / batch.faceMask.maskNode).
+  await buildFaceMask(batch, mesh, skinnedMeshes);
   for (const skinnedMesh of skinnedMeshes) createComputedSkinnedMesh(skinnedMesh, batch);
 
   // Rest LOCAL quats in the NORMALIZED source space — bones are still at GLB rest
@@ -1194,7 +1220,13 @@ function createComputedSkinnedMesh(sourceMesh, batch) {
     const boneOffset = meshInstance.mul(uint(skeletonState.boneCount));
     const indices = skinIndices.element(sourceVertex);
     const weights = skinWeights.element(sourceVertex);
-    const skinVertex = bindMatrix.mul(vec4(sourceVertices.element(sourceOffset).xyz, 1));
+    // T28: displace the bind-space head vertex from the face expression before
+    // skinning (only the head mesh carries a mask). Non-head meshes skin unchanged.
+    let srcPos = sourceVertices.element(sourceOffset).xyz;
+    if (batch.faceMask && sourceMesh === batch.faceMask.headMesh) {
+      srcPos = faceDeformNode(srcPos, sourceVertex, meshInstance, batch.faceMask, batch);
+    }
+    const skinVertex = bindMatrix.mul(vec4(srcPos, 1));
     const boneMatX = skeletonState.boneMatricesNode.element(boneOffset.add(indices.x));
     const boneMatY = skeletonState.boneMatricesNode.element(boneOffset.add(indices.y));
     const boneMatZ = skeletonState.boneMatricesNode.element(boneOffset.add(indices.z));
@@ -1251,6 +1283,203 @@ function createComputedSkinnedMesh(sourceMesh, batch) {
   computedMesh.frustumCulled = false;
   batch.source.add(computedMesh);
   batch.computeNodes.push(computeNode);
+}
+
+// --- T27: face-region mask (build / overlay / persist) ------------------------
+const _faceMaskOverlays = new Set(); // debug vertex clouds, recolored on region change
+const _faceMaskV = new THREE.Vector3();
+
+// Flatten a possibly-interleaved attribute into a plain typed array [i*n+c] — the
+// pure generator (face-mask.js) assumes that contiguous layout.
+function flatAttr(attr, n, Ctor) {
+  const out = new Ctor(attr.count * n);
+  for (let i = 0; i < attr.count; i += 1) for (let c = 0; c < n; c += 1) out[i * n + c] = attr.getComponent(i, c);
+  return out;
+}
+
+// Load-or-generate the region mask for a batch's head mesh, then stand up the GPU
+// buffers the deform reads: a per-instance expression buffer + a per-vertex mask
+// buffer + hinge/amount uniforms. Sidecar `.bin` (T29 painter output) wins when
+// present + valid; else auto-gen from geometry (V27). No head bone / no head verts →
+// face-drive off for this model (⊥ crash the crowd, V28).
+async function buildFaceMask(batch, mesh, skinnedMeshes) {
+  batch.faceMask = null;
+  batch.faceExpr = null;
+
+  // Head mesh + Head bone index from the skinned mesh's own skeleton (available now,
+  // before skeletonStates are built in the compute loop).
+  let headMesh = null; let headBoneIndex = -1; let headVerts = -1;
+  for (const sm of skinnedMeshes) {
+    const hbi = sm.skeleton ? sm.skeleton.bones.findIndex((b) => b.name === MESHY_BONES.head) : -1;
+    const si = sm.geometry.getAttribute('skinIndex');
+    const sw = sm.geometry.getAttribute('skinWeight');
+    if (hbi < 0 || !si || !sw) continue;
+    let n = 0;
+    for (let i = 0; i < si.count; i += 1) {
+      for (let k = 0; k < 4; k += 1) { if (si.getComponent(i, k) === hbi && sw.getComponent(i, k) > 0.5) { n += 1; break; } }
+    }
+    if (n > headVerts) { headVerts = n; headMesh = sm; headBoneIndex = hbi; }
+  }
+  if (!headMesh || headVerts <= 0) { console.warn(`[face] ${mesh.name}: no head-weighted verts / '${MESHY_BONES.head}' bone — face-drive off`); return; }
+
+  const geom = headMesh.geometry;
+  const vertexCount = geom.getAttribute('position').count;
+
+  let mask = null; let source = 'generated';
+  try {
+    const res = await fetch(assetUrl(`models/${mesh.id}.face-mask.bin`));
+    if (res.ok) { mask = assertMaskFits(decodeFaceMask(await res.arrayBuffer()), vertexCount); source = 'loaded (.bin)'; }
+  } catch (err) {
+    console.warn(`[face] ${mesh.name}: sidecar invalid (${err.message}) — regenerating`);
+  }
+  if (!mask) {
+    mask = generateFaceMask({
+      positions: flatAttr(geom.getAttribute('position'), 3, Float32Array),
+      skinIndices: flatAttr(geom.getAttribute('skinIndex'), 4, Uint16Array),
+      skinWeights: flatAttr(geom.getAttribute('skinWeight'), 4, Float32Array),
+      count: vertexCount,
+      headBoneIndex
+    });
+  }
+
+  // Per-instance expression buffer: 2 vec4/instance = [jawOpen,smile,pucker,blinkL |
+  // blinkR,browL,browR,_]. Updated CPU-side each frame (writeFaceExpr), read in compute.
+  const nWalkers = batch.walkers.length;
+  batch.faceExpr = new StorageBufferAttribute(nWalkers * 2, 4);
+  batch.faceExprNode = storage(batch.faceExpr, 'vec4', nWalkers * 2).toReadOnly();
+
+  // Per-vertex mask buffer: 2 vec4/vertex = [jaw,lowerLip,mouthCorner,upperLidL |
+  // upperLidR,browL,browR,_], normalized 0..1. Static (fill once).
+  const maskAttr = new StorageBufferAttribute(vertexCount * 2, 4);
+  const arr = maskAttr.array;
+  const D = mask.data; const N = vertexCount;
+  for (let i = 0; i < N; i += 1) {
+    const o = i * 8;
+    arr[o] = D[0 * N + i] / 255; arr[o + 1] = D[1 * N + i] / 255; arr[o + 2] = D[2 * N + i] / 255; arr[o + 3] = D[3 * N + i] / 255;
+    arr[o + 4] = D[4 * N + i] / 255; arr[o + 5] = D[5 * N + i] / 255; arr[o + 6] = D[6 * N + i] / 255; arr[o + 7] = 0;
+  }
+  maskAttr.needsUpdate = true;
+  const maskNode = storage(maskAttr, 'vec4', vertexCount * 2).toReadOnly();
+
+  // Hinge + amount uniforms (amounts driven live from state each frame; 0 when
+  // faceDrive is off → no deform without a rebuild).
+  const axis = new THREE.Vector3(mask.hinge.axis[0], mask.hinge.axis[1], mask.hinge.axis[2]);
+  if (axis.lengthSq() < 1e-8) axis.set(1, 0, 0); else axis.normalize();
+  batch.faceUniforms = {
+    hingeOrigin: uniform(new THREE.Vector3(mask.hinge.origin[0], mask.hinge.origin[1], mask.hinge.origin[2])),
+    hingeAxis: uniform(axis),
+    headHeight: uniform(mask.headHeight || 1),
+    jawAngle: uniform(0),
+    lipDrop: uniform(0),
+    cornerMove: uniform(0),
+    lidDrop: uniform(0),
+    browRaise: uniform(0)
+  };
+
+  batch.faceMask = { mask, headMesh, headBoneIndex, vertexCount, source, maskNode };
+  console.log(`[face] ${mesh.name}: mask ${source}, ${vertexCount} verts, head bone ${headBoneIndex}`);
+  buildFaceMaskOverlay(batch);
+}
+
+// Face deform (T28 / V29): displace the BIND-space head vertex before skinning, so the
+// head bone carries the motion. Jaw = hinge-rotate (Rodrigues about the ear-line axis);
+// lips/lids/brows = translate along mesh-local up. Normals unchanged (V29 note).
+function faceDeformNode(pos, sourceVertex, meshInstance, fm, batch) {
+  const u = batch.faceUniforms;
+  const mi2 = meshInstance.mul(uint(2));
+  const sv2 = sourceVertex.mul(uint(2));
+  const maskA = fm.maskNode.element(sv2);            // jaw, lowerLip, mouthCorner, upperLidL
+  const maskB = fm.maskNode.element(sv2.add(uint(1))); // upperLidR, browL, browR, _
+  const exprA = batch.faceExprNode.element(mi2);       // jawOpen, smile, pucker, blinkL
+  const exprB = batch.faceExprNode.element(mi2.add(uint(1))); // blinkR, browL, browR, _
+
+  // Jaw hinge — Rodrigues rotate (pos-origin) about the unit axis by θ, add the delta.
+  const theta = u.jawAngle.mul(exprA.x).mul(maskA.x);
+  const v = pos.sub(u.hingeOrigin);
+  const k = u.hingeAxis;
+  const c = cos(theta); const s = sin(theta);
+  const vrot = v.mul(c).add(k.cross(v).mul(s)).add(k.mul(k.dot(v)).mul(c.oneMinus()));
+  let p = pos.add(vrot.sub(v));
+
+  const hh = u.headHeight;
+  // lower lip follows jaw open, drops in mesh-local −y.
+  p = p.add(vec3(0, u.lipDrop.mul(hh).mul(exprA.x).mul(maskA.y).negate(), 0));
+  // mouth corners: smile spreads outward (±x), pucker narrows (net = smile−pucker).
+  const dir = sign(pos.x.sub(u.hingeOrigin.x));
+  const corner = u.cornerMove.mul(hh).mul(exprA.y.sub(exprA.z)).mul(maskA.z);
+  p = p.add(vec3(dir.mul(corner), 0, 0));
+  // upper lids close downward (−y): L=(blinkL,maskA.w), R=(blinkR,maskB.x).
+  const lid = u.lidDrop.mul(hh);
+  p = p.add(vec3(0, lid.mul(exprA.w).mul(maskA.w).add(lid.mul(exprB.x).mul(maskB.x)).negate(), 0));
+  // brows raise (+y): L=(browL,maskB.y), R=(browR,maskB.z).
+  const brow = u.browRaise.mul(hh);
+  p = p.add(vec3(0, brow.mul(exprB.y).mul(maskB.y).add(brow.mul(exprB.z).mul(maskB.z)), 0));
+  return p;
+}
+
+// Debug cloud: head verts at bind-pose world position, colored by the selected
+// region's weight (dark → hot). Standalone Points → cannot disturb the render path.
+function buildFaceMaskOverlay(batch) {
+  if (!batch.faceMask) return;
+  const { headMesh, vertexCount } = batch.faceMask;
+  headMesh.updateWorldMatrix(true, false);
+  const src = headMesh.geometry.getAttribute('position');
+  const positions = new Float32Array(vertexCount * 3);
+  for (let i = 0; i < vertexCount; i += 1) {
+    _faceMaskV.fromBufferAttribute(src, i).applyMatrix4(headMesh.matrixWorld);
+    positions[i * 3] = _faceMaskV.x; positions[i * 3 + 1] = _faceMaskV.y; positions[i * 3 + 2] = _faceMaskV.z;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3));
+  // Additive + no depth-test: zero-weight verts are black → invisible; region verts
+  // glow THROUGH the crowd (the overlay sits at the hidden template at the origin, so
+  // depth-testing buried it behind the real instances).
+  const pts = new THREE.Points(g, new THREE.PointsMaterial({
+    size: 0.02, sizeAttenuation: true, vertexColors: true, depthTest: false, transparent: true, blending: THREE.AdditiveBlending
+  }));
+  pts.name = `face-mask-overlay-${batch.mesh.id}`;
+  pts.frustumCulled = false;
+  pts.renderOrder = 1002;
+  pts.visible = state.faceMaskDebug;
+  pts.userData.batch = batch;
+  scene.add(pts);
+  batch.faceMaskOverlay = pts;
+  _faceMaskOverlays.add(pts);
+  recolorFaceMaskOverlay(pts);
+}
+
+function recolorFaceMaskOverlay(pts) {
+  const { mask, vertexCount } = pts.userData.batch.faceMask;
+  const region = Math.max(0, FACE_REGIONS.indexOf(state.faceMaskRegion));
+  const col = pts.geometry.getAttribute('color');
+  const off = region * vertexCount;
+  for (let i = 0; i < vertexCount; i += 1) {
+    const w = mask.data[off + i] / 255;
+    col.setXYZ(i, w * 1.4, w * w * 0.9, w * 0.12); // black(0) → red → yellow (additive)
+  }
+  col.needsUpdate = true;
+}
+
+function refreshFaceMaskOverlays() {
+  for (const pts of _faceMaskOverlays) { pts.visible = state.faceMaskDebug; if (state.faceMaskDebug) recolorFaceMaskOverlay(pts); }
+}
+
+// Persist the current masks so painter edits / a chosen auto-gen survive. Browser
+// can't write public/ → download; drop the files into public/models/ and commit.
+function downloadFaceMasks() {
+  let n = 0;
+  for (const batch of crowdBatches) {
+    if (!batch.faceMask) continue;
+    const blob = new Blob([encodeFaceMask(batch.faceMask.mask)], { type: 'application/octet-stream' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${batch.mesh.id}.face-mask.bin`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    n += 1;
+  }
+  statusEl.textContent = n ? `Downloaded ${n} face mask(s) → commit into public/models/` : 'No face masks to download.';
 }
 
 function createPerformerLightRig(index) {
@@ -1565,6 +1794,33 @@ function updateWalkerInstanceMatrix(walker) {
   transformMatrix.toArray(walker.batch.instanceMatrices.array, walker.batchIndex * 16);
 }
 
+// T28: push the tracked face expression into a walker's per-instance slot. Pose
+// performers get the live scalars (when faceDrive is on); everyone else = neutral.
+function writeFaceExpr(walker, batch) {
+  if (!batch.faceExpr) return;
+  const arr = batch.faceExpr.array;
+  const o = walker.batchIndex * 8;
+  const e = (walker.boneSource === 'pose' && state.faceDrive && latestFaceExpr) ? latestFaceExpr : null;
+  if (e) {
+    arr[o] = e.jawOpen; arr[o + 1] = e.smile; arr[o + 2] = e.pucker; arr[o + 3] = e.blinkL;
+    arr[o + 4] = e.blinkR; arr[o + 5] = e.browL; arr[o + 6] = e.browR; arr[o + 7] = 0;
+  } else {
+    for (let k = 0; k < 8; k += 1) arr[o + k] = 0;
+  }
+}
+
+// Live-tune the deform amounts from state; 0 when faceDrive is off (no rebuild).
+function updateFaceUniforms(batch) {
+  const u = batch.faceUniforms;
+  if (!u) return;
+  const on = state.faceDrive;
+  u.jawAngle.value = on ? state.faceJawAngle : 0;
+  u.lipDrop.value = on ? state.faceLipDrop : 0;
+  u.cornerMove.value = on ? state.faceCornerMove : 0;
+  u.lidDrop.value = on ? state.faceLidDrop : 0;
+  u.browRaise.value = on ? state.faceBrowRaise : 0;
+}
+
 function choreoOpts() {
   return {
     choreography: state.choreography,
@@ -1627,6 +1883,7 @@ function computePoseMatrices(batch) {
         facingSmooth: state.poseFacingSmooth,
         facingBodyGain: state.poseFacingBodyGain,
         headPitchGain: state.poseHeadPitchGain,
+        flipReject: state.poseFlipReject,
         clavicle: state.poseClavicle
       });
       // V19: surface which bones the joint-limit clamp throttled (e.g. face-touch
@@ -1634,7 +1891,6 @@ function computePoseMatrices(batch) {
       // 'Dump Clamps' button prints the full table + resets.
       lastPoseRetargeter = batch.retargeter;
       updateFacingArrows(batch.retargeter, batch.walkers?.[0]?.position);
-      updatePoseSkeleton3D(batch.walkers?.[0]);
       const df = batch.retargeter.debugFacing;
       if (df) poseStats.facing = `body θ${df.bodyTheta.toFixed(0)}→spine${df.spineYaw.toFixed(0)}  head θ${df.headTheta.toFixed(0)}→neck${df.neckYaw.toFixed(0)}`;
       const rep = batch.retargeter.clampReport();
@@ -1700,10 +1956,12 @@ function updateCrowdBatches(elapsed) {
         writeClipBoneSource(walker, batch, elapsed);
       }
       updateWalkerInstanceMatrix(walker);
+      writeFaceExpr(walker, batch);
     }
 
     for (const skeletonState of batch.skeletonStates) skeletonState.boneMatrices.needsUpdate = true;
     batch.instanceMatrices.needsUpdate = true;
+    if (batch.faceExpr) { updateFaceUniforms(batch); batch.faceExpr.needsUpdate = true; }
     for (const computeNode of batch.computeNodes) renderer.compute(computeNode);
   }
 }
@@ -1720,6 +1978,12 @@ function clearWalkers() {
   for (const batch of crowdBatches) {
     scene.remove(batch.source);
     batch.mixer?.stopAllAction();
+    if (batch.faceMaskOverlay) { // T27: drop the debug vertex cloud with its batch
+      scene.remove(batch.faceMaskOverlay);
+      batch.faceMaskOverlay.geometry.dispose();
+      batch.faceMaskOverlay.material.dispose();
+      _faceMaskOverlays.delete(batch.faceMaskOverlay);
+    }
   }
   skeletonStates.clear();
   crowdBatches.length = 0;
@@ -1777,19 +2041,13 @@ const facingArrowHead = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new TH
 facingArrowBody.visible = false;
 facingArrowHead.visible = false;
 scene.add(facingArrowBody, facingArrowHead);
-// 3D pose skeleton (octahedron bones + joint markers) — the detected pose drawn on the
-// performer, always-on-top. Anchored at the driven walker, pelvis at hip height.
+// 3D pose skeleton as octahedron bones + joint markers, fed WORLD-aligned joint
+// positions by updatePoseDebug3D (same mesh anchoring as the green line skeleton) — so
+// it lands on the mesh instead of floating. Replaces the 1px green pose lines.
 const poseSkeleton3D = new PoseSkeleton3D();
 poseSkeleton3D.visible = false;
 scene.add(poseSkeleton3D);
-function updatePoseSkeleton3D(walker) {
-  const on = !!(state.poseSkeleton3D && walker && latestCanonical);
-  if (!on) { poseSkeleton3D.visible = false; return; }
-  const p = walker.position;
-  poseSkeleton3D.position.set(p.x, p.y + 0.95, p.z); // canonical pelvis → hip height
-  poseSkeleton3D.rotation.y = walker.rotationY; // face the same way as the character
-  poseSkeleton3D.update(latestCanonical, state.poseKptThresh, 0.5); // 0.5 = world torso length (stable size)
-}
+const _skelJoints = new Array(23).fill(null); // reused world-position buffer
 
 const _faceDir = new THREE.Vector3();
 function updateFacingArrows(retargeter, anchor) {
@@ -1839,6 +2097,7 @@ function drawFacingCompass(ctx, w, h, bodyYaw, headYaw) {
 
 let poseLoopActive = false;
 let poseLoopId = 0; // generation guard — only the latest loop runs (no stacking)
+let poseGen = 0; // start/stop generation — an in-flight startPose superseded by a stop/switch tears down its own provider (no leaked worker/WS)
 let latestCanonical = null;
 let lastPoseFrame = null; // most recent raw frame (calibration overlay skeleton)
 let lastGoodPoseAt = 0;
@@ -2044,6 +2303,7 @@ function scanCameras() {
 
 async function startPose() {
   if (poseProvider) return;
+  const myGen = ++poseGen; // claim this start; a later stop/switch bumps poseGen → we bail + tear down
   posePipEl.hidden = false;
   // Sidecar backends load the model NATIVELY (nothing downloads in the browser); only
   // the in-browser worker compiles the GLB/onnx here.
@@ -2053,20 +2313,25 @@ async function startPose() {
     ? 'Connecting to native sidecar (ws://127.0.0.1:8787)…'
     : 'Loading pose model (rtmw3d-l ~219MB) — first load compiles GPU shaders, may briefly stutter…';
   const t0 = performance.now();
+  // Build into a LOCAL — only adopt into module `poseProvider` AFTER start() succeeds and
+  // only if still current. Otherwise a superseded start would leak its worker/WS/camera.
+  let provider = null;
   try {
     poseSmoother.reset();
     if (state.poseBackend === 'sidecar') {
-      poseProvider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide, readback: state.poseReadback });
-      poseProvider.debug = state.poseSidecarDebug;
+      provider = new SidecarPoseProvider({ kptThresh: state.poseKptThresh, sendMaxSide: state.poseSendMaxSide, readback: state.poseReadback });
+      provider.debug = state.poseSidecarDebug;
     } else if (state.poseBackend === 'sidecar-native') {
-      poseProvider = new NativeCapturePoseProvider({ kptThresh: state.poseKptThresh, width: 640, height: 480, preview: state.posePreview, device: state.poseNativeDevice });
-      poseProvider.debug = state.poseSidecarDebug;
+      provider = new NativeCapturePoseProvider({ kptThresh: state.poseKptThresh, width: 640, height: 480, preview: state.posePreview, device: state.poseNativeDevice });
+      provider.debug = state.poseSidecarDebug;
     } else {
       const Provider = state.poseWorker ? WorkerPoseProvider : RTMWPoseProvider;
-      poseProvider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh, yoloRes: state.poseYoloRes, rtmwVariant: state.poseRtmwVariant });
+      provider = new Provider({ ep: state.poseEP, kptThresh: state.poseKptThresh, yoloRes: state.poseYoloRes, rtmwVariant: state.poseRtmwVariant });
     }
     poseStats.backend = state.poseBackend;
-    await poseProvider.start();
+    await provider.start();
+    if (myGen !== poseGen) { provider.stop(); return; } // superseded during start → tear down, no leak
+    poseProvider = provider;
     const label = state.poseBackend.startsWith('sidecar') ? `${state.poseBackend}/${poseProvider.ep}` : `${state.poseWorker ? 'worker' : 'main'}/${state.poseEP}`;
     console.info(`[pose] ready in ${((performance.now() - t0) / 1000).toFixed(1)}s (${label})`);
     statusEl.textContent = '';
@@ -2081,11 +2346,14 @@ async function startPose() {
     posePipLabel.textContent = `pose: ${label}`;
     poseLoop(++poseLoopId);
   } catch (error) {
-    console.error('pose start failed:', error);
-    posePipLabel.textContent = `pose: ${error.message}`;
-    statusEl.textContent = `Pose start failed: ${error.message}`;
-    state.poseEnabled = false;
-    poseProvider = null;
+    try { provider?.stop(); } catch { /* partial start — best-effort cleanup */ }
+    if (myGen === poseGen) { // only report/reset if WE are still the current attempt
+      console.error('pose start failed:', error);
+      posePipLabel.textContent = `pose: ${error.message}`;
+      statusEl.textContent = `Pose start failed: ${error.message}`;
+      state.poseEnabled = false;
+      poseProvider = null;
+    }
   }
 }
 
@@ -2204,6 +2472,7 @@ function stopReplay() {
 }
 
 function stopPose() {
+  poseGen += 1; // invalidate any in-flight startPose → it stops the provider it built (no leak)
   poseLoopActive = false;
   poseLoopId += 1; // invalidate any in-flight loop so it can't resume on restart
   if (poseProvider) {
@@ -2228,15 +2497,18 @@ function stopPose() {
 // the mesh and scaled to match. Compare → see what the retarget did with the pose.
 function updatePoseDebug3D() {
   const show = state.poseDebug3D && !!latestCanonical;
-  poseDebugLines.visible = show;
+  // Green pose is now drawn as octahedron bones (poseSkeleton3D), not 1px lines → hide
+  // the old green line/points; keep the magenta rig lines as the interpretation reference.
+  poseDebugLines.visible = false;
+  poseDebugPoints.visible = false;
+  poseSkeleton3D.visible = show;
   poseRigLines.visible = show;
-  poseDebugPoints.visible = show;
   poseRigPoints.visible = show;
   if (!show) return;
   const walker = walkers.find((w) => w.boneSource === 'pose') ?? walkers[0];
   const skeleton = walker?.batch?.skeletonStates?.[0]?.skeleton;
   if (!walker || !skeleton) {
-    poseDebugLines.visible = poseRigLines.visible = poseDebugPoints.visible = poseRigPoints.visible = false;
+    poseSkeleton3D.visible = poseRigLines.visible = poseRigPoints.visible = false;
     return;
   }
 
@@ -2262,27 +2534,28 @@ function updatePoseDebug3D() {
   poseRigGeom.setDrawRange(0, m / 3);
   poseRigGeom.attributes.position.needsUpdate = true;
 
-  // Green canonical, pelvis-aligned to the mesh hips + scaled to the rig.
+  // Green canonical → pelvis anchored at the mesh Hips, scaled to the MESH HEIGHT: match
+  // the pose's Hips→top-of-head span to the rig's, using the vertical (y) extent only.
+  // (The old 3D-torso ratio pulsed with the jittery z → "weirdly scaling"; y is stable.)
   const hipsW = worldOf('Hips');
-  const spineW = worldOf('Spine02');
+  const headW = worldOf('Head');
   const J = latestCanonical.joints;
-  const torsoCanon = Math.hypot(latestCanonical.shoulderCenter.x, latestCanonical.shoulderCenter.y, latestCanonical.shoulderCenter.z) || 1;
-  const torsoRig = hipsW && spineW ? hipsW.distanceTo(spineW) : 0.3;
-  const s = (torsoRig / torsoCanon) * state.poseDebugScale;
+  let canonTop = 0.2; // highest confident body joint above the pelvis (≈ head)
+  for (let i = 0; i <= 16; i += 1) { const j = J[i]; if (j && j.confidence >= state.poseKptThresh && j.y > canonTop) canonTop = j.y; }
+  const rigUp = (headW && hipsW) ? Math.max(0.1, headW.y - hipsW.y) : 0.6; // rig Hips→Head height
+  const s = (rigUp / canonTop) * state.poseDebugScale;
   const ox = hipsW ? hipsW.x : walker.position.x;
   const oy = hipsW ? hipsW.y : state.poseDebugHeight;
   const oz = hipsW ? hipsW.z : walker.position.z;
-  const pos = poseDebugGeom.attributes.position.array;
-  let n = 0;
-  for (const [a, b] of BODY_BONES) {
-    const ja = J[a];
-    const jb = J[b];
-    if (!ja || !jb || ja.confidence < state.poseKptThresh || jb.confidence < state.poseKptThresh) continue;
-    pos[n++] = ox + ja.x * s; pos[n++] = oy + ja.y * s; pos[n++] = oz + ja.z * s;
-    pos[n++] = ox + jb.x * s; pos[n++] = oy + jb.y * s; pos[n++] = oz + jb.z * s;
+  // Per-keypoint world positions → octahedron skeleton. z damped ×0.4 (z is Z_RANGE-
+  // scaled, ~larger than x/y — undamped it blows the depth out).
+  for (let i = 0; i < 23; i += 1) {
+    const j = J[i];
+    _skelJoints[i] = (j && j.confidence >= state.poseKptThresh)
+      ? { x: ox + j.x * s, y: oy + j.y * s, z: oz + j.z * s * 0.4 }
+      : null;
   }
-  poseDebugGeom.setDrawRange(0, n / 3);
-  poseDebugGeom.attributes.position.needsUpdate = true;
+  poseSkeleton3D.update(_skelJoints);
 }
 
 // Guided calibration phase machine + on-screen overlay (countdown a single
