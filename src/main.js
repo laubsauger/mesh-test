@@ -41,6 +41,7 @@ import { NativeCapturePoseProvider } from './pose/native-capture-provider.js';
 import { drawOverlay } from './pose/overlay-2d.js';
 import { toCanonical, mirrorCanonical } from './pose/observation-adapter.js';
 import { Retargeter } from './pose/retargeter.js';
+import { FaceExpressionExtractor } from './pose/face-expression.js';
 import { KPT, NUM_KPTS, RTMW_VARIANTS, YOLO_RES_OPTIONS } from './pose/rtmw-constants.js';
 import { CanonicalSmoother } from './pose/one-euro.js';
 import { PoseRecorder, PosePlayer } from './pose/recorder.js';
@@ -806,6 +807,19 @@ function buildInspectorControls() {
   poseGroup.add(state, 'savePoseRecording').name('Save Recording');
   poseGroup.add(state, 'loadPoseRecording').name('Load Recording');
   poseGroup.add(state, 'runEpProbe').name('Probe EPs (console)');
+
+  // T26: face expression scalars (read-only live) + neutral recalibrate. Phase 1 —
+  // extraction only; the mask/deform (T27/T28) consume these later.
+  const faceGroup = renderer.inspector.createParameters('VJ Layer / Face');
+  faceGroup.add(faceStats, 'neutral').name('Neutral baseline').listen();
+  faceGroup.add(faceStats, 'jawOpen').name('Jaw Open').listen();
+  faceGroup.add(faceStats, 'smile').name('Smile').listen();
+  faceGroup.add(faceStats, 'pucker').name('Pucker').listen();
+  faceGroup.add(faceStats, 'blinkL').name('Blink L').listen();
+  faceGroup.add(faceStats, 'blinkR').name('Blink R').listen();
+  faceGroup.add(faceStats, 'browL').name('Brow L').listen();
+  faceGroup.add(faceStats, 'browR').name('Brow R').listen();
+  faceGroup.add({ recalibrate: () => faceExpr.recalibrateNeutral() }, 'recalibrate').name('Recalibrate Neutral (rest face)');
 
   const statsGroup = renderer.inspector.createParameters('VJ Layer / Render Stats');
   statsGroup.add(statsState, 'fps').name('FPS').listen();
@@ -1620,7 +1634,7 @@ function computePoseMatrices(batch) {
       // 'Dump Clamps' button prints the full table + resets.
       lastPoseRetargeter = batch.retargeter;
       updateFacingArrows(batch.retargeter, batch.walkers?.[0]?.position);
-      updatePoseSkeleton3D(batch.walkers?.[0]?.position);
+      updatePoseSkeleton3D(batch.walkers?.[0]);
       const df = batch.retargeter.debugFacing;
       if (df) poseStats.facing = `body θ${df.bodyTheta.toFixed(0)}→spine${df.spineYaw.toFixed(0)}  head θ${df.headTheta.toFixed(0)}→neck${df.neckYaw.toFixed(0)}`;
       const rep = batch.retargeter.clampReport();
@@ -1768,11 +1782,13 @@ scene.add(facingArrowBody, facingArrowHead);
 const poseSkeleton3D = new PoseSkeleton3D();
 poseSkeleton3D.visible = false;
 scene.add(poseSkeleton3D);
-function updatePoseSkeleton3D(anchor) {
-  const on = !!(state.poseSkeleton3D && anchor && latestCanonical);
+function updatePoseSkeleton3D(walker) {
+  const on = !!(state.poseSkeleton3D && walker && latestCanonical);
   if (!on) { poseSkeleton3D.visible = false; return; }
-  poseSkeleton3D.position.set(anchor.x, anchor.y + 0.95, anchor.z); // canonical pelvis → hip height
-  poseSkeleton3D.update(latestCanonical, state.poseKptThresh, 1.0);
+  const p = walker.position;
+  poseSkeleton3D.position.set(p.x, p.y + 0.95, p.z); // canonical pelvis → hip height
+  poseSkeleton3D.rotation.y = walker.rotationY; // face the same way as the character
+  poseSkeleton3D.update(latestCanonical, state.poseKptThresh, 0.5); // 0.5 = world torso length (stable size)
 }
 
 const _faceDir = new THREE.Vector3();
@@ -1785,7 +1801,12 @@ function updateFacingArrows(retargeter, anchor) {
   _faceDir.set(Math.sin(retargeter.torsoFacing.theta), 0, Math.cos(retargeter.torsoFacing.theta)).normalize();
   facingArrowBody.position.set(anchor.x, anchor.y + 1.0, anchor.z);
   facingArrowBody.setDirection(_faceDir);
-  _faceDir.set(Math.sin(retargeter.headFacing.theta), 0, Math.cos(retargeter.headFacing.theta)).normalize();
+  // Head arrow: yaw (horizontal) + PITCH (nod, vertical tilt). pitch is raw ±~0.5; ×2
+  // → visible tilt. Nod down (pitch +) → arrow tilts down (−y).
+  const hy = retargeter.headFacing.theta;
+  const hp = retargeter.headFacing.pitch * 2;
+  const cp = Math.cos(hp);
+  _faceDir.set(Math.sin(hy) * cp, -Math.sin(hp), Math.cos(hy) * cp).normalize();
   facingArrowHead.position.set(anchor.x, anchor.y + 1.75, anchor.z);
   facingArrowHead.setDirection(_faceDir);
 }
@@ -1826,6 +1847,14 @@ const poseSmoother = new CanonicalSmoother(NUM_KPTS, {
   minCutoff: 2,
   beta: 0.02
 });
+// T26 (V26): per-performer face expression from landmarks 23-90. One tracked feed →
+// one extractor for now (rides the same pose-performer concept, I.faceExpr). faceStats
+// is a stable object the Inspector .listen()s (extractor.value is copied in, so a reset
+// re-binding can't break the display).
+const faceExpr = new FaceExpressionExtractor();
+let latestFaceExpr = null;
+let faceExprPrevT = null;
+const faceStats = { jawOpen: 0, smile: 0, pucker: 0, blinkL: 0, blinkR: 0, browL: 0, browR: 0, neutral: 'auto…' };
 const poseRecorder = new PoseRecorder();
 let replayActive = false;
 let replayPlayer = null;
@@ -1957,8 +1986,21 @@ function updateCanonical(frame) {
       poseSmoother.setParams({ minCutoff: state.poseSmoothMinCutoff, beta: state.poseSmoothBeta });
       canon = poseSmoother.smooth(raw);
     }
-    latestCanonical = state.poseMirror ? mirrorCanonical(canon) : canon;
+    // Native capture owns the RAW camera (not a selfie); the browser worker feeds a
+    // mirrored selfie. Opposite handedness → auto-invert the mirror for native so ONE
+    // "Mirror Pose" setting stays aligned across both backends.
+    const isNative = poseProvider instanceof NativeCapturePoseProvider;
+    const doMirror = isNative ? !state.poseMirror : state.poseMirror;
+    latestCanonical = doMirror ? mirrorCanonical(canon) : canon;
     lastGoodPoseAt = now;
+
+    // T26: extract face expression scalars from the same canonical frame. dt from the
+    // frame timestamp (pose-rate); the extractor's own One Euro smooths per scalar.
+    const faceDt = faceExprPrevT === null ? 0 : (latestCanonical.timestampMs - faceExprPrevT) / 1000;
+    faceExprPrevT = latestCanonical.timestampMs;
+    latestFaceExpr = faceExpr.update(latestCanonical, faceDt, { thresh: state.poseKptThresh });
+    Object.assign(faceStats, latestFaceExpr);
+    faceStats.neutral = faceExpr.neutral ? 'set' : 'capturing…';
 
     // Calibration: collect bone-length samples during the capture phase (finalize
     // + countdown are driven by updateCalibration in the render loop).
@@ -2280,6 +2322,7 @@ function updateCalibration() {
       // Reset the facing frontal reference: the "stand like this" pose IS frontal, so the
       // running-max relearns THIS person/distance's frontal width during the hold.
       for (const b of crowdBatches) b.retargeter?.recalibrateFacing();
+      faceExpr.recalibrateNeutral(); // T26: the frontal "stand like this" hold = neutral face
       calibPhase = 'capturing';
       calibPhaseStart = performance.now();
     }

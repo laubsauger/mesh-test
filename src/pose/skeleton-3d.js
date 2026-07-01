@@ -41,18 +41,30 @@ export class PoseSkeleton3D extends THREE.Group {
     }
   }
 
-  // canonical = CanonicalPoseObservation (pelvis-centered, +y up). scale maps its
-  // normalized units to world (≈ character height). Bones span joint→joint; the octahedron
-  // is stretched along its length so it reads as a tapered bone.
-  update(canonical, kptThresh, scale, width = 0.02) {
+  // canonical = CanonicalPoseObservation (pelvis-centered, +y up). The raw canonical is
+  // NOT scale-stable (bbox jitter pulses the keypoint magnitudes), so we normalize per
+  // frame by the TORSO length (pelvis→shoulder-center) to a fixed world size, smoothed —
+  // the bones stay a constant length instead of scaling up/down. `targetTorso` = world
+  // torso length. Octahedron stretched along its length → tapered bone.
+  update(canonical, kptThresh, targetTorso = 0.5, width = 0.02) {
     const j = canonical?.joints;
     if (!j) { this.visible = false; return; }
     this.visible = true;
+    const ls = j[5]; const rs = j[6]; // shoulders (pelvis = origin)
+    // Scale from the 2D torso (x/y ONLY): x/y are crop-normalized, but z is a DIFFERENT
+    // normalization (Z_RANGE, ~4× bigger) that jitters separately — mixing them made the
+    // skeleton scale/distort on all axes. Damp z (ZD) so depth matches the x/y scale.
+    const torso2d = ls && rs ? Math.hypot((ls.x + rs.x) / 2, (ls.y + rs.y) / 2) : 0;
+    const raw = torso2d > 1e-3 ? targetTorso / torso2d : (this._scale || 1);
+    this._scale = this._scale ? this._scale + (raw - this._scale) * 0.12 : raw; // smooth
+    const scale = this._scale;
+    const ZD = 0.35; // depth damp → z in the same visual scale as x/y
+    const put = (v, p) => v.set(p.x * scale, p.y * scale, p.z * scale * ZD);
     for (let i = 0; i < 23; i += 1) {
       const p = j[i];
       const vis = !!(p && p.confidence >= kptThresh);
       this.joints[i].visible = vis;
-      if (vis) this.joints[i].position.set(p.x * scale, p.y * scale, p.z * scale);
+      if (vis) put(this.joints[i].position, p);
     }
     for (const b of this.bones) {
       const pa = j[b.a];
@@ -60,8 +72,8 @@ export class PoseSkeleton3D extends THREE.Group {
       const vis = !!(pa && pb && pa.confidence >= kptThresh && pb.confidence >= kptThresh);
       b.m.visible = vis;
       if (!vis) continue;
-      _va.set(pa.x * scale, pa.y * scale, pa.z * scale);
-      _vb.set(pb.x * scale, pb.y * scale, pb.z * scale);
+      put(_va, pa);
+      put(_vb, pb);
       b.m.position.copy(_va).add(_vb).multiplyScalar(0.5);
       _dir.copy(_vb).sub(_va);
       const len = _dir.length();

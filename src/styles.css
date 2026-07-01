@@ -131,12 +131,15 @@ body.is-fullscreen .status {
   text-shadow: 0 2px 16px rgb(0 0 0 / 0.75);
 }
 
-/* Live detected skeleton shown during calibration so you can see the pose tracking. */
+/* Live detected skeleton shown during calibration so you can see the pose tracking.
+   height:auto preserves the canvas backing-store aspect (feed can be 3:4, 4:3, 2:1…)
+   so it never squishes. */
 .calib-skeleton {
   display: block;
   margin: 18px auto 0;
-  width: 260px;
-  height: 346px;
+  width: 240px;
+  height: auto;
+  max-height: 46vh;
   border: 1px solid rgb(56 255 240 / 0.3);
   border-radius: 8px;
   background: rgb(2 4 10 / 0.5);

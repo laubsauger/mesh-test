@@ -19,6 +19,20 @@ export const MIRROR_INDEX = (() => {
   const pairs = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12], [13, 14], [15, 16], [17, 20], [18, 21], [19, 22]];
   for (const [a, b] of pairs) { m[a] = b; m[b] = a; }
   for (let k = 0; k < 21; k += 1) { m[91 + k] = 112 + k; m[112 + k] = 91 + k; } // hands
+  // Face (V30): iBUG-68 landmarks live at 23-90 (+23 offset). A mirror must SWAP the
+  // L/R-symmetric face points too — else a mirrored performer gets a scrambled face
+  // (blinkL↔R, brow/mouth-corner swapped). Standard dlib-68 horizontal flip pairs
+  // (iBUG-local; unlisted points — jaw center 8, nose bridge 27-30/33, mouth mid
+  // 51/57/62/66 — are self-symmetric):
+  const facePairs = [
+    [0, 16], [1, 15], [2, 14], [3, 13], [4, 12], [5, 11], [6, 10], [7, 9], // jaw contour
+    [17, 26], [18, 25], [19, 24], [20, 23], [21, 22],                       // brows
+    [31, 35], [32, 34],                                                     // lower nose
+    [36, 45], [37, 44], [38, 43], [39, 42], [40, 47], [41, 46],             // eyes
+    [48, 54], [49, 53], [50, 52], [55, 59], [56, 58],                       // mouth outer
+    [60, 64], [61, 63], [65, 67]                                            // mouth inner
+  ];
+  for (const [a, b] of facePairs) { m[23 + a] = 23 + b; m[23 + b] = 23 + a; }
   return m;
 })();
 
