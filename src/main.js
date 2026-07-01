@@ -361,9 +361,12 @@ const state = {
   poseSmoothMinCutoff: 2,
   poseSmoothBeta: 0.02,
   poseJointLimit: 150,
-  poseBodyYaw: true,
-  poseYawGain: 1.2, // amplify hip depth-separation so turning registers — but only modestly:
-  // high gain blows up noisy monocular z near frontal → axis sign-flips → whole-body 180° snap.
+  // Body yaw ON: the torso frame is now built from the RAW 3D hip-axis (no depth
+  // amplification), so turn/tilt/pivot come straight from the pelvis-aligned data.
+  // The horizontal hip separation dominates the sign → stable near frontal (the old
+  // yawGain-amplified scalar is what spun it, §B8/§B8b). Off = lean-only.
+  poseBodyYaw: false, // stable base while the FK rework lands (yaw twist is a separate known issue)
+  poseClavicle: false, // shoulder shrug/protraction — unproven, opt-in
   poseFollow: 0.5, // higher = snappier (less laggy/jello)
   poseSwingTwist: true,
   poseWristTwist: true,
@@ -725,7 +728,7 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseArmLimit', 30, 180, 1).name('Arm Limit °');
   poseGroup.add(state, 'poseFollow', 0.05, 1, 0.01).name('Pose Follow (smooth)');
   poseGroup.add(state, 'poseBodyYaw').name('Body Yaw (turn)').listen();
-  poseGroup.add(state, 'poseYawGain', 1, 8, 0.1).name('Yaw Gain (depth)');
+  poseGroup.add(state, 'poseClavicle').name('Clavicles (shrug)').listen();
   poseGroup.add(state, 'poseSwingTwist').name('Swing-Twist').listen();
   poseGroup.add(state, 'poseTwistSmooth', 0.02, 1, 0.01).name('Twist Smooth');
   poseGroup.add(state, 'poseWristTwist').name('Wrist Twist (hands)').listen();
@@ -1586,7 +1589,7 @@ function computePoseMatrices(batch) {
         grounding: state.poseGrounding,
         groundFollow: state.poseGroundFollow,
         bodyYaw: state.poseBodyYaw,
-        yawGain: state.poseYawGain
+        clavicle: state.poseClavicle
       });
       // V19: surface which bones the joint-limit clamp throttled (e.g. face-touch
       // → forearm wanted 148° capped 110°). Peak-held top 3 into the HUD (stable);

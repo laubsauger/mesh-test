@@ -63,46 +63,45 @@ export const headCenter = (c) => {
   return n ? { x: x / n, y: y / n, z: z / n, confidence: conf } : { x: 0, y: 0, z: 0, confidence: 0 };
 };
 
+// `zTrust` = how much to trust this bone's monocular DEPTH (z), 0..1. NOT a hack —
+// depth reliability genuinely differs per joint: arms reach toward camera (need full
+// z=1), but hip/knee/torso z is noisy → damp it. Effective z = zTrust × global
+// depthScale. (The removed hacks were yaw AMPLIFICATION/deadzone/hold, which fought
+// the data; this RESPECTS which joints have usable depth.)
+
 // Upper limb bones get full swing-TWIST (direction + bend-plane) so the arm/leg
 // roll is determined, not left to bind roll (§22). root/mid/end = the 3 canonical
 // joints; midBone/endBone give the bind bend-plane from the rig.
 export const LIMBS = [
-  { upper: 'leftArm', midBone: 'leftForeArm', endBone: 'leftHand', root: KPT.leftShoulder, mid: KPT.leftElbow, end: KPT.leftWrist, depth: 1 },
-  { upper: 'rightArm', midBone: 'rightForeArm', endBone: 'rightHand', root: KPT.rightShoulder, mid: KPT.rightElbow, end: KPT.rightWrist, depth: 1 },
-  { upper: 'leftUpLeg', midBone: 'leftLeg', endBone: 'leftFoot', root: KPT.leftHip, mid: KPT.leftKnee, end: KPT.leftAnkle, depth: 0.35 },
-  { upper: 'rightUpLeg', midBone: 'rightLeg', endBone: 'rightFoot', root: KPT.rightHip, mid: KPT.rightKnee, end: KPT.rightAnkle, depth: 0.35 }
+  { upper: 'leftArm', midBone: 'leftForeArm', endBone: 'leftHand', root: KPT.leftShoulder, mid: KPT.leftElbow, end: KPT.leftWrist, zTrust: 1 },
+  { upper: 'rightArm', midBone: 'rightForeArm', endBone: 'rightHand', root: KPT.rightShoulder, mid: KPT.rightElbow, end: KPT.rightWrist, zTrust: 1 },
+  { upper: 'leftUpLeg', midBone: 'leftLeg', endBone: 'leftFoot', root: KPT.leftHip, mid: KPT.leftKnee, end: KPT.leftAnkle, zTrust: 0.4 },
+  { upper: 'rightUpLeg', midBone: 'rightLeg', endBone: 'rightFoot', root: KPT.rightHip, mid: KPT.rightKnee, end: KPT.rightAnkle, zTrust: 0.4 }
 ];
 
 // Forearms: direction (elbow→wrist) + optional axial TWIST from the hand knuckle
 // line (indexMCP→pinkyMCP rotates with pronation/supination).
 export const FOREARMS = [
-  { bone: 'leftForeArm', root: KPT.leftElbow, mid: KPT.leftWrist, rollA: KPT.leftIndexBase, rollB: KPT.leftPinkyBase, depth: 1 },
-  { bone: 'rightForeArm', root: KPT.rightElbow, mid: KPT.rightWrist, rollA: KPT.rightIndexBase, rollB: KPT.rightPinkyBase, depth: 1 }
+  { bone: 'leftForeArm', root: KPT.leftElbow, mid: KPT.leftWrist, rollA: KPT.leftIndexBase, rollB: KPT.leftPinkyBase, zTrust: 1 },
+  { bone: 'rightForeArm', root: KPT.rightElbow, mid: KPT.rightWrist, rollA: KPT.rightIndexBase, rollB: KPT.rightPinkyBase, zTrust: 1 }
 ];
 
-// Direction-only bones (swing). `depth` damps noisy monocular z per-bone.
+// Direction-only bones (swing). zTrust damps noisy monocular depth per bone.
 export const SEGMENTS = [
-  { bone: 'leftLeg', from: kpt(KPT.leftKnee), to: kpt(KPT.leftAnkle), depth: 0.35 },
-  { bone: 'rightLeg', from: kpt(KPT.rightKnee), to: kpt(KPT.rightAnkle), depth: 0.35 },
-  { bone: 'leftFoot', from: kpt(KPT.leftAnkle), to: kpt(KPT.leftBigToe), depth: 0.35 },
-  { bone: 'rightFoot', from: kpt(KPT.rightAnkle), to: kpt(KPT.rightBigToe), depth: 0.35 },
+  { bone: 'leftLeg', from: kpt(KPT.leftKnee), to: kpt(KPT.leftAnkle), zTrust: 0.4 },
+  { bone: 'rightLeg', from: kpt(KPT.rightKnee), to: kpt(KPT.rightAnkle), zTrust: 0.4 },
+  { bone: 'leftFoot', from: kpt(KPT.leftAnkle), to: kpt(KPT.leftBigToe), zTrust: 0.4 },
+  { bone: 'rightFoot', from: kpt(KPT.rightAnkle), to: kpt(KPT.rightBigToe), zTrust: 0.4 },
   // Hands: wrist → middle-finger base. Leaf bones (no child) — bind dir captured
   // from forearm→hand. Drives wrist bend; twist (pronation) is a follow-up.
-  { bone: 'leftHand', from: kpt(KPT.leftWrist), to: kpt(KPT.leftMiddleBase), depth: 1 },
-  { bone: 'rightHand', from: kpt(KPT.rightWrist), to: kpt(KPT.rightMiddleBase), depth: 1 },
+  { bone: 'leftHand', from: kpt(KPT.leftWrist), to: kpt(KPT.leftMiddleBase), zTrust: 1 },
+  { bone: 'rightHand', from: kpt(KPT.rightWrist), to: kpt(KPT.rightMiddleBase), zTrust: 1 },
   // NOTE: no 'spine' segment — the Meshy 'Spine' bone's child sits BELOW it
   // (Spine→Spine01 = -y), so aiming it up is a ~180° flip → degenerate chest roll
   // (one shoulder up/down, see §B). Torso lean is driven via Hips instead.
   // NOTE: neck is NOT here — driven by _aimHead (full basis: head-up + face-right
   // for head yaw/roll), not a plain direction aim.
 ];
-
-// Torso-lean depth: z (monocular fwd/back) is the noisy axis and on the long
-// hip→shoulder baseline a little z-jitter tilts the whole upper body. Keep it low
-// — vertical + side lean stay responsive, fwd/back is damped (raise via depthScale).
-export const HIPS_DEPTH = 0.12;
-// Neck-pitch depth: short shoulder→head baseline amplifies z-noise → bobbing head.
-export const NECK_DEPTH = 0.3;
 
 // Torso bend is distributed across the spine as a fractional WORLD rotation per
 // bone (NOT per-bone direction-aim — Spine's child is -y, that path 180°-flips,
@@ -120,8 +119,8 @@ export const SPINE_CHAIN = [
 // observed shoulder joint relative to the shoulder-center → shrug (Y) + slight
 // protraction. Subtle — driven at reduced gain. z damped (monocular).
 export const CLAVICLES = [
-  { bone: 'leftShoulder', joint: KPT.leftShoulder, depth: 0.2 },
-  { bone: 'rightShoulder', joint: KPT.rightShoulder, depth: 0.2 }
+  { bone: 'leftShoulder', joint: KPT.leftShoulder },
+  { bone: 'rightShoulder', joint: KPT.rightShoulder }
 ];
 
 // Resolve logical key → THREE.Bone from a skeleton. Throws on any missing bone —
