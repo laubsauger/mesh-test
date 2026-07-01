@@ -143,9 +143,16 @@ window.addEventListener('pointerdown', (e) => {
   if (e.button === 3) { faceEditUndo(); e.preventDefault(); } else if (e.button === 4) { faceEditRedo(); e.preventDefault(); }
 });
 window.addEventListener('keydown', (e) => {
-  if (!faceEditor.active || !(e.metaKey || e.ctrlKey)) return;
+  if (!faceEditor.active) return;
+  const tag = e.target?.tagName;
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return; // don't hijack typing
   const k = e.key.toLowerCase();
-  if (k === 'z') { if (e.shiftKey) faceEditRedo(); else faceEditUndo(); e.preventDefault(); } else if (k === 'y') { faceEditRedo(); e.preventDefault(); }
+  if (e.metaKey || e.ctrlKey) {
+    if (k === 'z') { if (e.shiftKey) faceEditRedo(); else faceEditUndo(); e.preventDefault(); } else if (k === 'y') { faceEditRedo(); e.preventDefault(); }
+    return;
+  }
+  if (k === 'b') { faceEditSetTool('brush'); e.preventDefault(); } // Photoshop-style tool keys
+  else if (k === 'v') { faceEditSetTool('camera'); e.preventDefault(); }
 });
 
 // 3D debug overlay: the canonical pose (what drives the rig) drawn as a line
@@ -1540,10 +1547,16 @@ function downloadFaceMasks() {
 // re-places the jaw hinge — the fixes for the wrong-region failures on stylized heads.
 const faceEditor = {
   active: false, batchIndex: 0, region: 'jaw', radius: 0.04, strength: 0.5,
+  tool: 'brush', // 'camera' (orbit only) | 'brush' (paint; rotate/pan off, zoom on)
   erase: false, symmetric: true, hingeMode: false, editHead: null, batch: null, painting: false,
   hingeStage: 0, hingeGizmo: null, // two-click hinge (0=origin next, 1=axis next); axis line
+  brushRing: null, prevDrift: false, // Photoshop-style cursor ring; saved drift state
   history: [], histIndex: -1, lastSnapT: 0, lastSnapTag: '' // undo/redo ring
 };
+const REGION_HEX = { jaw: 0xff5c5c, lowerLip: 0xff9f43, mouthCorner: 0xfeca57, upperLidL: 0x54a0ff, upperLidR: 0x5f27cd, browL: 0x1dd1a1, browR: 0x00d2d3 };
+const _brushN = new THREE.Vector3();
+const _nMat = new THREE.Matrix3();
+const _zAxis = new THREE.Vector3(0, 0, 1);
 const REGION_MIRROR = { upperLidL: 'upperLidR', upperLidR: 'upperLidL', browL: 'browR', browR: 'browL' };
 const _rayNDC = new THREE.Vector2();
 const _raycaster = new THREE.Raycaster();
@@ -1564,14 +1577,34 @@ function setFaceEditMode(on) {
   }
   faceEditor.batch = null;
   if (faceEditor.hingeGizmo) faceEditor.hingeGizmo.visible = false;
-  if (!on) return;
+  if (faceEditor.brushRing) faceEditor.brushRing.visible = false;
+  if (!on) {
+    // Restore camera drift + full orbit on exit.
+    state.cameraDrift = faceEditor.prevDrift; controls.autoRotate = faceEditor.prevDrift;
+    controls.enableRotate = true; controls.enablePan = true;
+    return;
+  }
   const batch = editBatch();
   if (!batch) { statusEl.textContent = 'Face editor: no model with a face mask.'; faceEditor.active = false; return; }
   faceEditor.batch = batch;
+  // Auto-stop camera drift while editing (spinning the head fights painting).
+  faceEditor.prevDrift = state.cameraDrift;
+  state.cameraDrift = false; controls.autoRotate = false;
   buildEditHead(batch);
   frameEditHead();
+  faceEditSetTool(faceEditor.tool);
   faceEditResetHistory();
-  statusEl.textContent = `Face editor: ${batch.mesh.name} — click the head to paint "${faceEditor.region}" (Erase/Symmetric in panel).`;
+  statusEl.textContent = `Face editor: ${batch.mesh.name} — Brush tool paints, Move tool orbits (B/V).`;
+}
+
+// Tool select: Camera = full orbit, no paint; Brush = paint (rotate/pan off so drags
+// paint, zoom stays on). Keeps painting and camera moves from fighting each other.
+function faceEditSetTool(t) {
+  faceEditor.tool = t;
+  const brush = t === 'brush';
+  controls.enableRotate = !brush; controls.enablePan = !brush; controls.enableZoom = true; controls.enabled = true;
+  if (!brush && faceEditor.brushRing) faceEditor.brushRing.visible = false;
+  setEditorState({ tool: t });
 }
 
 // Static clone of the head geometry, placed to the left of the crowd, scaled to a
@@ -1719,25 +1752,63 @@ function faceEditRaycast(e) {
 }
 
 function onFaceEditDown(e) {
-  if (!faceEditor.active || !faceEditor.editHead) return;
+  if (!faceEditor.active || !faceEditor.editHead || faceEditor.tool !== 'brush') return; // Camera tool → orbit only
   if (e.button === 3 || e.button === 4) return; // aux = undo/redo (window listener)
   const hit = faceEditRaycast(e);
-  if (!hit) return; // missed head → let OrbitControls handle it (orbit empty space)
-  controls.enabled = false; // paint, don't orbit
+  if (!hit) return;
   if (faceEditor.hingeMode) { faceEditSetHinge(hit.point); return; }
   faceEditor.painting = true;
   faceEditPaint(hit.point, e.button === 2 || faceEditor.erase);
 }
 
+// In Brush tool: follow the cursor with the ring (always) + paint while dragging.
 function onFaceEditMove(e) {
-  if (!faceEditor.painting) return;
+  if (!faceEditor.active || faceEditor.tool !== 'brush' || !faceEditor.editHead) {
+    if (faceEditor.brushRing) faceEditor.brushRing.visible = false;
+    return;
+  }
   const hit = faceEditRaycast(e);
-  if (hit) faceEditPaint(hit.point, faceEditor.erase || (e.buttons === 2));
+  updateBrushRing(hit);
+  if (faceEditor.painting && hit) faceEditPaint(hit.point, faceEditor.erase || (e.buttons === 2));
 }
 
 function onFaceEditUp() {
-  if (faceEditor.painting) { faceEditor.painting = false; controls.enabled = true; faceEditCommit('paint'); } // one undo/stroke
-  else if (!controls.enabled) { controls.enabled = true; }
+  if (faceEditor.painting) { faceEditor.painting = false; faceEditCommit('paint'); } // one undo/stroke
+}
+
+// Photoshop-style brush cursor: a ring on the surface at the paint radius, colored by
+// the region (red when erasing), opacity ≈ strength, plus a faint inner falloff ring.
+function buildBrushRing() {
+  const grp = new THREE.Group();
+  const mk = (inner, outer, opacity) => {
+    const m = new THREE.Mesh(
+      new THREE.RingGeometry(inner, outer, 48),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity, depthTest: false, side: THREE.DoubleSide })
+    );
+    grp.add(m); return m;
+  };
+  grp.userData.outer = mk(0.94, 1.0, 0.9); // radius edge
+  grp.userData.inner = mk(0.46, 0.5, 0.4); // ~50% falloff hint
+  grp.renderOrder = 2100; grp.frustumCulled = false; grp.visible = false;
+  scene.add(grp);
+  return grp;
+}
+function updateBrushRing(hit) {
+  if (!faceEditor.brushRing) faceEditor.brushRing = buildBrushRing();
+  const ring = faceEditor.brushRing;
+  const show = faceEditor.active && faceEditor.tool === 'brush' && faceEditor.editHead && hit && !faceEditor.hingeMode;
+  ring.visible = show;
+  if (!show) return;
+  ring.scale.setScalar(faceEditor.radius * faceEditor.editHead.scale.x); // local radius → world
+  ring.position.copy(hit.point);
+  const n = hit.face
+    ? _brushN.copy(hit.face.normal).applyMatrix3(_nMat.getNormalMatrix(faceEditor.editHead.matrixWorld)).normalize()
+    : _brushN.set(0, 0, 1);
+  ring.quaternion.setFromUnitVectors(_zAxis, n);
+  const hex = faceEditor.erase ? 0xff4444 : (REGION_HEX[faceEditor.region] || 0xffffff);
+  ring.userData.outer.material.color.setHex(hex);
+  ring.userData.inner.material.color.setHex(hex);
+  ring.userData.outer.material.opacity = 0.35 + 0.6 * faceEditor.strength;
 }
 
 // Two-click hinge editing (T30): 1st click sets the current region's hinge ORIGIN (and
@@ -1923,6 +1994,7 @@ function registerEditorActions() {
     setOpen(v) { faceEditor.active = v; setFaceEditMode(v); if (v) { syncEditorStore(); pushRegionConfigToStore(); updateHingeGizmo(); } setEditorState({ open: v }); },
     setModel(i) { faceEditor.batchIndex = i; setFaceEditMode(true); deformEditHead(); pushRegionConfigToStore(); updateHingeGizmo(); setEditorState({ modelIndex: i }); },
     setRegion(r) { faceEditor.region = r; faceEditor.hingeStage = 0; recolorEditHead(); pushRegionConfigToStore(); updateHingeGizmo(); setEditorState({ region: r }); },
+    setTool(t) { faceEditSetTool(t); },
     setMode(m) { faceEditor.erase = m === 'erase'; faceEditor.hingeMode = m === 'hinge'; faceEditor.hingeStage = 0; updateHingeGizmo(); setEditorState({ mode: m }); },
     setRadius(v) { faceEditor.radius = v; setEditorState({ radius: v }); },
     setStrength(v) { faceEditor.strength = v; setEditorState({ strength: v }); },

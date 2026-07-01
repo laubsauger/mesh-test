@@ -7,7 +7,8 @@ export const editorState = {
   models: [],            // [{ index, name }]
   modelIndex: 0,
   region: 'jaw',
-  mode: 'paint',         // 'paint' | 'erase' | 'hinge'
+  tool: 'brush',         // 'camera' (orbit) | 'brush' (paint)
+  mode: 'paint',         // brush sub-mode: 'paint' | 'erase' | 'hinge'
   radius: 0.04,
   strength: 0.5,
   symmetric: true,
