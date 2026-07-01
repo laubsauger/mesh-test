@@ -18,3 +18,6 @@ public/bipeds/
 # public/inference/ (see README "Inference models"). `npm run check:models`
 # verifies they're present. Committed character GLBs in public/models/ stay.
 public/inference/
+
+# camera debug snapshots (webcam frames — do not commit, privacy)
+cam-*.jpg

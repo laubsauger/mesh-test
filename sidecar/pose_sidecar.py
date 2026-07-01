@@ -362,9 +362,10 @@ def annotate(timings, frame, box):
         print(f"[sidecar] f{_diag['n']} conf={timings['poseConf']} span={span} box={timings['box']}")
 
 
-def enumerate_cameras(max_n=8):
+def enumerate_cameras(max_n=8, save_dir=None):
     """Probe indices 0..max_n: which OPEN + deliver LIVE (non-black) frames, at what res.
-    Index-based (OpenCV can't read device names portably) — find your OBS/real cam here."""
+    Index-based (OpenCV can't read device names portably) — find your OBS/real cam here.
+    If save_dir given, WRITE the grabbed frame to cam-<i>.jpg so you can SEE each feed."""
     out = []
     backends = ([(cv2.CAP_DSHOW, "DShow"), (cv2.CAP_MSMF, "MSMF")]
                 if sys.platform == "win32" else [(cv2.CAP_ANY, "default")])
@@ -374,17 +375,23 @@ def enumerate_cameras(max_n=8):
             if not cap.isOpened():
                 cap.release()
                 continue
-            live, w, h = False, 0, 0
+            live, w, h, mean, snap = False, 0, 0, 0.0, None
             for _ in range(6):
                 ok, f = cap.read()
                 if ok and f is not None:
                     h, w = f.shape[:2]
-                    if float(f.mean()) > 5:
+                    snap = f  # keep the last real frame (even if dark) for the snapshot
+                    mean = float(f.mean())
+                    if mean > 5:
                         live = True
                         break
                 time.sleep(0.03)
             cap.release()
-            out.append({"index": i, "backend": name, "live": live, "w": w, "h": h})
+            path = None
+            if save_dir is not None and snap is not None:
+                path = os.path.abspath(os.path.join(save_dir, f"cam-{i}.jpg"))
+                cv2.imwrite(path, snap)  # open this to SEE what the device shows
+            out.append({"index": i, "backend": name, "live": live, "w": w, "h": h, "mean": round(mean, 1), "path": path})
             break  # one working backend per index is enough to report
     return out
 
@@ -677,11 +684,12 @@ async def main():
     global NATIVE_DEVICE
     NATIVE_DEVICE = args.device
 
-    if args.list_cameras:  # discovery — no model load, no server
+    if args.list_cameras:  # discovery — no model load, no server. Saves a JPG per device.
         print("[sidecar] scanning cameras (this opens each index briefly)…")
-        for c in enumerate_cameras():
-            print(f"  device {c['index']} ({c['backend']}): {'LIVE ✓' if c['live'] else 'black/none ✗'}  {c['w']}x{c['h']}")
-        print("[sidecar] pick a LIVE index → set it as the Native Device in the UI (or pass via the browser).")
+        for c in enumerate_cameras(save_dir="."):
+            tag = "LIVE ✓" if c["live"] else "black/none ✗"
+            print(f"  device {c['index']} ({c['backend']}): {tag}  {c['w']}x{c['h']}  mean={c['mean']}  ->  {c['path'] or '(no frame)'}")
+        print("[sidecar] OPEN the cam-<N>.jpg files to SEE each feed. Pick a LIVE index → Native Device.")
         return
 
     global FP16, COREML_UNITS
