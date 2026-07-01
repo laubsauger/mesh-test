@@ -42,7 +42,9 @@ function rerootHand(joints, hand, wrist, base) {
       x: wrist.x + p.x * AX.x,
       y: wrist.y + p.y * AX.y,
       z: wrist.z + p.z * AX.z,
-      confidence: p.visibility ?? 0.9
+      // HandLandmarker leaves visibility=0 (no visibility head) — a real 0, not
+      // undefined, so `??` wouldn't fall back. `||` treats absent (0) as confident.
+      confidence: p.visibility || 0.9
     };
   }
 }
@@ -102,7 +104,7 @@ export function fillHands2D(k2d, handNorm, base, width, height) {
   if (!handNorm) return;
   for (let k = 0; k < 21 && k < handNorm.length; k += 1) {
     const p = handNorm[k];
-    k2d[base + k] = { x: p.x * width, y: p.y * height, confidence: p.visibility ?? 0.9 };
+    k2d[base + k] = { x: p.x * width, y: p.y * height, confidence: p.visibility || 0.9 }; // hands: visibility=0, see rerootHand
   }
 }
 

@@ -1,7 +1,7 @@
 // 2D skeleton overlay on a canvas sized to the video — the M1 "does it track me"
 // check. Draws raw keypoints2D + body/foot bones, gated by confidence. `mirror`
 // flips x to match a CSS-mirrored selfie video.
-import { BODY_BONES, KPT_GROUPS } from './topology.js';
+import { BODY_BONES, KPT_GROUPS, handEdges } from './topology.js';
 
 export function drawOverlay(ctx, frame, vidW, vidH, { kptThresh = 0.3, mirror = true, bg = null } = {}) {
   // bg = optional preview image (native-capture mode has no <video>, so the sidecar's
@@ -29,6 +29,22 @@ export function drawOverlay(ctx, frame, vidW, vidH, { kptThresh = 0.3, mirror = 
     ctx.moveTo(X(ka.x), ka.y);
     ctx.lineTo(X(kb.x), kb.y);
     ctx.stroke();
+  }
+
+  // Hand finger bones (COCO-WholeBody: left base 91, right base 112). Drawn before the
+  // dots so joints sit on top. Warm colors match the lhand/rhand dot groups.
+  for (const [base, color] of [[91, '#ffa726'], [112, '#ffd54f']]) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    for (const [a, b] of handEdges(base)) {
+      const ka = k[a];
+      const kb = k[b];
+      if (!ka || !kb || ka.confidence < kptThresh || kb.confidence < kptThresh) continue;
+      ctx.beginPath();
+      ctx.moveTo(X(ka.x), ka.y);
+      ctx.lineTo(X(kb.x), kb.y);
+      ctx.stroke();
+    }
   }
 
   for (const group of KPT_GROUPS) {
