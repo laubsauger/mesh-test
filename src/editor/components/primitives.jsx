@@ -44,12 +44,21 @@ export function MiniSlider({ label, value, onChange }) {
   );
 }
 
-export function Btn({ active, disabled, onClick, children, title }) {
+// A small keycap chip, e.g. shown on buttons so shortcuts are discoverable.
+export function Kbd({ children, dark }) {
+  return (
+    <kbd className={`ml-1 px-1 rounded text-[9px] font-mono leading-none border ${dark
+      ? 'border-black/25 text-black/55' : 'border-white/15 text-slate-400'}`}>{children}</kbd>
+  );
+}
+
+export function Btn({ active, disabled, onClick, children, title, kbd }) {
   return (
     <button title={title} disabled={disabled} onClick={onClick}
-      className={`px-2.5 py-1 rounded text-xs font-medium transition-colors disabled:opacity-30 ${active
+      className={`inline-flex items-center px-2.5 py-1 rounded text-xs font-medium transition-colors disabled:opacity-30 ${active
         ? 'bg-cyan-500 text-black' : 'bg-white/5 text-slate-200 hover:bg-white/10'}`}>
       {children}
+      {kbd ? <Kbd dark={active}>{kbd}</Kbd> : null}
     </button>
   );
 }

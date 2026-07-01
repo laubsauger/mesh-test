@@ -8,7 +8,8 @@ import * as THREE from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import { attribute, mix, texture, uniform, vec3 } from 'three/tsl';
 import { FACE_REGIONS, generateFaceMask, decodeFaceMask, assertMaskFits } from '../pose/face-mask.js';
-import { registerActions, setEditorState, editorState } from '../editor/editor-store.js';
+import { registerActions, setEditorState, editorState, actions } from '../editor/editor-store.js';
+import { HOTKEYS, REGION_KEYS, matchesHotkey } from '../editor/keymap.js';
 import { uploadMaskBuffer, syncConfigUniforms, recolorFaceMaskOverlay, refreshFaceMaskOverlays, downloadFaceMasks, flatAttr } from './deform.js';
 import { runtime } from './face-runtime.js';
 
@@ -22,6 +23,7 @@ export const faceEditor = {
   erase: false, symmetric: true, hingeMode: false, editHead: null, batch: null, painting: false,
   hingeStage: 0, hingeGizmo: null, // two-click hinge (0=origin next, 1=axis next); axis line
   brushRing: null, prevDrift: false, // Photoshop-style cursor ring; saved drift state
+  tempTool: null, // Ctrl-hold momentary tool (effective tool = tempTool || tool)
   history: [], histIndex: -1, lastSnapT: 0, lastSnapTag: '' // undo/redo ring
 };
 const REGION_HEX = { jaw: 0xff5c5c, lowerLip: 0xff9f43, mouthCorner: 0xfeca57, upperLidL: 0x54a0ff, upperLidR: 0x5f27cd, browL: 0x1dd1a1, browR: 0x00d2d3 };
@@ -50,6 +52,7 @@ export function setFaceEditMode(on) {
   if (faceEditor.brushRing) faceEditor.brushRing.visible = false;
   if (!on) {
     // Restore camera drift + full orbit on exit.
+    faceEditor.tempTool = null;
     state.cameraDrift = faceEditor.prevDrift; controls.autoRotate = faceEditor.prevDrift;
     controls.enableRotate = true; controls.enablePan = true;
     return;
@@ -67,14 +70,31 @@ export function setFaceEditMode(on) {
   statusEl.textContent = `Face editor: ${batch.mesh.name} — Brush tool paints, Move tool orbits (B/V).`;
 }
 
-// Tool select: Camera = full orbit, no paint; Brush = paint (rotate/pan off so drags
-// paint, zoom stays on). Keeps painting and camera moves from fighting each other.
-export function faceEditSetTool(t) {
-  faceEditor.tool = t;
+// Effective tool = the Ctrl-held momentary override, else the selected tool.
+const effTool = () => faceEditor.tempTool || faceEditor.tool;
+
+// Apply orbit/paint control mode for a tool: Camera = full orbit, no paint; Brush =
+// paint (rotate/pan off so drags paint, zoom stays on).
+function applyToolControls(t) {
   const brush = t === 'brush';
   controls.enableRotate = !brush; controls.enablePan = !brush; controls.enableZoom = true; controls.enabled = true;
   if (!brush && faceEditor.brushRing) faceEditor.brushRing.visible = false;
+}
+
+// Tool select (V/B or the panel). Clears any momentary override.
+export function faceEditSetTool(t) {
+  faceEditor.tool = t;
+  faceEditor.tempTool = null;
+  applyToolControls(t);
   setEditorState({ tool: t });
+}
+
+// Ctrl-hold: momentarily swap camera↔brush (orbit while painting) without changing the
+// selected tool or the UI; reverts on release. (Mac: ⌘ handles undo/save, so Ctrl is
+// free.) editorKeyDown/Up drive this.
+function setTempTool(on) {
+  if (on && !faceEditor.tempTool) { faceEditor.tempTool = faceEditor.tool === 'brush' ? 'camera' : 'brush'; applyToolControls(faceEditor.tempTool); }
+  else if (!on && faceEditor.tempTool) { faceEditor.tempTool = null; applyToolControls(faceEditor.tool); }
 }
 
 // Static clone of the head geometry, placed to the left of the crowd, scaled to a
@@ -222,7 +242,7 @@ function faceEditRaycast(e) {
 }
 
 export function onFaceEditDown(e) {
-  if (!faceEditor.active || !faceEditor.editHead || faceEditor.tool !== 'brush') return; // Camera tool → orbit only
+  if (!faceEditor.active || !faceEditor.editHead || effTool() !== 'brush') return; // Camera tool → orbit only
   if (e.button === 3 || e.button === 4) return; // aux = undo/redo (window listener)
   const hit = faceEditRaycast(e);
   if (!hit) return;
@@ -233,7 +253,7 @@ export function onFaceEditDown(e) {
 
 // In Brush tool: follow the cursor with the ring (always) + paint while dragging.
 export function onFaceEditMove(e) {
-  if (!faceEditor.active || faceEditor.tool !== 'brush' || !faceEditor.editHead) {
+  if (!faceEditor.active || effTool() !== 'brush' || !faceEditor.editHead) {
     if (faceEditor.brushRing) faceEditor.brushRing.visible = false;
     return;
   }
@@ -244,6 +264,39 @@ export function onFaceEditMove(e) {
 
 export function onFaceEditUp() {
   if (faceEditor.painting) { faceEditor.painting = false; faceEditCommit('paint'); } // one undo/stroke
+}
+
+// Keyboard shortcuts (editor only). Everything routes through the store actions so the
+// UI stays in sync; the labels shown on the buttons come from the same HOTKEYS map.
+export function onEditorKeyDown(e) {
+  if (!faceEditor.active) return;
+  const tag = e.target?.tagName;
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return; // don't hijack typing
+  if (e.key === 'Control') { setTempTool(true); return; } // Ctrl-hold: momentary tool swap
+  const H = HOTKEYS;
+  // Meta combos first (⌘/Ctrl).
+  if (matchesHotkey(e, H.redo)) { actions.redo?.(); e.preventDefault(); return; }
+  if (matchesHotkey(e, H.undo)) { actions.undo?.(); e.preventDefault(); return; }
+  if (matchesHotkey(e, H.save)) { actions.save?.(); e.preventDefault(); return; }
+  if (e.metaKey || e.ctrlKey) return; // leave other meta combos alone
+  // Plain / shift keys.
+  if (matchesHotkey(e, H.camera)) actions.setTool?.('camera');
+  else if (matchesHotkey(e, H.brush)) actions.setTool?.('brush');
+  else if (matchesHotkey(e, H.paint)) actions.setMode?.('paint');
+  else if (matchesHotkey(e, H.erase)) actions.setMode?.('erase');
+  else if (matchesHotkey(e, H.hinge)) actions.setMode?.('hinge');
+  else if (matchesHotkey(e, H.symmetric)) actions.setSymmetric?.(!faceEditor.symmetric);
+  else if (matchesHotkey(e, H.radiusDown)) actions.setRadius?.(Math.max(0.005, +(faceEditor.radius - 0.01).toFixed(3)));
+  else if (matchesHotkey(e, H.radiusUp)) actions.setRadius?.(Math.min(0.3, +(faceEditor.radius + 0.01).toFixed(3)));
+  else if (matchesHotkey(e, H.flip)) actions.reseed?.(true);   // ⇧R
+  else if (matchesHotkey(e, H.reseed)) actions.reseed?.(false); // R
+  else if (matchesHotkey(e, H.clear)) actions.clearRegion?.();
+  else { const i = REGION_KEYS.indexOf(e.key); if (i >= 0 && i < FACE_REGIONS.length) actions.setRegion?.(FACE_REGIONS[i]); else return; }
+  e.preventDefault();
+}
+
+export function onEditorKeyUp(e) {
+  if (e.key === 'Control') setTempTool(false);
 }
 
 // Photoshop-style brush cursor: a ring on the surface at the paint radius, colored by
@@ -266,7 +319,7 @@ function buildBrushRing() {
 function updateBrushRing(hit) {
   if (!faceEditor.brushRing) faceEditor.brushRing = buildBrushRing();
   const ring = faceEditor.brushRing;
-  const show = faceEditor.active && faceEditor.tool === 'brush' && faceEditor.editHead && hit && !faceEditor.hingeMode;
+  const show = faceEditor.active && effTool() === 'brush' && faceEditor.editHead && hit && !faceEditor.hingeMode;
   ring.visible = show;
   if (!show) return;
   ring.scale.setScalar(faceEditor.radius * faceEditor.editHead.scale.x); // local radius → world

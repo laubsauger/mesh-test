@@ -59,7 +59,7 @@ import {
 import {
   initEditor, faceEditor, registerEditorActions, setFaceEditMode,
   onFaceEditDown, onFaceEditMove, onFaceEditUp, faceEditUndo, faceEditRedo, faceEditSetTool,
-  faceEditReseed, faceEditPaint, faceEditClearRegion
+  faceEditReseed, faceEditPaint, faceEditClearRegion, onEditorKeyDown, onEditorKeyUp
 } from './face/editor.js';
 import { KPT, NUM_KPTS, RTMW_VARIANTS, YOLO_RES_OPTIONS } from './pose/rtmw-constants.js';
 import { CanonicalSmoother } from './pose/one-euro.js';
@@ -147,23 +147,15 @@ renderer.domElement.addEventListener('pointerdown', (e) => onFaceEditDown(e));
 renderer.domElement.addEventListener('pointermove', (e) => onFaceEditMove(e));
 window.addEventListener('pointerup', () => onFaceEditUp());
 renderer.domElement.addEventListener('contextmenu', (e) => { if (faceEditor.active) e.preventDefault(); });
-// Undo/redo: mouse back/forward (buttons 3/4) + Cmd/Ctrl+Z / Shift+Z / Y (editor only).
+// Mouse back/forward (buttons 3/4) = undo/redo (editor only). Keyboard shortcuts +
+// Ctrl-hold tool-swap live in editor.js (onEditorKeyDown/Up) so all editor hotkeys +
+// their on-screen labels share one keymap.
 window.addEventListener('pointerdown', (e) => {
   if (!faceEditor.active) return;
   if (e.button === 3) { faceEditUndo(); e.preventDefault(); } else if (e.button === 4) { faceEditRedo(); e.preventDefault(); }
 });
-window.addEventListener('keydown', (e) => {
-  if (!faceEditor.active) return;
-  const tag = e.target?.tagName;
-  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return; // don't hijack typing
-  const k = e.key.toLowerCase();
-  if (e.metaKey || e.ctrlKey) {
-    if (k === 'z') { if (e.shiftKey) faceEditRedo(); else faceEditUndo(); e.preventDefault(); } else if (k === 'y') { faceEditRedo(); e.preventDefault(); }
-    return;
-  }
-  if (k === 'b') { faceEditSetTool('brush'); e.preventDefault(); } // Photoshop-style tool keys
-  else if (k === 'v') { faceEditSetTool('camera'); e.preventDefault(); }
-});
+window.addEventListener('keydown', (e) => onEditorKeyDown(e));
+window.addEventListener('keyup', (e) => onEditorKeyUp(e));
 
 // 3D debug overlay: the canonical pose (what drives the rig) drawn as a line
 // skeleton at the pose performer, to spot retarget discrepancies vs the mesh.

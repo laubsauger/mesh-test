@@ -1,6 +1,7 @@
 // Editor header (T32): title, model select, undo/redo, save/load .bin, close.
 import { useRef } from 'react';
 import { actions } from '../editor-store.js';
+import { HOTKEYS } from '../keymap.js';
 import { Btn } from './primitives.jsx';
 
 export default function Header({ s }) {
@@ -19,10 +20,10 @@ export default function Header({ s }) {
         {s.models.map((m) => <option key={m.index} value={m.index}>{m.name}</option>)}
       </select>
       <div className="flex gap-1">
-        <Btn disabled={!s.canUndo} onClick={() => actions.undo()} title="Undo (⌘/Ctrl+Z, mouse back)">↶</Btn>
-        <Btn disabled={!s.canRedo} onClick={() => actions.redo()} title="Redo (⌘/Ctrl+Shift+Z, mouse fwd)">↷</Btn>
+        <Btn disabled={!s.canUndo} onClick={() => actions.undo()} title={`Undo (${HOTKEYS.undo.label}, mouse back)`}>↶</Btn>
+        <Btn disabled={!s.canRedo} onClick={() => actions.redo()} title={`Redo (${HOTKEYS.redo.label}, mouse fwd)`}>↷</Btn>
       </div>
-      <Btn onClick={() => actions.save()} title="Download .bin (commit into public/models/)">Save</Btn>
+      <Btn onClick={() => actions.save()} kbd={HOTKEYS.save.label} title="Download .bin (commit into public/models/)">Save</Btn>
       <Btn onClick={() => fileRef.current?.click()} title="Load a .bin override">Load</Btn>
       <input ref={fileRef} type="file" accept=".bin" className="hidden" onChange={onLoadFile} />
       <Btn onClick={() => actions.setOpen(false)} title="Close editor">✕</Btn>
