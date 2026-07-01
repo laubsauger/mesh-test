@@ -13,7 +13,8 @@ export const editorState = {
   symmetric: true,
   overlays: { editHead: true, wireframe: false, maskCloud: false, crowd: true },
   expr: { jawOpen: 0, smile: 0, pucker: 0, blinkL: 0, blinkR: 0, browL: 0, browR: 0 },
-  regionSums: {},        // region → painted-weight sum (for the region list badges)
+  // Current region's deform config (T30 configurable regions), mirrored from main.js.
+  regionConfig: { driver: 0, type: 0, amount: 0, dir: [0, -1, 0], mirrorX: false, hingeOrigin: [0, 0, 0], hingeAxis: [1, 0, 0] },
   status: ''
 };
 

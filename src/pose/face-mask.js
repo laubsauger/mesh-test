@@ -15,10 +15,40 @@
 //   browL/R   ← browL/R (translate up)
 export const FACE_REGIONS = ['jaw', 'lowerLip', 'mouthCorner', 'upperLidL', 'upperLidR', 'browL', 'browR'];
 
+// Expression scalars a region can be DRIVEN by (index = order here). Any region can be
+// reassigned to any driver in the editor (T30 configurable regions).
+export const EXPR_KEYS = ['jawOpen', 'smile', 'pucker', 'blinkL', 'blinkR', 'browL', 'browR'];
+export const DEFORM_TYPES = ['translate', 'hinge']; // 0 = translate along dir, 1 = hinge-rotate about axis
+
+// Per-region deform config (aligned to FACE_REGIONS). `driver` indexes EXPR_KEYS;
+// `type` indexes DEFORM_TYPES; `amount` = radians (hinge) or fraction-of-headHeight
+// (translate); `dir` = local translate direction; `mirrorX` flips dir.x by the vertex's
+// side (mouth corners spread ±X); hinge origin/axis for type=hinge. Defaults reproduce
+// the original hardcoded T28 behavior; the editor makes every field tunable.
+export function defaultRegionConfig(hinge) {
+  const O = hinge?.origin ? hinge.origin.slice(0, 3) : [0, 0, 0];
+  const A = hinge?.axis ? hinge.axis.slice(0, 3) : [1, 0, 0];
+  const mk = (driver, type, amount, dir, mirrorX) => ({
+    driver, type, amount, dir: dir.slice(), mirrorX, hingeOrigin: O.slice(), hingeAxis: A.slice()
+  });
+  return [
+    mk(0, 1, 0.5, [0, -1, 0], false),  // jaw       ← jawOpen, hinge
+    mk(0, 0, 0.06, [0, -1, 0], false), // lowerLip  ← jawOpen, translate down
+    mk(1, 0, 0.05, [1, 0, 0], true),   // mouthCorner ← smile, translate outward (±X)
+    mk(3, 0, 0.06, [0, -1, 0], false), // upperLidL ← blinkL, translate down
+    mk(4, 0, 0.06, [0, -1, 0], false), // upperLidR ← blinkR, translate down
+    mk(5, 0, 0.04, [0, 1, 0], false),  // browL     ← browL, translate up
+    mk(6, 0, 0.04, [0, 1, 0], false)   // browR     ← browR, translate up
+  ];
+}
+
 const MAGIC = 0x464d534b; // 'FMSK'
-const VERSION = 1;
+const VERSION = 2; // v2 adds per-region config block
 // magic + ver + regionCount + vertexCount + hinge(6 f32) + headHeight(1 f32)
 const HEADER_BYTES = 4 + 1 + 1 + 4 + 6 * 4 + 4;
+// Per-region config block (v2): driver u8 + type u8 + mirrorX u8 + pad u8 + amount f32
+// + dir(3 f32) + hingeOrigin(3 f32) + hingeAxis(3 f32) = 4 + 4 + 36 = 44 bytes/region.
+const CONFIG_BYTES = 4 + 4 + 12 + 12 + 12;
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 // Trapezoid membership: ramps 0→1 over [lo-f,lo], 1 across [lo,hi], 1→0 over [hi,hi+f].
@@ -107,7 +137,7 @@ export function generateFaceMask({ positions, skinIndices, skinWeights, count, h
   // headHeight = the deform's scale reference (geometry units): translations (lip
   // drop, lid close, brow raise) are expressed as fractions of it so they hold across
   // Meshy exports of differing scale (T28). Hinge rotation is scale-free.
-  return { vertexCount: count, regions: FACE_REGIONS, data, hinge, headHeight: hY };
+  return { vertexCount: count, regions: FACE_REGIONS, data, hinge, headHeight: hY, config: defaultRegionConfig(hinge) };
 }
 
 // Serialize to the `.bin` sidecar layout (see HEADER_BYTES). Returns an ArrayBuffer.
@@ -117,7 +147,8 @@ export function encodeFaceMask(mask) {
   if (data.length !== R * vertexCount) {
     throw new Error(`encodeFaceMask: data length ${data.length} != regions×verts ${R * vertexCount}`);
   }
-  const buf = new ArrayBuffer(HEADER_BYTES + data.length);
+  const config = mask.config || defaultRegionConfig(hinge);
+  const buf = new ArrayBuffer(HEADER_BYTES + R * CONFIG_BYTES + data.length);
   const dv = new DataView(buf);
   let o = 0;
   dv.setUint32(o, MAGIC, true); o += 4;
@@ -127,7 +158,16 @@ export function encodeFaceMask(mask) {
   for (let k = 0; k < 3; k += 1) { dv.setFloat32(o, hinge.origin[k], true); o += 4; }
   for (let k = 0; k < 3; k += 1) { dv.setFloat32(o, hinge.axis[k], true); o += 4; }
   dv.setFloat32(o, headHeight, true); o += 4;
-  new Uint8Array(buf, HEADER_BYTES).set(data);
+  // Per-region config block.
+  for (let r = 0; r < R; r += 1) {
+    const c = config[r];
+    dv.setUint8(o, c.driver); dv.setUint8(o + 1, c.type); dv.setUint8(o + 2, c.mirrorX ? 1 : 0); dv.setUint8(o + 3, 0); o += 4;
+    dv.setFloat32(o, c.amount, true); o += 4;
+    for (let k = 0; k < 3; k += 1) { dv.setFloat32(o, c.dir[k], true); o += 4; }
+    for (let k = 0; k < 3; k += 1) { dv.setFloat32(o, c.hingeOrigin[k], true); o += 4; }
+    for (let k = 0; k < 3; k += 1) { dv.setFloat32(o, c.hingeAxis[k], true); o += 4; }
+  }
+  new Uint8Array(buf, HEADER_BYTES + R * CONFIG_BYTES).set(data);
   return buf;
 }
 
@@ -146,10 +186,21 @@ export function decodeFaceMask(arrayBuffer) {
   const origin = [dv.getFloat32(o, true), dv.getFloat32(o + 4, true), dv.getFloat32(o + 8, true)]; o += 12;
   const axis = [dv.getFloat32(o, true), dv.getFloat32(o + 4, true), dv.getFloat32(o + 8, true)]; o += 12;
   const headHeight = dv.getFloat32(o, true); o += 4;
+  // Per-region config block.
+  const config = [];
+  for (let r = 0; r < R; r += 1) {
+    const driver = dv.getUint8(o); const type = dv.getUint8(o + 1); const mirrorX = dv.getUint8(o + 2) === 1; o += 4;
+    const amount = dv.getFloat32(o, true); o += 4;
+    const dir = [dv.getFloat32(o, true), dv.getFloat32(o + 4, true), dv.getFloat32(o + 8, true)]; o += 12;
+    const hingeOrigin = [dv.getFloat32(o, true), dv.getFloat32(o + 4, true), dv.getFloat32(o + 8, true)]; o += 12;
+    const hingeAxis = [dv.getFloat32(o, true), dv.getFloat32(o + 4, true), dv.getFloat32(o + 8, true)]; o += 12;
+    config.push({ driver, type, amount, dir, mirrorX, hingeOrigin, hingeAxis });
+  }
   const expect = R * vertexCount;
-  const data = new Uint8Array(arrayBuffer, HEADER_BYTES, expect);
+  const dataOffset = HEADER_BYTES + R * CONFIG_BYTES;
+  const data = new Uint8Array(arrayBuffer, dataOffset, expect);
   if (data.length !== expect) throw new Error(`decodeFaceMask: data length ${data.length} != ${expect}`);
-  return { vertexCount, regions: FACE_REGIONS.slice(), data: new Uint8Array(data), hinge: { origin, axis }, headHeight };
+  return { vertexCount, regions: FACE_REGIONS.slice(), data: new Uint8Array(data), hinge: { origin, axis }, headHeight, config };
 }
 
 // V28 guard: a mask only applies to the geometry it was built for. A vertexCount

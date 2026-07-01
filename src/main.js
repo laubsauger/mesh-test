@@ -358,7 +358,7 @@ const state = {
   poseEP: 'webgpu',
   poseEnabled: true, // dev default: pose on at load
   poseWorker: true, // run inference in a Worker (own GPU device, off main thread)
-  poseBackend: 'worker', // 'worker' = onnxruntime-web (webgpu) | 'sidecar' = native ORT (TRT/CUDA) over WS | 'mediapipe' = in-browser BlazePose+Face
+  poseBackend: 'mediapipe', // default: in-browser BlazePose+Face (no sidecar). 'worker' = onnxruntime-web | 'sidecar'/'sidecar-native' = native ORT over WS
   poseMediaPipeHands: false, // mediapipe: also run the 21-pt hand landmarker (extra cost)
   poseSidecarDebug: false, // sidecar: console per-frame timing/flow trace
   poseReadback: 'bitmap', // sidecar frame snapshot: 'bitmap'(createImageBitmap) | 'videoframe'(WebCodecs)
@@ -589,8 +589,10 @@ function hidePreloader() {
 }
 
 function buildInspectorControls() {
-  // dev default: single mesh selected (pose drives one performer).
-  state.selectedMeshIds = manifest.meshes.length ? [manifest.meshes[0].id] : [];
+  // dev default: single mesh selected (pose drives one performer). Prefer the T-Pose
+  // Hero (added for pose work); fall back to the first mesh.
+  const defaultMesh = manifest.meshes.find((m) => m.id === 'Meshy_AI_T_Pose_Hero_biped') ?? manifest.meshes[0];
+  state.selectedMeshIds = defaultMesh ? [defaultMesh.id] : [];
 
   const performanceGroup = renderer.inspector.createParameters('VJ Layer / Scene');
   performanceGroup.add(state, 'count', 1, 500).name('Count').onChange((value) => {
@@ -689,7 +691,7 @@ function buildInspectorControls() {
   }).listen();
   lightingGroup.add(state, 'glowShadows').name('Glow Shadows (slow)').onChange(applyGlowShadows);
   lightingGroup.add(state, 'emissiveBoost', 0, 5, 0.01).name('Emissive').onChange(() => {
-    for (const batch of crowdBatches) applyEmissiveBoost(batch.source);
+    for (const batch of crowdBatches) applyEmissiveBoost(batch.source, batch.mesh.id);
   });
 
   const meshGroup = renderer.inspector.createParameters('VJ Layer / Meshes');
@@ -850,13 +852,8 @@ function buildInspectorControls() {
   faceGroup.add(faceStats, 'browL').name('Brow L').listen();
   faceGroup.add(faceStats, 'browR').name('Brow R').listen();
   faceGroup.add({ recalibrate: () => faceExpr.recalibrateNeutral() }, 'recalibrate').name('Recalibrate Neutral (rest face)');
-  // T28: face deform toggle + amount tuning (live uniforms, no rebuild).
+  // T28: face deform on/off (per-region amounts now live in the editor's config).
   faceGroup.add(state, 'faceDrive').name('Face Drive (deform)');
-  faceGroup.add(state, 'faceJawAngle', 0, 1.2, 0.01).name('Jaw Angle (rad)');
-  faceGroup.add(state, 'faceLipDrop', 0, 0.2, 0.005).name('Lip Drop');
-  faceGroup.add(state, 'faceCornerMove', 0, 0.2, 0.005).name('Mouth Corner');
-  faceGroup.add(state, 'faceLidDrop', 0, 0.2, 0.005).name('Lid Close');
-  faceGroup.add(state, 'faceBrowRaise', 0, 0.2, 0.005).name('Brow Raise');
   // T27: region-mask debug + persistence.
   faceGroup.add(state, 'faceMaskDebug').name('Mask Debug (verts)').onChange(refreshFaceMaskOverlays);
   faceGroup.add(state, 'faceMaskRegion', FACE_REGIONS).name('Mask Region').onChange(refreshFaceMaskOverlays);
@@ -1062,7 +1059,7 @@ async function loadCrowdBatch(mesh, animationAsset, batchWalkers) {
   }
 
   normalizeModel(source);
-  applyEmissiveBoost(source);
+  applyEmissiveBoost(source, mesh.id);
 
   // idle: no mixer/action — the rig stays at its bind pose (won't fight pose).
   const mixer = isIdle ? null : new THREE.AnimationMixer(source);
@@ -1366,33 +1363,33 @@ async function buildFaceMask(batch, mesh, skinnedMeshes) {
 
   // Per-instance expression buffer: 2 vec4/instance = [jawOpen,smile,pucker,blinkL |
   // blinkR,browL,browR,_]. Updated CPU-side each frame (writeFaceExpr), read in compute.
+  // Per-instance expression = FLAT floats (8/instance) so the deform can index the
+  // driver scalar by a per-region uniform int (configurable regions, T30).
   const nWalkers = batch.walkers.length;
-  batch.faceExpr = new StorageBufferAttribute(nWalkers * 2, 4);
-  batch.faceExprNode = storage(batch.faceExpr, 'vec4', nWalkers * 2).toReadOnly();
+  batch.faceExpr = new StorageBufferAttribute(nWalkers * 8, 1);
+  batch.faceExprNode = storage(batch.faceExpr, 'float', nWalkers * 8).toReadOnly();
 
   // Per-vertex mask buffer: 2 vec4/vertex = [jaw,lowerLip,mouthCorner,upperLidL |
   // upperLidR,browL,browR,_], normalized 0..1. Filled from mask.data; re-uploaded live
-  // when the editor (T29) repaints/re-seeds.
+  // when the editor repaints/re-seeds.
   const maskAttr = new StorageBufferAttribute(vertexCount * 2, 4);
   uploadMaskBuffer(mask, maskAttr);
   const maskNode = storage(maskAttr, 'vec4', vertexCount * 2).toReadOnly();
 
-  // Hinge + amount uniforms (amounts driven live from state each frame; 0 when
-  // faceDrive is off → no deform without a rebuild).
-  const axis = new THREE.Vector3(mask.hinge.axis[0], mask.hinge.axis[1], mask.hinge.axis[2]);
-  if (axis.lengthSq() < 1e-8) axis.set(1, 0, 0); else axis.normalize();
+  // Per-region config uniforms (driver/type/amount/dir/mirror/hinge) — every field
+  // live-tunable from the editor without a shader rebuild (T30). faceOn gates the whole
+  // deform (0 when faceDrive off). Values synced from mask.config by syncConfigUniforms.
   batch.faceUniforms = {
-    hingeOrigin: uniform(new THREE.Vector3(mask.hinge.origin[0], mask.hinge.origin[1], mask.hinge.origin[2])),
-    hingeAxis: uniform(axis),
     headHeight: uniform(mask.headHeight || 1),
-    jawAngle: uniform(0),
-    lipDrop: uniform(0),
-    cornerMove: uniform(0),
-    lidDrop: uniform(0),
-    browRaise: uniform(0)
+    faceOn: uniform(0),
+    regions: mask.config.map(() => ({
+      driver: uniform(0), type: uniform(0), amount: uniform(0), mirrorX: uniform(0),
+      dir: uniform(new THREE.Vector3()), hingeOrigin: uniform(new THREE.Vector3()), hingeAxis: uniform(new THREE.Vector3(1, 0, 0))
+    }))
   };
 
   batch.faceMask = { mask, headMesh, headBoneIndex, vertexCount, source, maskNode, maskAttr, geom, forwardSign: 1 };
+  syncConfigUniforms(batch);
   console.log(`[face] ${mesh.name}: mask ${source}, ${vertexCount} verts, head bone ${headBoneIndex}`);
   buildFaceMaskOverlay(batch);
 }
@@ -1409,40 +1406,53 @@ function uploadMaskBuffer(mask, maskAttr) {
   maskAttr.needsUpdate = true;
 }
 
-// Face deform (T28 / V29): displace the BIND-space head vertex before skinning, so the
-// head bone carries the motion. Jaw = hinge-rotate (Rodrigues about the ear-line axis);
-// lips/lids/brows = translate along mesh-local up. Normals unchanged (V29 note).
+// Face deform (T28/T30 / V29): displace the BIND-space head vertex before skinning, so
+// the head bone carries the motion. GENERAL config-driven form (T30 configurable
+// regions): each of the 7 regions independently contributes s = driver·weight·amount,
+// applied as either a TRANSLATE (dir·s·headHeight) or a HINGE-rotate (angle s about its
+// axis), blended by the region's `type` uniform. Every field is a uniform → the editor
+// retargets drivers / switches type / moves hinges with NO shader rebuild. Normals
+// unchanged (V29 note).
 function faceDeformNode(pos, sourceVertex, meshInstance, fm, batch) {
   const u = batch.faceUniforms;
-  const mi2 = meshInstance.mul(uint(2));
   const sv2 = sourceVertex.mul(uint(2));
-  const maskA = fm.maskNode.element(sv2);            // jaw, lowerLip, mouthCorner, upperLidL
-  const maskB = fm.maskNode.element(sv2.add(uint(1))); // upperLidR, browL, browR, _
-  const exprA = batch.faceExprNode.element(mi2);       // jawOpen, smile, pucker, blinkL
-  const exprB = batch.faceExprNode.element(mi2.add(uint(1))); // blinkR, browL, browR, _
-
-  // Jaw hinge — Rodrigues rotate (pos-origin) about the unit axis by θ, add the delta.
-  const theta = u.jawAngle.mul(exprA.x).mul(maskA.x);
-  const v = pos.sub(u.hingeOrigin);
-  const k = u.hingeAxis;
-  const c = cos(theta); const s = sin(theta);
-  const vrot = v.mul(c).add(k.cross(v).mul(s)).add(k.mul(k.dot(v)).mul(c.oneMinus()));
-  let p = pos.add(vrot.sub(v));
-
+  const maskA = fm.maskNode.element(sv2);            // regions 0..3
+  const maskB = fm.maskNode.element(sv2.add(uint(1))); // regions 4..6, _
+  const weight = [maskA.x, maskA.y, maskA.z, maskA.w, maskB.x, maskB.y, maskB.z];
+  const instBase = meshInstance.mul(uint(8));
   const hh = u.headHeight;
-  // lower lip follows jaw open, drops in mesh-local −y.
-  p = p.add(vec3(0, u.lipDrop.mul(hh).mul(exprA.x).mul(maskA.y).negate(), 0));
-  // mouth corners: smile spreads outward (±x), pucker narrows (net = smile−pucker).
-  const dir = sign(pos.x.sub(u.hingeOrigin.x));
-  const corner = u.cornerMove.mul(hh).mul(exprA.y.sub(exprA.z)).mul(maskA.z);
-  p = p.add(vec3(dir.mul(corner), 0, 0));
-  // upper lids close downward (−y): L=(blinkL,maskA.w), R=(blinkR,maskB.x).
-  const lid = u.lidDrop.mul(hh);
-  p = p.add(vec3(0, lid.mul(exprA.w).mul(maskA.w).add(lid.mul(exprB.x).mul(maskB.x)).negate(), 0));
-  // brows raise (+y): L=(browL,maskB.y), R=(browR,maskB.z).
-  const brow = u.browRaise.mul(hh);
-  p = p.add(vec3(0, brow.mul(exprB.y).mul(maskB.y).add(brow.mul(exprB.z).mul(maskB.z)), 0));
-  return p;
+  let delta = vec3(0, 0, 0);
+  for (let r = 0; r < 7; r += 1) {
+    const rc = u.regions[r];
+    const driver = batch.faceExprNode.element(instBase.add(uint(rc.driver))); // dynamic driver select
+    const s = driver.mul(weight[r]).mul(rc.amount).mul(u.faceOn);
+    // translate: dir·s·headHeight, with mirrorX flipping dir.x by the vertex's side.
+    const mx = mix(float(1), sign(pos.x.sub(rc.hingeOrigin.x)), rc.mirrorX);
+    const tDelta = vec3(rc.dir.x.mul(mx), rc.dir.y, rc.dir.z).mul(s).mul(hh);
+    // hinge: Rodrigues rotate (pos-origin) about axis by angle s.
+    const v = pos.sub(rc.hingeOrigin);
+    const k = rc.hingeAxis;
+    const c = cos(s); const sn = sin(s);
+    const hDelta = v.mul(c).add(k.cross(v).mul(sn)).add(k.mul(k.dot(v)).mul(c.oneMinus())).sub(v);
+    delta = delta.add(mix(tDelta, hDelta, rc.type));
+  }
+  return pos.add(delta);
+}
+
+// Push mask.config → the per-region deform uniforms (live edits, no rebuild).
+function syncConfigUniforms(batch) {
+  const u = batch.faceUniforms; if (!u) return;
+  const cfg = batch.faceMask.mask.config;
+  for (let r = 0; r < cfg.length; r += 1) {
+    const c = cfg[r]; const ru = u.regions[r];
+    ru.driver.value = c.driver; ru.type.value = c.type; ru.amount.value = c.amount; ru.mirrorX.value = c.mirrorX ? 1 : 0;
+    ru.dir.value.set(c.dir[0], c.dir[1], c.dir[2]);
+    ru.hingeOrigin.value.set(c.hingeOrigin[0], c.hingeOrigin[1], c.hingeOrigin[2]);
+    _defAxis.set(c.hingeAxis[0], c.hingeAxis[1], c.hingeAxis[2]);
+    if (_defAxis.lengthSq() < 1e-8) _defAxis.set(1, 0, 0); else _defAxis.normalize();
+    ru.hingeAxis.value.copy(_defAxis);
+  }
+  u.headHeight.value = batch.faceMask.mask.headHeight || 1;
 }
 
 // Debug cloud: head verts at bind-pose world position, colored by the selected
@@ -1518,7 +1528,8 @@ function downloadFaceMasks() {
 // re-places the jaw hinge — the fixes for the wrong-region failures on stylized heads.
 const faceEditor = {
   active: false, batchIndex: 0, region: 'jaw', radius: 0.04, strength: 0.5,
-  erase: false, symmetric: true, hingeMode: false, editHead: null, batch: null, painting: false
+  erase: false, symmetric: true, hingeMode: false, editHead: null, batch: null, painting: false,
+  hingeStage: 0, hingeGizmo: null // two-click hinge (0=origin next, 1=axis next); axis line
 };
 const REGION_MIRROR = { upperLidL: 'upperLidR', upperLidR: 'upperLidL', browL: 'browR', browR: 'browL' };
 const _rayNDC = new THREE.Vector2();
@@ -1539,6 +1550,7 @@ function setFaceEditMode(on) {
     faceEditor.editHead = null;
   }
   faceEditor.batch = null;
+  if (faceEditor.hingeGizmo) faceEditor.hingeGizmo.visible = false;
   if (!on) return;
   const batch = editBatch();
   if (!batch) { statusEl.textContent = 'Face editor: no model with a face mask.'; faceEditor.active = false; return; }
@@ -1638,15 +1650,6 @@ function faceEditPaint(worldPoint, erase) {
   recolorEditHead();
 }
 
-function applyHingeUniforms(batch) {
-  const u = batch.faceUniforms; const h = batch.faceMask.mask.hinge;
-  u.hingeOrigin.value.set(h.origin[0], h.origin[1], h.origin[2]);
-  const ax = _vTmp.set(h.axis[0], h.axis[1], h.axis[2]);
-  if (ax.lengthSq() < 1e-8) ax.set(1, 0, 0); else ax.normalize();
-  u.hingeAxis.value.copy(ax);
-  u.headHeight.value = batch.faceMask.mask.headHeight || 1;
-}
-
 // Re-run auto-gen (optionally flipping the assumed +z forward), re-upload, recolor.
 function faceEditReseed(flipForward) {
   const batch = faceEditor.batch || editBatch(); if (!batch) return;
@@ -1660,8 +1663,10 @@ function faceEditReseed(flipForward) {
     count: fm.vertexCount, headBoneIndex: fm.headBoneIndex, forwardSign: fm.forwardSign
   });
   uploadMaskBuffer(fm.mask, fm.maskAttr);
-  applyHingeUniforms(batch);
+  syncConfigUniforms(batch);
   recolorEditHead();
+  deformEditHead();
+  pushRegionConfigToStore();
   if (batch.faceMaskOverlay) recolorFaceMaskOverlay(batch.faceMaskOverlay);
   statusEl.textContent = `Re-seeded ${batch.mesh.name} (forward ${fm.forwardSign > 0 ? '+z' : '-z'}).`;
 }
@@ -1687,13 +1692,7 @@ function onFaceEditDown(e) {
   const hit = faceEditRaycast(e);
   if (!hit) return; // missed head → let OrbitControls handle it (orbit empty space)
   controls.enabled = false; // paint, don't orbit
-  if (faceEditor.hingeMode) {
-    faceEditor.editHead.worldToLocal(_vLocal.copy(hit.point));
-    faceEditor.batch.faceMask.mask.hinge.origin = [_vLocal.x, _vLocal.y, _vLocal.z];
-    applyHingeUniforms(faceEditor.batch);
-    statusEl.textContent = 'Jaw hinge set.';
-    return;
-  }
+  if (faceEditor.hingeMode) { faceEditSetHinge(hit.point); return; }
   faceEditor.painting = true;
   faceEditPaint(hit.point, e.button === 2 || faceEditor.erase);
 }
@@ -1708,41 +1707,103 @@ function onFaceEditUp() {
   if (faceEditor.painting || !controls.enabled) { faceEditor.painting = false; controls.enabled = true; }
 }
 
-// CPU preview deform for the edit-head (T30 test-drive): apply the SAME jaw-hinge +
-// translates as the GPU path (faceDeformNode) to the static edit-head so the sliders
-// show the effect WYSIWYG while painting. Cheap (one mesh, recompute on change).
+// Two-click hinge editing (T30): 1st click sets the current region's hinge ORIGIN (and
+// switches it to hinge type); 2nd click sets the AXIS direction (origin→point). Updates
+// the config + gizmo live.
+function faceEditSetHinge(worldPoint) {
+  const batch = faceEditor.batch; if (!batch) return;
+  const r = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
+  const c = batch.faceMask.mask.config[r];
+  faceEditor.editHead.worldToLocal(_vLocal.copy(worldPoint));
+  if (!faceEditor.hingeStage) {
+    c.hingeOrigin = [_vLocal.x, _vLocal.y, _vLocal.z];
+    c.type = 1; // hinging a region implies hinge type
+    faceEditor.hingeStage = 1;
+    statusEl.textContent = `${faceEditor.region}: hinge origin set — click a 2nd point for the axis.`;
+  } else {
+    const dx = _vLocal.x - c.hingeOrigin[0]; const dy = _vLocal.y - c.hingeOrigin[1]; const dz = _vLocal.z - c.hingeOrigin[2];
+    const len = Math.hypot(dx, dy, dz) || 1;
+    c.hingeAxis = [dx / len, dy / len, dz / len];
+    faceEditor.hingeStage = 0;
+    statusEl.textContent = `${faceEditor.region}: hinge axis set.`;
+  }
+  syncConfigUniforms(batch); deformEditHead(); updateHingeGizmo(); pushRegionConfigToStore();
+}
+
+// Cyan line showing the current region's hinge (origin ± axis). Visible when the region
+// is hinge-type or hinge mode is on.
+function updateHingeGizmo() {
+  const batch = faceEditor.batch; const eh = faceEditor.editHead;
+  if (!batch || !eh) { if (faceEditor.hingeGizmo) faceEditor.hingeGizmo.visible = false; return; }
+  const r = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
+  const c = batch.faceMask.mask.config[r];
+  const show = c.type === 1 || faceEditor.hingeMode;
+  if (!faceEditor.hingeGizmo) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+    const line = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0x00ffff, depthTest: false, transparent: true }));
+    line.renderOrder = 2001; line.frustumCulled = false; scene.add(line);
+    faceEditor.hingeGizmo = line;
+  }
+  const line = faceEditor.hingeGizmo; line.visible = show;
+  if (!show) return;
+  eh.updateWorldMatrix(true, false);
+  const o = new THREE.Vector3(c.hingeOrigin[0], c.hingeOrigin[1], c.hingeOrigin[2]);
+  const a = new THREE.Vector3(c.hingeAxis[0], c.hingeAxis[1], c.hingeAxis[2]);
+  if (a.lengthSq() < 1e-8) a.set(1, 0, 0); else a.normalize();
+  const L = (batch.faceMask.mask.headHeight || 1) * 0.6;
+  const p1 = o.clone().addScaledVector(a, -L).applyMatrix4(eh.matrixWorld);
+  const p2 = o.clone().addScaledVector(a, L).applyMatrix4(eh.matrixWorld);
+  const arr = line.geometry.getAttribute('position').array;
+  arr[0] = p1.x; arr[1] = p1.y; arr[2] = p1.z; arr[3] = p2.x; arr[4] = p2.y; arr[5] = p2.z;
+  line.geometry.getAttribute('position').needsUpdate = true;
+}
+
+// Mirror the current region's config into the store so the React config panel reflects it.
+function pushRegionConfigToStore() {
+  const batch = faceEditor.batch; if (!batch) return;
+  const r = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
+  setEditorState({ regionConfig: { ...batch.faceMask.mask.config[r] } });
+}
+
+// CPU preview deform for the edit-head (T30 test-drive): the SAME config-driven form as
+// the GPU faceDeformNode, on the static edit-head so sliders show the effect WYSIWYG.
 const ZERO_EXPR = { jawOpen: 0, smile: 0, pucker: 0, blinkL: 0, blinkR: 0, browL: 0, browR: 0 };
+const EXPR_ORDER = ['jawOpen', 'smile', 'pucker', 'blinkL', 'blinkR', 'browL', 'browR'];
 const _defAxis = new THREE.Vector3();
 function deformEditHead() {
   const mesh = faceEditor.editHead; const batch = faceEditor.batch;
   if (!mesh || !faceEditor.bindPositions || !batch) return;
   const fm = batch.faceMask; const N = fm.vertexCount; const D = fm.mask.data;
+  const cfg = fm.mask.config; const hh = fm.mask.headHeight || 1;
   const e = debugFaceOverride || ZERO_EXPR;
+  const drv = EXPR_ORDER.map((k) => e[k]); // driver index → scalar value
   const bind = faceEditor.bindPositions;
   const pos = mesh.geometry.getAttribute('position');
-  const h = fm.mask.hinge; const hh = fm.mask.headHeight || 1;
-  const ox = h.origin[0]; const oy = h.origin[1]; const oz = h.origin[2];
-  _defAxis.set(h.axis[0], h.axis[1], h.axis[2]);
-  if (_defAxis.lengthSq() < 1e-8) _defAxis.set(1, 0, 0); else _defAxis.normalize();
-  const kx = _defAxis.x; const ky = _defAxis.y; const kz = _defAxis.z;
-  const jawA = state.faceJawAngle; const lip = state.faceLipDrop * hh; const corner = state.faceCornerMove * hh;
-  const lid = state.faceLidDrop * hh; const brow = state.faceBrowRaise * hh;
   for (let i = 0; i < N; i += 1) {
-    let x = bind[i * 3]; let y = bind[i * 3 + 1]; let z = bind[i * 3 + 2];
-    const theta = jawA * e.jawOpen * (D[i] / 255);
-    if (theta > 1e-5) { // Rodrigues rotate about the hinge axis through the origin
-      const vx = x - ox; const vy = y - oy; const vz = z - oz;
-      const c = Math.cos(theta); const sN = Math.sin(theta); const oneC = 1 - c;
-      const dot = kx * vx + ky * vy + kz * vz;
-      const crx = ky * vz - kz * vy; const cry = kz * vx - kx * vz; const crz = kx * vy - ky * vx;
-      x = ox + vx * c + crx * sN + kx * dot * oneC;
-      y = oy + vy * c + cry * sN + ky * dot * oneC;
-      z = oz + vz * c + crz * sN + kz * dot * oneC;
+    const bx = bind[i * 3]; const by = bind[i * 3 + 1]; const bz = bind[i * 3 + 2];
+    let x = bx; let y = by; let z = bz;
+    for (let r = 0; r < 7; r += 1) {
+      const c = cfg[r];
+      const s = drv[c.driver] * (D[r * N + i] / 255) * c.amount;
+      if (s === 0) continue;
+      if (c.type === 1) { // hinge (Rodrigues about c.hingeAxis through c.hingeOrigin)
+        const ox = c.hingeOrigin[0]; const oy = c.hingeOrigin[1]; const oz = c.hingeOrigin[2];
+        _defAxis.set(c.hingeAxis[0], c.hingeAxis[1], c.hingeAxis[2]);
+        if (_defAxis.lengthSq() < 1e-8) _defAxis.set(1, 0, 0); else _defAxis.normalize();
+        const kx = _defAxis.x; const ky = _defAxis.y; const kz = _defAxis.z;
+        const vx = bx - ox; const vy = by - oy; const vz = bz - oz;
+        const cc = Math.cos(s); const sn = Math.sin(s); const oneC = 1 - cc;
+        const dot = kx * vx + ky * vy + kz * vz;
+        const crx = ky * vz - kz * vy; const cry = kz * vx - kx * vz; const crz = kx * vy - ky * vx;
+        x += (ox + vx * cc + crx * sn + kx * dot * oneC) - bx;
+        y += (oy + vy * cc + cry * sn + ky * dot * oneC) - by;
+        z += (oz + vz * cc + crz * sn + kz * dot * oneC) - bz;
+      } else { // translate along dir (mirrorX flips x by side), scaled by headHeight
+        const mx = c.mirrorX ? Math.sign(bx - c.hingeOrigin[0]) : 1;
+        x += c.dir[0] * mx * s * hh; y += c.dir[1] * s * hh; z += c.dir[2] * s * hh;
+      }
     }
-    y -= lip * e.jawOpen * (D[N + i] / 255);
-    x += Math.sign(bind[i * 3] - ox) * corner * (e.smile - e.pucker) * (D[2 * N + i] / 255);
-    y -= lid * (e.blinkL * (D[3 * N + i] / 255) + e.blinkR * (D[4 * N + i] / 255));
-    y += brow * (e.browL * (D[5 * N + i] / 255) + e.browR * (D[6 * N + i] / 255));
     pos.setXYZ(i, x, y, z);
   }
   pos.needsUpdate = true;
@@ -1775,9 +1836,11 @@ function faceEditLoadMask(arrayBuffer) {
     const mask = assertMaskFits(decodeFaceMask(arrayBuffer), batch.faceMask.vertexCount);
     batch.faceMask.mask = mask;
     uploadMaskBuffer(mask, batch.faceMask.maskAttr);
-    applyHingeUniforms(batch);
+    syncConfigUniforms(batch);
     recolorEditHead();
     deformEditHead();
+    updateHingeGizmo();
+    pushRegionConfigToStore();
     setEditorState({ status: 'Loaded .bin' });
   } catch (err) {
     setEditorState({ status: `Load failed: ${err.message}` });
@@ -1788,14 +1851,21 @@ function faceEditLoadMask(arrayBuffer) {
 // React only reads the store + invokes these.
 function registerEditorActions() {
   registerActions({
-    setOpen(v) { faceEditor.active = v; setFaceEditMode(v); if (v) syncEditorStore(); setEditorState({ open: v }); },
-    setModel(i) { faceEditor.batchIndex = i; setFaceEditMode(true); deformEditHead(); setEditorState({ modelIndex: i }); },
-    setRegion(r) { faceEditor.region = r; recolorEditHead(); setEditorState({ region: r }); },
-    setMode(m) { faceEditor.erase = m === 'erase'; faceEditor.hingeMode = m === 'hinge'; setEditorState({ mode: m }); },
+    setOpen(v) { faceEditor.active = v; setFaceEditMode(v); if (v) { syncEditorStore(); pushRegionConfigToStore(); updateHingeGizmo(); } setEditorState({ open: v }); },
+    setModel(i) { faceEditor.batchIndex = i; setFaceEditMode(true); deformEditHead(); pushRegionConfigToStore(); updateHingeGizmo(); setEditorState({ modelIndex: i }); },
+    setRegion(r) { faceEditor.region = r; faceEditor.hingeStage = 0; recolorEditHead(); pushRegionConfigToStore(); updateHingeGizmo(); setEditorState({ region: r }); },
+    setMode(m) { faceEditor.erase = m === 'erase'; faceEditor.hingeMode = m === 'hinge'; faceEditor.hingeStage = 0; updateHingeGizmo(); setEditorState({ mode: m }); },
     setRadius(v) { faceEditor.radius = v; setEditorState({ radius: v }); },
     setStrength(v) { faceEditor.strength = v; setEditorState({ strength: v }); },
     setSymmetric(v) { faceEditor.symmetric = v; setEditorState({ symmetric: v }); },
-    reseed(flip) { faceEditReseed(flip); recolorEditHead(); deformEditHead(); },
+    // Patch the CURRENT region's deform config (driver/type/amount/dir/mirrorX) live.
+    setRegionConfig(patch) {
+      const batch = faceEditor.batch; if (!batch) return;
+      const r = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
+      Object.assign(batch.faceMask.mask.config[r], patch);
+      syncConfigUniforms(batch); deformEditHead(); updateHingeGizmo(); pushRegionConfigToStore();
+    },
+    reseed(flip) { faceEditReseed(flip); },
     clearRegion() { faceEditClearRegion(); deformEditHead(); },
     save() { downloadFaceMasks(); },
     loadMask(buf) { faceEditLoadMask(buf); },
@@ -1886,7 +1956,13 @@ function updatePerformerLightRig(walker, elapsed) {
   walker.lightRig.rimLight.intensity = state.performerRim * pulse;
 }
 
-function applyEmissiveBoost(model) {
+// Per-model emissive trim: some GLBs bake a HOTTER neon map (T Pose Hero) → too much
+// bloom at the global Emissive=1. Scale that model's emissive down without dimming the
+// others. 1 = as-authored; tune per id here.
+const EMISSIVE_SCALE = { Meshy_AI_T_Pose_Hero_biped: 0.5 };
+
+function applyEmissiveBoost(model, meshId) {
+  const scale = EMISSIVE_SCALE[meshId] ?? 1;
   model.traverse((child) => {
     if ((!child.isMesh && !child.isSkinnedMesh) || !child.material) return;
 
@@ -1900,14 +1976,14 @@ function applyEmissiveBoost(model) {
         // and the MRT emissive pass have real signal. Zeroing emissive here was
         // multiplying the vein map by 0 and killing all glow + bloom.
         material.emissive.setRGB(1, 1, 1);
-        material.emissiveIntensity = state.emissiveBoost;
+        material.emissiveIntensity = state.emissiveBoost * scale;
       } else if (material.color) {
         // Untextured fallback: derive a glow from a saturated base color.
         const color = material.color;
         const maxChannel = Math.max(color.r, color.g, color.b);
         const saturation = maxChannel - Math.min(color.r, color.g, color.b);
         if (maxChannel > 0.45 && saturation > 0.14) {
-          material.emissive.copy(color).multiplyScalar(state.emissiveBoost * 0.55);
+          material.emissive.copy(color).multiplyScalar(state.emissiveBoost * 0.55 * scale);
           material.emissiveIntensity = state.emissiveBoost;
         } else {
           material.emissive.setRGB(0, 0, 0);
@@ -2142,16 +2218,12 @@ function writeFaceExpr(walker, batch) {
   }
 }
 
-// Live-tune the deform amounts from state; 0 when faceDrive is off (no rebuild).
+// Gate the whole deform each frame (per-region amounts live in the config uniforms,
+// synced by syncConfigUniforms on edit).
 function updateFaceUniforms(batch) {
   const u = batch.faceUniforms;
   if (!u) return;
-  const on = state.faceDrive;
-  u.jawAngle.value = on ? state.faceJawAngle : 0;
-  u.lipDrop.value = on ? state.faceLipDrop : 0;
-  u.cornerMove.value = on ? state.faceCornerMove : 0;
-  u.lidDrop.value = on ? state.faceLidDrop : 0;
-  u.browRaise.value = on ? state.faceBrowRaise : 0;
+  u.faceOn.value = state.faceDrive ? 1 : 0;
 }
 
 function choreoOpts() {

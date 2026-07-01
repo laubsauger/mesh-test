@@ -76,6 +76,12 @@ describe('encode/decode + guard', () => {
     expect(back.vertexCount).toBe(mask.vertexCount);
     expect(back.headHeight).toBeCloseTo(mask.headHeight, 5);
     expect(Array.from(back.data)).toEqual(Array.from(mask.data));
+    // per-region config (v2) round-trips
+    expect(back.config.length).toBe(mask.config.length);
+    expect(back.config[0].type).toBe(mask.config[0].type); // jaw = hinge
+    expect(back.config[0].driver).toBe(mask.config[0].driver);
+    expect(back.config[2].mirrorX).toBe(mask.config[2].mirrorX); // mouthCorner mirrored
+    expect(back.config[1].amount).toBeCloseTo(mask.config[1].amount, 5);
     back.hinge.origin.forEach((v, k) => expect(v).toBeCloseTo(mask.hinge.origin[k], 5)); // f32 round-trip
     back.hinge.axis.forEach((v, k) => expect(v).toBeCloseTo(mask.hinge.axis[k], 5));
   });
