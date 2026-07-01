@@ -484,6 +484,24 @@ def select_box(boxes, last):
     return min(boxes, key=lambda b: (b[0] + b[2] / 2 - lcx) ** 2 + (b[1] + b[3] / 2 - lcy) ** 2)
 
 
+def smooth_box(box, prev, a_pos=0.5, a_size=0.25):
+    """Temporal low-pass the crop box. The raw detector box WIDTH jitters ±49% frame-
+    to-frame (measured) → the crop warps every frame → overlay scale-pulse + injected
+    pose x/z noise. Smooth in center+size space; damp SIZE harder than POSITION (a
+    person translates faster than they resize). Returns a new [x,y,w,h,*rest]."""
+    if prev is None or box is None:
+        return box
+    x, y, w, h = box[0], box[1], box[2], box[3]
+    px, py, pw, ph = prev[0], prev[1], prev[2], prev[3]
+    cx, cy = x + w / 2, y + h / 2
+    pcx, pcy = px + pw / 2, py + ph / 2
+    ncx = pcx + (cx - pcx) * a_pos
+    ncy = pcy + (cy - pcy) * a_pos
+    nw = pw + (w - pw) * a_size
+    nh = ph + (h - ph) * a_size
+    return [ncx - nw / 2, ncy - nh / 2, nw, nh, *box[4:]]
+
+
 async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, preview_w):
     """BACKEND-OWNED capture: the sidecar opens the webcam ITSELF, runs det→crop→pose
     →decode natively, and PUSHES only keypoints to the browser. No camera frame ever
@@ -550,8 +568,12 @@ async def native_capture_loop(ws, pipe, thresh, device, width, height, preview, 
                 if no_det == 30:
                     print(f"[sidecar] 30 frames, NO person detected (frame mean={float(bgr.mean()):.1f}) — "
                           "black camera, or person out of view, or kptThresh too high")
-            box = select_box(boxes, last_box)  # track the person → no transient-box trash
-            last_box = box
+            raw_box = select_box(boxes, last_box)  # track the person → no transient-box trash
+            if raw_box is not None:
+                box = smooth_box(raw_box, last_box)  # temporal low-pass → kill the crop scale-pulse
+                last_box = box
+            else:
+                box = None  # dropout: hold last_box for continuity, emit no pose this frame
             frame, timings = pipe.infer(rgb, cfg["thresh"], [box] if box else [])
             timings["detect"] = detect_ms
             annotate(timings, frame, box)  # box + poseConf → flows to the browser debug trace

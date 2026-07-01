@@ -77,6 +77,9 @@ export class NativeCapturePoseProvider {
       if (this._lastPushAt) this.stats.sendHz = 1000 / Math.max(1, now - this._lastPushAt);
       this._lastPushAt = now;
       this.timings = { ...this.timings, ...t };
+      // Stamp the frame with receive-time so RECORDINGS carry timing (the sidecar's raw
+      // `frame` has none → analyzer couldn't compute rates). Monotonic; deltas are valid.
+      if (msg.frame && msg.frame.timestampMs == null) msg.frame.timestampMs = now;
       this.latestFrame = msg.frame;
       if (msg.frame) this.stats.recv += 1; else this.stats.dropped += 1;
       if (this.debug) {

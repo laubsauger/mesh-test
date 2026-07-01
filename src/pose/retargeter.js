@@ -30,9 +30,42 @@ const _qFrac = new THREE.Quaternion(); // torso: fractional world bend Q^f per s
 const _qWorldT = new THREE.Quaternion(); // torso: per-bone target world quat
 const _qId = new THREE.Quaternion(); // identity (slerp start for Q^f)
 const _qTorso = new THREE.Quaternion(); // torso: full world delta Q (rest frame→target)
+const _twist = new THREE.Quaternion(); // swing/twist limit temps
+const _swing = new THREE.Quaternion();
+const _qInv = new THREE.Quaternion();
+const _qClampTmp = new THREE.Quaternion();
 const _mBind = new THREE.Matrix4();
 const _mTarget = new THREE.Matrix4();
 const DEG2RAD = Math.PI / 180;
+const TWIST_LIMIT_DEG = 90; // axial roll cap — separate from swing so roll can't
+// inflate the reach clamp (that inflation is what yanked bones "weird", user §arch).
+
+// Scale a quaternion's rotation angle down to maxDeg (slerp from identity). Mutates q.
+function clampQuatAngle(q, maxDeg) {
+  const angle = 2 * Math.acos(Math.min(1, Math.abs(q.w)));
+  const maxRad = maxDeg * DEG2RAD;
+  if (angle > maxRad && angle > 1e-4) {
+    _qClampTmp.identity().slerp(q, maxRad / angle);
+    q.copy(_qClampTmp);
+  }
+  return angle / DEG2RAD; // pre-clamp angle (deg), for diagnostics
+}
+
+// Swing/twist limit: split `delta` (local rotation from rest) into TWIST (axial roll
+// about the bone's own length axis) + SWING (the bend/reach), clamp each separately,
+// recompose into `out`. Anatomical: roll gets a tight cap, reach a loose one — vs a
+// single total-angle clamp where a bit of arbitrary roll ate the reach budget and
+// yanked the bone toward rest. `axis` = bone length dir in its LOCAL frame.
+function limitSwingTwist(delta, axis, swingMaxDeg, out) {
+  const d = delta.x * axis.x + delta.y * axis.y + delta.z * axis.z;
+  _twist.set(axis.x * d, axis.y * d, axis.z * d, delta.w);
+  if (_twist.lengthSq() < 1e-8) _twist.set(0, 0, 0, 1); else _twist.normalize();
+  _swing.copy(delta).multiply(_qInv.copy(_twist).invert()); // delta = swing·twist → swing = delta·twist⁻¹
+  const swingRaw = clampQuatAngle(_swing, swingMaxDeg);
+  clampQuatAngle(_twist, TWIST_LIMIT_DEG);
+  out.copy(_swing).multiply(_twist);
+  return swingRaw;
+}
 
 // Rotation mapping orthonormal-ish basis (a1,a2) → (b1,b2), written to `out`.
 const _a2o = new THREE.Vector3();
@@ -69,6 +102,55 @@ function confGate(conf, thresh, band = 0.12) {
   return t <= 0 ? 0 : t * t * (3 - 2 * t);
 }
 
+// FacingEstimator — stable body/head YAW without trusting the flip-prone monocular
+// z-sign (measured: shoulder depth axis is near-zero 70% of the time, its sign pure
+// noise → the 180° spin). Instead:
+//   magnitude ← 2D L↔R width FORESHORTENING (image plane, stable): turn shrinks the
+//               projected shoulder/ear width. Scale-normalized by body/head height so
+//               distance doesn't fake a turn. Running-max = the frontal reference.
+//   sign      ← z-diff, but ONLY consulted once the magnitude proves a REAL turn
+//               (past a gate) AND the z-diff is decisive — else the sign is HELD.
+//   deadzone  ← near-frontal magnitude → 0 (no yaw at all), so frontal z-noise can't
+//               rotate anything. This is the whole fix: sign of ~0 is never applied.
+export class FacingEstimator {
+  constructor() { this.r0 = 0; this.sign = 1; this.theta = 0; this.pitch = 0; this.pitch0 = undefined; }
+
+  update(l, r, height2D, { deadzone = 0.17, signGate = 0.32, zMin = 0.05, follow = 0.15, gain = 1 } = {}) {
+    const width2D = Math.hypot(r.x - l.x, r.y - l.y);
+    const ratio = height2D > 1e-4 ? width2D / height2D : 0;
+    this.r0 = Math.max(this.r0 * 0.9995, ratio); // running-max frontal ratio (scale-invariant)
+    const cos = this.r0 > 1e-4 ? Math.min(1, ratio / this.r0) : 1;
+    // SOFT deadzone: subtract it (continuous ramp from 0) instead of a hard cutoff that
+    // snapped 0→deadzone at the edge — that snap was the "sudden jump at a threshold".
+    const mag = Math.max(0, Math.min(Math.PI / 2, Math.acos(cos) * gain) - deadzone);
+    const zdiff = r.z - l.z;
+    if (mag > signGate && Math.abs(zdiff) > zMin) this.sign = Math.sign(zdiff) || this.sign;
+    this.theta += (this.sign * mag - this.theta) * follow; // temporal smooth
+    return this.theta;
+  }
+
+  // Smooth a DIRECTLY-provided signed yaw (head nose-offset — already sign-correct 2D).
+  // Soft deadzone (subtract, not cutoff) so it eases in without a jump at the edge.
+  smoothAngle(raw, { deadzone = 0.17, follow = 0.15 } = {}) {
+    const mag = Math.max(0, Math.abs(raw) - deadzone);
+    this.theta += (Math.sign(raw) * mag - this.theta) * follow;
+    return this.theta;
+  }
+
+  // Head PITCH (forward/back nod) from a raw signed value (nose vertical offset from the
+  // ear line). Auto-baselines the frontal offset (slow running mean = pitch0) so rest =
+  // no nod, then smooths the deviation. No calibration needed.
+  smoothPitch(raw, { follow = 0.15 } = {}) {
+    if (this.pitch0 === undefined) this.pitch0 = raw;
+    this.pitch0 += (raw - this.pitch0) * 0.002; // slow frontal-baseline learn
+    this.pitch += ((raw - this.pitch0) - this.pitch) * follow;
+    return this.pitch;
+  }
+}
+
+const _right = new THREE.Vector3();
+const _qYaw = new THREE.Quaternion();
+
 const _blend = new THREE.Vector3();
 function smoothAxis(last, candidate, follow, mode) {
   const backward = candidate.dot(last) < 0;
@@ -89,6 +171,8 @@ export class Retargeter {
     this.lastPlaneN = new Map(); // limb → last good bend-plane normal (pole stability)
     this.clampStats = new Map(); // V19: boneKey → { raw°, max°, clamped } last frame
     this.clampPeak = new Map(); // V19: boneKey → worst { raw°, max°, over° } since reset
+    this.torsoFacing = new FacingEstimator(); // 2D-foreshortening yaw (flip-safe, no z-sign spin)
+    this.headFacing = new FacingEstimator();
     this._captureBind();
   }
 
@@ -108,7 +192,10 @@ export class Retargeter {
     restDirWorld.normalize();
     const bindWorldQuat = new THREE.Quaternion();
     bone.getWorldQuaternion(bindWorldQuat);
-    const entry = { restDirWorld, bindWorldQuat, restLocalQuat: bone.quaternion.clone() };
+    // localAim = bone's length axis in its OWN local frame (twist axis for the
+    // swing/twist limit): world child-dir mapped back through the bind orientation.
+    const localAim = restDirWorld.clone().applyQuaternion(_qInv.copy(bindWorldQuat).invert());
+    const entry = { restDirWorld, bindWorldQuat, restLocalQuat: bone.quaternion.clone(), localAim };
     this.bind.set(boneKey, entry);
     return entry;
   }
@@ -190,7 +277,8 @@ export class Retargeter {
       restDirWorld.normalize();
       const bindWorldQuat = new THREE.Quaternion();
       bone.getWorldQuaternion(bindWorldQuat);
-      this.bind.set(handKey, { restDirWorld, bindWorldQuat, restLocalQuat: bone.quaternion.clone() });
+      const localAim = restDirWorld.clone().applyQuaternion(_qInv.copy(bindWorldQuat).invert());
+      this.bind.set(handKey, { restDirWorld, bindWorldQuat, restLocalQuat: bone.quaternion.clone(), localAim });
     }
 
     // Upper limbs: also capture the bind bend-plane normal from the rest rig
@@ -227,21 +315,34 @@ export class Retargeter {
       _qLocal.copy(qWorld);
     }
 
-    if (gain < 1) _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, gain);
+    // gain<1 eases the target toward rest (soft confidence / headGain). Preserve the
+    // target first: copy(rest) would clobber _qLocal → slerp rest onto itself → the bone
+    // PINNED to rest (the head, always gain 0.7, never moved; any soft-gated bone too).
+    if (gain < 1) {
+      _qClampTmp.copy(_qLocal); // target
+      _qLocal.copy(bind.restLocalQuat).slerp(_qClampTmp, gain);
+    }
 
     if (maxAngleDeg < 180) {
-      _qDelta.copy(bind.restLocalQuat).invert().multiply(_qLocal);
-      const angle = 2 * Math.acos(Math.min(1, Math.abs(_qDelta.w)));
+      // Plain total-angle clamp on the LOCAL articulation from rest. (Dropped the
+      // swing/twist split: it capped roll separately from reach, so a stacked twist
+      // pushed the TOTAL past the cap and PINNED bones — the "piece resisting rotation".
+      // The real flip fixes are upstream — straightness gates + 2D facing — so a bone
+      // never gets a garbage twist target that needs anatomical un-splitting here.)
+      _qDelta.copy(bind.restLocalQuat).invert().multiply(_qLocal); // articulation from rest
+      const rawDeg = 2 * Math.acos(Math.min(1, Math.abs(_qDelta.w))) / DEG2RAD;
       const maxRad = maxAngleDeg * DEG2RAD;
-      const clamped = angle > maxRad && angle > 1e-4;
-      if (clamped) _qLocal.copy(bind.restLocalQuat).slerp(_qLocal, maxRad / angle);
-      // V19: how far this bone WANTED to rotate vs the cap it hit (deg).
-      const rawDeg = angle / DEG2RAD;
+      if (rawDeg * DEG2RAD > maxRad && rawDeg > 1e-4 / DEG2RAD) {
+        // Clamp toward rest by (max/raw): rest → TARGET, not rest → rest. Must preserve
+        // the target first — copy(rest) would clobber _qLocal, slerping rest onto itself
+        // → every clamped bone snapped to REST (the arm stuck at A-pose). This was latent
+        // (only spine hit the else-branch) until the swing/twist path was dropped.
+        _qClampTmp.copy(_qLocal); // the aimed target
+        _qLocal.copy(bind.restLocalQuat).slerp(_qClampTmp, maxAngleDeg / rawDeg);
+      }
+      // V19: how far this bone WANTED to swing vs the cap it hit (deg).
+      const clamped = rawDeg > maxAngleDeg + 0.01;
       this.clampStats.set(boneKey, { raw: rawDeg, max: maxAngleDeg, clamped });
-      // Peak-hold + hit-count: live value flickers too fast to read, so keep the
-      // worst overflow per bone until reset. `hits` (clamped frames) vs the apply
-      // count tells a SUSTAINED reach (clamps most frames) from a one-frame
-      // inversion spike (peak 180° but hits≈1).
       if (clamped) {
         const p = this.clampPeak.get(boneKey);
         const over = rawDeg - maxAngleDeg;
@@ -310,32 +411,32 @@ export class Retargeter {
     const canTwist = opts.swingTwist && bind.bindPlaneN && e && e.confidence >= opts.kptThresh;
     if (canTwist) {
       _endP.set(e.x * sx, e.y, e.z * opts.depthScale);
-      _planeN.copy(_endP).sub(_midP).cross(_dir); // (end-mid) × (dir)
+      _target.copy(_endP).sub(_midP); // forearm vector (mid→end)
+      const foreLen = _target.length();
+      _planeN.copy(_target).cross(_dir); // bend-plane normal = forearm × upperDir
       const planeLen = _planeN.length();
-      // Pole-vector stability + smoothing: the bend normal depends on the wrist,
-      // so wrist/forearm jitter would roll the UPPER arm ("elbow spins when I turn
-      // my wrist"). Reuse the last plane when near-straight, and heavily smooth it
-      // (lerp) so twist follows gross changes, not per-frame wrist noise.
-      let plane = null;
-      if (planeLen > 0.04) {
+      // STRAIGHTNESS GATE (the arm-roll fix): sin(bend) = |forearm×dir|/|forearm|. A
+      // near-straight arm has NO defined bend plane — its normal is noise that flips
+      // ~180°/frame (measured up to 172° → the hard axial twist). Only twist a
+      // MEANINGFULLY BENT arm (>~25°); straighter → swing-only (roll is invisible on a
+      // straight arm anyway). The old |planeLen|>0.04 gate engaged twist at ~8° — deep
+      // in the noise. Bent enough → smooth the plane (align: bend-plane sign is free).
+      const sinBend = foreLen > 1e-6 ? planeLen / foreLen : 0;
+      if (sinBend > 0.42) { // ≈25° elbow bend
         _planeN.divideScalar(planeLen);
         let last = this.lastPlaneN.get(limb.upper);
         if (!last) {
           last = _planeN.clone();
           this.lastPlaneN.set(limb.upper, last);
         } else {
-          smoothAxis(last, _planeN, opts.planeFollow, 'align'); // bend-plane sign carries no info
+          smoothAxis(last, _planeN, opts.planeFollow, 'align');
         }
-        plane = last;
-      } else {
-        plane = this.lastPlaneN.get(limb.upper) ?? null;
-      }
-      if (plane) {
-        basisQuat(bind.restDirWorld, bind.bindPlaneN, _dir, plane, _q);
+        basisQuat(bind.restDirWorld, bind.bindPlaneN, _dir, last, _q);
         _q.multiply(bind.bindWorldQuat);
         this._setBoneFromWorld(limb.upper, bind, _q, opts.maxAngleDeg, opts.follow, gate);
         return;
       }
+      // near-straight → fall through to swing-only (no roll)
     }
     // fallback: swing only
     _q.setFromUnitVectors(bind.restDirWorld, _dir).multiply(bind.bindWorldQuat);
@@ -362,11 +463,18 @@ export class Retargeter {
       const a = canonical.joints[fa.rollA];
       const b = canonical.joints[fa.rollB];
       if (a && b && a.confidence >= opts.kptThresh && b.confidence >= opts.kptThresh) {
-        _planeN.set((b.x - a.x) * sx, b.y - a.y, (b.z - a.z) * opts.depthScale);
+        // Knuckle line (index→pinky) with z DAMPED hard — hand z is the noisiest signal
+        // (measured Δz ~0.2), and a noisy z flips the roll axis (same as the upper arm).
+        // The palm orientation is stable in 2D; z only refines it.
+        _planeN.set((b.x - a.x) * sx, b.y - a.y, (b.z - a.z) * opts.depthScale * 0.3);
+        const knuckLen = _planeN.length();
         _planeN.addScaledVector(_dir, -_dir.dot(_planeN)); // perpendicular to forearm
-        const len = _planeN.length();
-        if (len > 0.02) {
-          _planeN.divideScalar(len);
+        const perpLen = _planeN.length();
+        // GATE: only roll when the knuckle line is meaningfully PERPENDICULAR to the
+        // forearm (a defined palm normal). Near-parallel (edge-on palm / degenerate
+        // keypoints) → the roll axis is noise that flips → swing-only instead.
+        if (knuckLen > 1e-6 && perpLen / knuckLen > 0.5) { // >~30° off the forearm axis
+          _planeN.divideScalar(perpLen);
           let last = this.lastPlaneN.get(fa.bone);
           if (!last) { last = _planeN.clone(); this.lastPlaneN.set(fa.bone, last); }
           else smoothAxis(last, _planeN, opts.planeFollow, 'align'); // forearm-roll plane sign carries no info
@@ -408,17 +516,34 @@ export class Retargeter {
     // freeze — eases out/in without a pop.
     const gate = confGate(Math.min(hc.confidence, sc.confidence), opts.kptThresh);
 
+    // θ from 2D shoulder-width FORESHORTENING (stable) + hysteresis z-sign + frontal
+    // deadzone — NOT the flip-prone 3D hip axis. Updated EVERY frame (even when yaw
+    // isn't applied) so the facing-debug overlay reflects live detection; holds last
+    // when shoulders drop.
+    const ls = canonical.joints[KPT.leftShoulder];
+    const rs = canonical.joints[KPT.rightShoulder];
+    let theta = this.torsoFacing.theta;
+    if (ls && rs && ls.confidence >= opts.kptThresh && rs.confidence >= opts.kptThresh) {
+      const height2D = Math.hypot(sc.x - hc.x, sc.y - hc.y); // torso height (scale ref)
+      theta = this.torsoFacing.update(
+        { x: ls.x * sx, y: ls.y, z: ls.z }, { x: rs.x * sx, y: rs.y, z: rs.z }, height2D, opts.facing);
+    }
     let haveYaw = false;
-    if (opts.yaw && hipsBind.bindAcross && lh.confidence >= opts.kptThresh && rh.confidence >= opts.kptThresh) {
-      _planeN.set((rh.x - lh.x) * sx, rh.y - lh.y, (rh.z - lh.z) * opts.depthScale); // hip axis (right), 3D
-      _planeN.addScaledVector(_dir, -_dir.dot(_planeN)); // orthonormalize ⊥ up
-      if (_planeN.lengthSq() > 1e-6) {
-        _planeN.normalize();
-        basisQuat(hipsBind.restDirWorld, hipsBind.bindAcross, _dir, _planeN, _qTorso); // Q = world delta
+    if (opts.yaw && hipsBind.bindAcross) {
+      // Base the target right-axis on the RIG's own right (bindAcross), re-orthogonalized
+      // to the current up, then rotate by θ. (Using image-right `sx,0,0` was ±x-flipped
+      // vs bindAcross → a 180° offset that made basisQuat map to ~rest = no turn.)
+      _right.copy(hipsBind.bindAcross);
+      _right.addScaledVector(_dir, -_dir.dot(_right)); // ⊥ current up
+      if (_right.lengthSq() > 1e-6) {
+        _right.normalize();
+        _qYaw.setFromAxisAngle(_dir, theta);
+        _right.applyQuaternion(_qYaw); // rotate right into the turn
+        basisQuat(hipsBind.restDirWorld, hipsBind.bindAcross, _dir, _right, _qTorso);
         haveYaw = true;
       }
     }
-    if (!haveYaw) _qTorso.setFromUnitVectors(hipsBind.restDirWorld, _dir); // lean only (no hip axis)
+    if (!haveYaw) _qTorso.setFromUnitVectors(hipsBind.restDirWorld, _dir); // lean only (no yaw)
 
     // Distribute: cumulative weight f → Q^f at each bone (full Q at the top).
     let f = 0;
@@ -471,22 +596,51 @@ export class Retargeter {
     if (_dir.lengthSq() < 1e-8) return;
     _dir.normalize();
 
+    // Head yaw from FACE GEOMETRY: nose horizontal offset from the ear midline. SIGNED
+    // + 2D → no z, no flip. Nose is the cleanest marker (measured conf 0.92). Normalized
+    // by half the ear span (foreshortens on turn → amplifies toward profile). Updated
+    // every frame (debug overlay); applied only when yaw is on.
+    const nose = canonical.joints[KPT.nose];
+    let theta = this.headFacing.theta;
+    let pitch = this.headFacing.pitch;
+    if (le && re && le.confidence >= opts.kptThresh && re.confidence >= opts.kptThresh) {
+      const leX = le.x * sx; const reX = re.x * sx;
+      const earCx = (leX + reX) / 2;
+      const halfSpan = Math.abs(reX - leX) / 2;
+      // Require the ears meaningfully separated: near profile the span → 0 and the
+      // normalization explodes (measured pitch spiking to 17). Only read yaw+pitch when
+      // the face is frontal enough to trust; else hold the last smoothed value.
+      if (nose && nose.confidence >= opts.kptThresh && halfSpan > 0.03) {
+        const rawYaw = Math.asin(Math.max(-1, Math.min(1, (nose.x * sx - earCx) / halfSpan))); // nose X → yaw
+        const rawPitch = Math.max(-1, Math.min(1, ((le.y + re.y) / 2 - nose.y) / (2 * halfSpan))); // nose vs ear line → nod
+        theta = this.headFacing.smoothAngle(rawYaw, opts.facing);
+        pitch = this.headFacing.smoothPitch(rawPitch, opts.facing);
+      }
+    }
     let framed = false;
-    if (opts.yaw && bind.bindAcross && le && re && le.confidence >= opts.kptThresh && re.confidence >= opts.kptThresh) {
-      _planeN.set((re.x - le.x) * sx, re.y - le.y, (re.z - le.z) * opts.depthScale); // ear axis (right)
-      _planeN.addScaledVector(_dir, -_dir.dot(_planeN)); // orthonormalize ⊥ up
-      if (_planeN.lengthSq() > 1e-6) {
-        _planeN.normalize();
-        basisQuat(bind.restDirWorld, bind.bindAcross, _dir, _planeN, _q); // Q = world delta
+    if (opts.yaw && bind.bindAcross && le && re) {
+      _right.copy(bind.bindAcross); // rig's own right axis (NOT image-right, which was ±x-flipped)
+      _right.addScaledVector(_dir, -_dir.dot(_right)); // ⊥ current up
+      if (_right.lengthSq() > 1e-6) {
+        _right.normalize();
+        _qYaw.setFromAxisAngle(_dir, theta);
+        _right.applyQuaternion(_qYaw); // yaw: rotate right about up
+        _qYaw.setFromAxisAngle(_right, pitch * (opts.pitchGain ?? 0)); // pitch: tilt up about right (nod)
+        _dir.applyQuaternion(_qYaw);
+        basisQuat(bind.restDirWorld, bind.bindAcross, _dir, _right, _q);
         framed = true;
       }
     }
-    if (!framed) _q.setFromUnitVectors(bind.restDirWorld, _dir); // pitch only (no ears)
+    if (!framed) _q.setFromUnitVectors(bind.restDirWorld, _dir); // pitch/roll only (no yaw)
     _q.multiply(bind.bindWorldQuat);
     this._setBoneFromWorld('neck', bind, _q, opts.maxAngleDeg, opts.follow, gate * (opts.gain ?? 1));
   }
 
-  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, clavicle = false } = {}) {
+  // Reset the frontal-width reference (call on a "stand frontal" calibration frame so
+  // the yaw estimator learns THIS person/distance's frontal shoulder/ear width).
+  recalibrateFacing() { this.torsoFacing.r0 = 0; this.headFacing.r0 = 0; }
+
+  apply(canonical, { kptThresh = 0.3, mirrorX = true, depthScale = 1, jointLimitDeg = 180, armLimit = 180, follow = 1, swingTwist = true, headGain = 1, planeFollow = 0.12, wristTwist = false, grounding = false, groundFollow = 0.3, bodyYaw = true, facingDeadzone = 0.17, facingSmooth = 0.15, facingBodyGain = 1, headPitchGain = 2, clavicle = false } = {}) {
     this.restPose();
     this.rig.hips.position.y = this.hipsRestPosY; // reset (restPose only touches rotations)
     this.clampStats.clear(); // V19: only THIS frame's aimed bones report clamps
@@ -494,19 +648,20 @@ export class Retargeter {
     // depthScale = the ONE monocular-z trust knob, applied to every aim's z (no
     // per-bone damping). 1 = raw 3D.
     const base = { kptThresh, mirrorX, follow, maxAngleDeg: jointLimitDeg, swingTwist, planeFollow, depthScale };
+    const facing = { deadzone: facingDeadzone, follow: facingSmooth, gain: facingBodyGain }; // 2D-yaw estimator tuning
 
     // Torso (distributed across the spine chain); clavicles; upper limbs (children
     // compensate); forearms (with optional twist); then lower bones / feet / hands /
     // neck. Arms use a tighter limit (over-rotation guard). Torso first so the spine
     // is posed before its children (arms/neck) read updated parent world matrices.
-    this._aimTorso(canonical, { ...base, depthScale: depthScale * 0.2, yaw: bodyYaw }); // hip/shoulder z noisy
+    this._aimTorso(canonical, { ...base, depthScale: depthScale * 0.2, yaw: bodyYaw, facing }); // hip/shoulder z noisy
     if (clavicle) this._aimClavicles(canonical, { ...base, depthScale: depthScale * 0.25, gain: 0.6 });
     for (const limb of LIMBS) {
       const isArm = limb.upper.includes('Arm');
       this._aimLimb(limb, canonical, { ...base, depthScale: depthScale * limb.zTrust, maxAngleDeg: isArm ? armLimit : jointLimitDeg });
     }
     for (const fa of FOREARMS) this._aimForeArm(fa, canonical, { ...base, depthScale: depthScale * fa.zTrust, wristTwist, maxAngleDeg: armLimit });
-    this._aimHead(canonical, { ...base, depthScale: depthScale * 0.4, yaw: bodyYaw, gain: headGain });
+    this._aimHead(canonical, { ...base, depthScale: depthScale * 0.4, yaw: bodyYaw, gain: headGain, facing, pitchGain: headPitchGain });
     for (const seg of SEGMENTS) {
       this._aim(seg.bone, seg.from(canonical), seg.to(canonical), {
         ...base,
@@ -537,5 +692,26 @@ export class Retargeter {
     } else {
       this.groundOffsetY = 0;
     }
+
+    // DEBUG: compare the estimator θ to the yaw ACTUALLY applied to the mesh bones, so
+    // we can tell "estimator right, mesh wrong" from "not applied". Refresh the subtree
+    // then read spine02 + neck WORLD yaw (twist about world-up) vs their rest.
+    this.rig.hips.updateWorldMatrix(false, true);
+    this.debugFacing = {
+      bodyTheta: this.torsoFacing.theta * 180 / Math.PI,
+      headTheta: this.headFacing.theta * 180 / Math.PI,
+      spineYaw: this._yawAboutUp('spine02', this.bind.get('spine02')?.bindWorldQuat),
+      neckYaw: this._yawAboutUp('neck', this.bind.get('neck')?.bindWorldQuat)
+    };
+  }
+
+  // DEBUG: yaw (rotation about world-up) a bone's WORLD orientation carries vs its rest
+  // bind — the yaw that actually reaches the mesh. Compare to the estimator θ.
+  _yawAboutUp(boneKey, bindWorldQuat) {
+    const bone = this.rig[boneKey];
+    if (!bone || !bindWorldQuat) return 0;
+    bone.getWorldQuaternion(_q); // current world orientation
+    _qDelta.copy(_q).multiply(_qInv.copy(bindWorldQuat).invert()); // world delta from rest
+    return 2 * Math.atan2(_qDelta.y, _qDelta.w) * 180 / Math.PI; // twist about world-up (deg, signed)
   }
 }

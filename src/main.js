@@ -44,6 +44,7 @@ import { Retargeter } from './pose/retargeter.js';
 import { KPT, NUM_KPTS, RTMW_VARIANTS, YOLO_RES_OPTIONS } from './pose/rtmw-constants.js';
 import { CanonicalSmoother } from './pose/one-euro.js';
 import { PoseRecorder, PosePlayer } from './pose/recorder.js';
+import { PoseSkeleton3D } from './pose/skeleton-3d.js';
 
 const canvas = document.querySelector('#scene');
 const statusEl = document.querySelector('#status');
@@ -53,6 +54,8 @@ const poseOverlayEl = document.querySelector('#pose-overlay');
 const posePipLabel = document.querySelector('#pose-pip-label');
 const calibOverlay = document.querySelector('#calib-overlay');
 const calibTextEl = document.querySelector('#calib-text');
+const calibSkeletonEl = document.querySelector('#calib-skeleton');
+const calibSkeletonCtx = calibSkeletonEl.getContext('2d');
 
 const preloaderEl = document.querySelector('#preloader');
 const preloaderBar = document.querySelector('#preloader-bar');
@@ -365,17 +368,23 @@ const state = {
   // amplification), so turn/tilt/pivot come straight from the pelvis-aligned data.
   // The horizontal hip separation dominates the sign → stable near frontal (the old
   // yawGain-amplified scalar is what spun it, §B8/§B8b). Off = lean-only.
-  poseBodyYaw: false, // stable base while the FK rework lands (yaw twist is a separate known issue)
+  poseBodyYaw: true, // 2D-foreshortening yaw (flip-safe, validated). Head from nose-offset (great), body from shoulder width
+  poseFacingDeadzone: 0.17, // rad — below this |yaw| → 0 (frontal holds still; kills near-frontal flips)
+  poseFacingSmooth: 0.15, // yaw temporal smoothing (lower = smoother/laggier)
+  poseFacingBodyGain: 1.0, // body (torso) yaw strength — the shoulder read is ~half the head; raise to make the torso follow the arrow
+  poseHeadPitchGain: 2.0, // head forward/back nod strength (nose-Y). 0 = off; negate if it nods the wrong way
   poseClavicle: false, // shoulder shrug/protraction — unproven, opt-in
   poseFollow: 0.5, // higher = snappier (less laggy/jello)
   poseSwingTwist: true,
   poseWristTwist: true,
   poseTwistSmooth: 0.12,
   poseHeadGain: 0.7,
+  poseFacingDebug: false, // draw detected body/head facing as arrows (PiP compass + 3D on performer)
+  poseSkeleton3D: false, // draw the detected pose as 3D octahedron bones + joint markers on the performer
   poseRejectOutliers: true,
   poseMaxJump: 0.5,
   poseHoldMs: 2000,
-  poseBoneGate: true,
+  poseBoneGate: false, // OFF: 3D limb-length gate rejects 32-40% of TURNED frames (monocular z varies) → freeze. Velocity gate covers teleports.
   poseGrounding: true,
   poseGroundFollow: 0.3,
   poseOverlay: true,
@@ -727,7 +736,11 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseJointLimit', 30, 180, 1).name('Joint Limit °');
   poseGroup.add(state, 'poseArmLimit', 30, 180, 1).name('Arm Limit °');
   poseGroup.add(state, 'poseFollow', 0.05, 1, 0.01).name('Pose Follow (smooth)');
-  poseGroup.add(state, 'poseBodyYaw').name('Body Yaw (turn)').listen();
+  poseGroup.add(state, 'poseBodyYaw').name('Body Yaw (2D turn)').listen();
+  poseGroup.add(state, 'poseFacingDeadzone', 0, 0.6, 0.01).name('Yaw Deadzone');
+  poseGroup.add(state, 'poseFacingSmooth', 0.02, 0.5, 0.01).name('Yaw Smooth');
+  poseGroup.add(state, 'poseFacingBodyGain', 0.5, 3, 0.05).name('Body Yaw Gain');
+  poseGroup.add(state, 'poseHeadPitchGain', -4, 4, 0.1).name('Head Pitch (nod)');
   poseGroup.add(state, 'poseClavicle').name('Clavicles (shrug)').listen();
   poseGroup.add(state, 'poseSwingTwist').name('Swing-Twist').listen();
   poseGroup.add(state, 'poseTwistSmooth', 0.02, 1, 0.01).name('Twist Smooth');
@@ -742,6 +755,12 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseGrounding').name('Grounding (feet)').listen();
   poseGroup.add(state, 'poseGroundFollow', 0.05, 1, 0.01).name('Ground Smooth');
   poseGroup.add(state, 'poseOverlay').name('2D Overlay').listen();
+  poseGroup.add(state, 'poseFacingDebug').name('Facing Debug (arrows)').listen().onChange((on) => {
+    if (!on) { facingArrowBody.visible = false; facingArrowHead.visible = false; }
+  });
+  poseGroup.add(state, 'poseSkeleton3D').name('3D Pose Skeleton').listen().onChange((on) => {
+    if (!on) poseSkeleton3D.visible = false;
+  });
   poseGroup.add(state, 'poseDebug3D').name('Pose Debug 3D').listen();
   poseGroup.add(state, 'poseDebugScale', 0.2, 3, 0.01).name('Debug Scale');
   poseGroup.add(state, 'poseDebugHeight', 0, 3, 0.01).name('Debug Height');
@@ -766,6 +785,7 @@ function buildInspectorControls() {
   poseStatsGroup.add(poseStats, 'overlayMs').name('Overlay Draw').listen();
   poseStatsGroup.add(poseStats, 'retargetMs').name('Retarget/frame').listen();
   poseStatsGroup.add(poseStats, 'clamp').name('Clamp (want→cap)').listen();
+  poseStatsGroup.add(poseStats, 'facing').name('Facing θ→applied').listen();
   poseGroup.add(state, 'poseRecording').name('Record').listen().onChange((on) => {
     if (on) {
       poseRecorder.start({
@@ -1589,12 +1609,20 @@ function computePoseMatrices(batch) {
         grounding: state.poseGrounding,
         groundFollow: state.poseGroundFollow,
         bodyYaw: state.poseBodyYaw,
+        facingDeadzone: state.poseFacingDeadzone,
+        facingSmooth: state.poseFacingSmooth,
+        facingBodyGain: state.poseFacingBodyGain,
+        headPitchGain: state.poseHeadPitchGain,
         clavicle: state.poseClavicle
       });
       // V19: surface which bones the joint-limit clamp throttled (e.g. face-touch
       // → forearm wanted 148° capped 110°). Peak-held top 3 into the HUD (stable);
       // 'Dump Clamps' button prints the full table + resets.
       lastPoseRetargeter = batch.retargeter;
+      updateFacingArrows(batch.retargeter, batch.walkers?.[0]?.position);
+      updatePoseSkeleton3D(batch.walkers?.[0]?.position);
+      const df = batch.retargeter.debugFacing;
+      if (df) poseStats.facing = `body θ${df.bodyTheta.toFixed(0)}→spine${df.spineYaw.toFixed(0)}  head θ${df.headTheta.toFixed(0)}→neck${df.neckYaw.toFixed(0)}`;
       const rep = batch.retargeter.clampReport();
       poseStats.clamp = rep.length
         ? rep.slice(0, 3).map((r) => `${r.bone} ${Math.round(r.raw)}→${r.max}`).join('  ')
@@ -1726,9 +1754,72 @@ function syncPipAspect() {
     posePipEl.style.aspectRatio = `${poseOverlayEl.width} / ${poseOverlayEl.height}`;
   }
 }
+
+// --- Facing debug: draw the DETECTED body/head yaw (retargeter's 2D estimators) as
+// arrows — a top-down compass in the PiP + 3D arrows on the driven performer. Cyan =
+// body, magenta = head. Toggled by state.poseFacingDebug.
+const facingArrowBody = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), 1.1, 0x00e5ff, 0.32, 0.2);
+const facingArrowHead = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), 0.8, 0xff4fd8, 0.26, 0.16);
+facingArrowBody.visible = false;
+facingArrowHead.visible = false;
+scene.add(facingArrowBody, facingArrowHead);
+// 3D pose skeleton (octahedron bones + joint markers) — the detected pose drawn on the
+// performer, always-on-top. Anchored at the driven walker, pelvis at hip height.
+const poseSkeleton3D = new PoseSkeleton3D();
+poseSkeleton3D.visible = false;
+scene.add(poseSkeleton3D);
+function updatePoseSkeleton3D(anchor) {
+  const on = !!(state.poseSkeleton3D && anchor && latestCanonical);
+  if (!on) { poseSkeleton3D.visible = false; return; }
+  poseSkeleton3D.position.set(anchor.x, anchor.y + 0.95, anchor.z); // canonical pelvis → hip height
+  poseSkeleton3D.update(latestCanonical, state.poseKptThresh, 1.0);
+}
+
+const _faceDir = new THREE.Vector3();
+function updateFacingArrows(retargeter, anchor) {
+  const on = !!(state.poseFacingDebug && retargeter && anchor);
+  facingArrowBody.visible = on;
+  facingArrowHead.visible = on;
+  if (!on) return;
+  // θ about vertical: 0 = frontal (+z, toward camera). sin/cos → world horizontal dir.
+  _faceDir.set(Math.sin(retargeter.torsoFacing.theta), 0, Math.cos(retargeter.torsoFacing.theta)).normalize();
+  facingArrowBody.position.set(anchor.x, anchor.y + 1.0, anchor.z);
+  facingArrowBody.setDirection(_faceDir);
+  _faceDir.set(Math.sin(retargeter.headFacing.theta), 0, Math.cos(retargeter.headFacing.theta)).normalize();
+  facingArrowHead.position.set(anchor.x, anchor.y + 1.75, anchor.z);
+  facingArrowHead.setDirection(_faceDir);
+}
+
+// Top-down facing compass drawn in the PiP corner. θ=0 → arrow points DOWN (toward the
+// viewer = frontal); it swings as the body/head turn. Sized to the canvas.
+function drawFacingCompass(ctx, w, h, bodyYaw, headYaw) {
+  const R = Math.max(16, Math.min(w, h) * 0.09);
+  const cx = R + 8;
+  const cy = R + 8;
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(2,4,10,0.55)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(120,255,240,0.35)'; ctx.lineWidth = 1; ctx.stroke();
+  const arrow = (ang, color, len) => {
+    const dx = Math.sin(ang); const dy = Math.cos(ang);
+    const ex = cx + dx * len; const ey = cy + dy * len;
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
+    const a = Math.atan2(dy, dx); const hd = R * 0.35;
+    ctx.beginPath(); ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - hd * Math.cos(a - 0.5), ey - hd * Math.sin(a - 0.5));
+    ctx.lineTo(ex - hd * Math.cos(a + 0.5), ey - hd * Math.sin(a + 0.5));
+    ctx.closePath(); ctx.fill();
+  };
+  arrow(bodyYaw, '#00e5ff', R - 3); // body cyan
+  arrow(headYaw, '#ff4fd8', R - R * 0.42); // head magenta (shorter)
+  ctx.restore();
+}
+
 let poseLoopActive = false;
 let poseLoopId = 0; // generation guard — only the latest loop runs (no stacking)
 let latestCanonical = null;
+let lastPoseFrame = null; // most recent raw frame (calibration overlay skeleton)
 let lastGoodPoseAt = 0;
 let lastPoseRetargeter = null; // V19: active pose retargeter, for the clamp dump button
 const poseSmoother = new CanonicalSmoother(NUM_KPTS, {
@@ -1760,7 +1851,8 @@ const poseStats = {
   frames: '—', // sidecar flow counters: sent/recv drop/stale/timeout @ Hz
   overlayMs: 0,
   retargetMs: 0,
-  clamp: '—' // V19: bones the joint-limit clamp throttled this frame (wanted°→cap°)
+  clamp: '—', // V19: bones the joint-limit clamp throttled this frame (wanted°→cap°)
+  facing: '—' // DEBUG: estimator θ (body/head) → yaw actually applied to spine/neck bones
 };
 const ema = (prev, next, a = 0.2) => prev + a * (next - prev);
 
@@ -1968,8 +2060,13 @@ function consumePoseFrame(frame) {
     } else {
       poseOverlayCtx.clearRect(0, 0, poseOverlayEl.width, poseOverlayEl.height);
     }
+    if (state.poseFacingDebug && lastPoseRetargeter) {
+      drawFacingCompass(poseOverlayCtx, poseOverlayEl.width, poseOverlayEl.height,
+        lastPoseRetargeter.torsoFacing.theta, lastPoseRetargeter.headFacing.theta);
+    }
     poseStats.overlayMs = ema(poseStats.overlayMs, performance.now() - ov0);
   }
+  lastPoseFrame = frame; // for the calibration-overlay skeleton view
   updateCanonical(frame);
   window.__poseCanonical = latestCanonical;
 }
@@ -2072,6 +2169,9 @@ function stopPose() {
     poseProvider = null;
   }
   poseVideoEl.srcObject = null;
+  facingArrowBody.visible = false;
+  facingArrowHead.visible = false;
+  poseSkeleton3D.visible = false;
   if (poseOverlayCtx) poseOverlayCtx.clearRect(0, 0, poseOverlayEl.width, poseOverlayEl.height);
   posePipEl.hidden = true;
   posePipLabel.textContent = 'pose: off';
@@ -2161,12 +2261,25 @@ function setCalibText(line, big, figure = false) {
 function updateCalibration() {
   if (calibPhase === 'idle') { calibOverlay.hidden = true; return; }
   calibOverlay.hidden = false;
+  // Live detected skeleton so you SEE the tracking while calibrating (not just a guide).
+  if (lastPoseFrame && poseProvider) {
+    const vw = poseProvider.video?.videoWidth || 320;
+    const vh = poseProvider.video?.videoHeight || 427;
+    if (calibSkeletonEl.width !== vw) { calibSkeletonEl.width = vw; calibSkeletonEl.height = vh; }
+    drawOverlay(calibSkeletonCtx, lastPoseFrame, vw, vh, { kptThresh: state.poseKptThresh, mirror: true, bg: poseProvider.preview ?? null });
+    calibSkeletonEl.hidden = false;
+  } else {
+    calibSkeletonEl.hidden = true;
+  }
   const t = performance.now() - calibPhaseStart;
 
   if (calibPhase === 'ready') {
     setCalibText('Stand like this — full body in frame', Math.ceil((CALIB_READY_MS - t) / 1000), true);
     if (t >= CALIB_READY_MS) {
       for (const [k] of CALIB_BONES) calibSamples[k] = [];
+      // Reset the facing frontal reference: the "stand like this" pose IS frontal, so the
+      // running-max relearns THIS person/distance's frontal width during the hold.
+      for (const b of crowdBatches) b.retargeter?.recalibrateFacing();
       calibPhase = 'capturing';
       calibPhaseStart = performance.now();
     }

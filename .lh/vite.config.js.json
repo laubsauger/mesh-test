@@ -1,0 +1,18 @@
+{
+    "sourceFile": "vite.config.js",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1782913797687,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1782913797687,
+            "name": "Commit-0",
+            "content": "import { createRequire } from 'node:module';\nimport { readFileSync, readdirSync } from 'node:fs';\nimport { dirname, join, basename } from 'node:path';\nimport { defineConfig } from 'vite';\n\n// `base` is the path the site is served from. GitHub Pages project sites live at\n// https://<user>.github.io/<repo>/, so CI passes VITE_BASE=/<repo>/. Locally it\n// defaults to '/'. import.meta.env.BASE_URL in the app resolves asset URLs.\n\n// Cross-origin isolation (COOP + COEP) enables SharedArrayBuffer → onnxruntime-web\n// wasm multi-threading (and a pose worker later). Requires same-origin wasm,\n// which the serve-ort plugin provides.\nconst setIsolationHeaders = (res) => {\n  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');\n  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');\n};\n\nconst crossOriginIsolation = {\n  name: 'cross-origin-isolation',\n  configureServer(server) {\n    server.middlewares.use((_req, res, next) => { setIsolationHeaders(res); next(); });\n  },\n  configurePreviewServer(server) {\n    server.middlewares.use((_req, res, next) => { setIsolationHeaders(res); next(); });\n  }\n};\n\n// Serve onnxruntime-web's wasm + jsep .mjs glue from /ort/ — same-origin so COEP\n// allows it. node_modules can't go through ?url (ort's exports field blocks deep\n// imports) nor /public (Vite forbids importing .mjs from /public). So: serve\n// straight from node_modules in dev (before Vite's transform), emit to dist/ort\n// on build. ort.env.wasm.wasmPaths points here.\nconst require = createRequire(import.meta.url);\n// resolve the package main (exported), then its dist dir holds the wasm/mjs.\nconst ortDistDir = dirname(require.resolve('onnxruntime-web'));\nconst ortFiles = () => readdirSync(ortDistDir).filter((f) => /^ort-wasm-simd-threaded.*\\.(wasm|mjs)$/.test(f));\nconst ortMime = (f) => (f.endsWith('.wasm') ? 'application/wasm' : 'text/javascript');\n\nconst serveOrt = {\n  name: 'serve-ort-wasm',\n  configureServer(server) {\n    // Direct use() in configureServer runs BEFORE Vite's internal middlewares,\n    // so /ort/*.mjs is served static instead of treated as a source module.\n    server.middlewares.use((req, res, next) => {\n      const path = req.url?.split('?')[0];\n      if (!path || !path.includes('/ort/')) return next();\n      const name = basename(path);\n      if (!/^ort-wasm-simd-threaded.*\\.(wasm|mjs)$/.test(name)) return next();\n      try {\n        const body = readFileSync(join(ortDistDir, name));\n        res.setHeader('Content-Type', ortMime(name));\n        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');\n        res.end(body);\n      } catch {\n        next();\n      }\n    });\n  },\n  generateBundle() {\n    for (const f of ortFiles()) {\n      this.emitFile({ type: 'asset', fileName: `ort/${f}`, source: readFileSync(join(ortDistDir, f)) });\n    }\n  }\n};\n\nexport default defineConfig({\n  base: process.env.VITE_BASE ?? '/',\n  plugins: [crossOriginIsolation, serveOrt]\n});\n"
+        }
+    ]
+}
