@@ -29,6 +29,7 @@ Extension (face): drive facial deform (jaw/chin, eyes, mouth) of face-less Meshy
 - `I.inspector` — Inspector adds: choreography selector + delay, pose performer count, pose drive mode, constraint preset, EP selector (`poseEP` wasm|webgpu), debug overlays.
 - `I.recording` — `RecordedPoseSession` (`docs/pose-driver.md` §46), replayable ∀ mode (objective compare).
 - `I.faceExpr` — `FaceExpression {jawOpen, smile, pucker, blinkL, blinkR, browL, browR}` = 0..1 scalars, per pose-performer (`boneSource=pose`, V20/I.boneSource — face rides the SAME performer slot as body pose, ⊥ separate concept). Derived deterministic from landmarks 23-90 (2D x/y ratios: MAR=jawOpen, corner-width=smile, EAR=blink, brow-eye gap=brow), neutral-calibrated, OneEuro-smoothed. ⊥ model inference (code answers). z ignored (monocular garbage).
+- `I.editorUI` — React+Tailwind editor mode (T30), DOM overlay in the VJ app (§C exception: custom DOM allowed for the editor ONLY; the runtime VJ layer stays canvas+status). Glue = framework-agnostic `editor-store` (state + pub/sub + action registry); main.js owns three & registers actions, React renders panels + drives them. Deps: react, react-dom, @vitejs/plugin-react, tailwindcss v4 (@tailwindcss/vite).
 - `I.faceMask` — per-model region-weight sidecar `public/models/<id>.face-mask.bin`. Header `{vertexCount, regions[], hinge/anchor params}` + per-vertex uint8 weight × region. Regions: `jaw, lowerLip, mouthCorner, upperLidL, upperLidR, browL, browR`. Committed artifact (sibling to GLB, like the manifest). Auto-gen once/model from mesh geometry; optional hand-paint fixup.
 
 ## §V INVARIANTS
@@ -100,6 +101,7 @@ T26|x|**face phase 1 — extract**: `FaceExpression` from landmarks 23-90 → 7 
 T27|x|**face phase 2 — mask**: auto-gen region weights from mesh geometry (Y-bands + symmetry + anchors, ⊥ landmarks); write `public/models/<id>.face-mask.bin` (header + per-vtx uint8/region); loader w/ vertexCount THROW guard; vertex-color debug overlay|V27,V28,I.faceMask
 T28|x|**face phase 3 — deform**: `positionNode` reads mask + per-instance expr instanced attr; hinge-rotate jaw + translate lowerLip/mouthCorner/eyelid/brow. Scope jaw+mouth FIRST, eyes after. Normals skipped (note; fix if lighting reads wrong). ✅ hero performer opens mouth/blinks in webcam sync|V29,I.faceMask,I.faceExpr
 T29|x|**face phase 4 (gated on T28 quality)**: in-app mask painter — raycast brush per region, edit hinge/anchor params, save `.bin`. Skip if auto-gen good enough|I.faceMask,I.inspector
+T30|~|**face phase 5 — proper editor UI**: React+Tailwind in-app editor mode (DOM overlay, NOT the three Inspector — §C exception, editor-only). Panels: tools/brush (region+mode+radius+strength+erase+symmetric), region/bone list w/ color chips + visibility, view/overlay toggles (crowd mesh, edit-head, wireframe, mask overlay, camera presets), expression TEST-DRIVE sliders (7 scalars → live deform). Glue via framework-agnostic editor store (pub/sub); main.js owns three + registers actions, React reads/writes store. Reuses T29 edit-head/paint/mask/deform|I.editorUI,I.faceMask,I.faceExpr
 
 ## §B BUGS
 id|date|cause|fix

@@ -1,0 +1,3 @@
+/* Tailwind v4 entry for the editor overlay (T30). Scoped to the editor root so its
+   utilities/preflight don't restyle the VJ app's canvas/status DOM. */
+@import "tailwindcss";

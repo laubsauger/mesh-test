@@ -47,6 +47,8 @@ import { Retargeter } from './pose/retargeter.js';
 import { FaceExpressionExtractor } from './pose/face-expression.js';
 import { generateFaceMask, decodeFaceMask, encodeFaceMask, assertMaskFits, FACE_REGIONS } from './pose/face-mask.js';
 import { MESHY_BONES } from './pose/rig-map.js';
+import { registerActions, setEditorState, editorState, actions as editorActions } from './editor/editor-store.js';
+import { mountEditor } from './editor/mount.jsx';
 import { KPT, NUM_KPTS, RTMW_VARIANTS, YOLO_RES_OPTIONS } from './pose/rtmw-constants.js';
 import { CanonicalSmoother } from './pose/one-euro.js';
 import { PoseRecorder, PosePlayer } from './pose/recorder.js';
@@ -398,7 +400,8 @@ const state = {
   poseFacingBodyGain: 1.0, // body (torso) yaw strength — the shoulder read is ~half the head; raise to make the torso follow the arrow
   poseHeadPitchGain: 2.0, // head forward/back nod strength (nose-Y). 0 = off; negate if it nods the wrong way
   poseClavicle: false, // shoulder shrug/protraction — unproven, opt-in
-  poseFollow: 0.5, // higher = snappier (less laggy/jello)
+  poseFollow: 0.5, // legacy per-frame blend (used only when Rig Smoothing = 0)
+  poseSmoothTime: 35, // ms half-life for the frame-rate-INDEPENDENT rig blend. Lower = snappier/less lag, higher = smoother. 0 = off (use poseFollow)
   poseSwingTwist: true,
   poseWristTwist: true,
   poseTwistSmooth: 0.12,
@@ -553,6 +556,8 @@ async function init() {
   if (!manifest.meshes?.length) throw new Error('Biped manifest is empty.');
 
   buildInspectorControls();
+  registerEditorActions(); // T30: wire the React editor's actions
+  mountEditor();           // mount the React editor overlay (hidden until opened)
 
   // Stream download progress for the first build into the preloader bar.
   setPreloader(0.15, 'Downloading characters…');
@@ -762,7 +767,8 @@ function buildInspectorControls() {
   poseGroup.add(state, 'poseSmoothBeta', 0, 0.2, 0.001).name('Smooth Beta');
   poseGroup.add(state, 'poseJointLimit', 30, 180, 1).name('Joint Limit °');
   poseGroup.add(state, 'poseArmLimit', 30, 180, 1).name('Arm Limit °');
-  poseGroup.add(state, 'poseFollow', 0.05, 1, 0.01).name('Pose Follow (smooth)');
+  poseGroup.add(state, 'poseSmoothTime', 0, 150, 1).name('Rig Smoothing (ms)');
+  poseGroup.add(state, 'poseFollow', 0.05, 1, 0.01).name('Pose Follow (legacy)');
   poseGroup.add(state, 'poseBodyYaw').name('Body Yaw (2D turn)').listen();
   poseGroup.add(state, 'poseFacingDeadzone', 0, 0.6, 0.01).name('Yaw Deadzone');
   poseGroup.add(state, 'poseFacingSmooth', 0.02, 0.5, 0.01).name('Yaw Smooth');
@@ -855,18 +861,8 @@ function buildInspectorControls() {
   faceGroup.add(state, 'faceMaskDebug').name('Mask Debug (verts)').onChange(refreshFaceMaskOverlays);
   faceGroup.add(state, 'faceMaskRegion', FACE_REGIONS).name('Mask Region').onChange(refreshFaceMaskOverlays);
   faceGroup.add({ download: downloadFaceMasks }, 'download').name('Download Face Masks (.bin)');
-  // T29: mask editor — paint region weights on a dedicated edit-head, fix auto-gen.
-  faceGroup.add(faceEditor, 'active').name('Edit Mode').listen().onChange(setFaceEditMode);
-  faceGroup.add(faceEditor, 'batchIndex', 0, 6, 1).name('Edit Model #').onChange(() => { if (faceEditor.active) setFaceEditMode(true); });
-  faceGroup.add(faceEditor, 'region', FACE_REGIONS).name('Paint Region').onChange(recolorEditHead);
-  faceGroup.add(faceEditor, 'radius', 0.005, 0.3, 0.005).name('Brush Radius');
-  faceGroup.add(faceEditor, 'strength', 0.05, 1, 0.05).name('Brush Strength');
-  faceGroup.add(faceEditor, 'erase').name('Erase (or right-drag)');
-  faceGroup.add(faceEditor, 'symmetric').name('Symmetric Paint');
-  faceGroup.add(faceEditor, 'hingeMode').name('Set Jaw Hinge (click)');
-  faceGroup.add({ reseed: () => faceEditReseed(false) }, 'reseed').name('Re-seed Auto-gen');
-  faceGroup.add({ flip: () => faceEditReseed(true) }, 'flip').name('Flip Forward Axis');
-  faceGroup.add({ clear: faceEditClearRegion }, 'clear').name('Clear Region');
+  // T30: the full mask editor is the React overlay — this just opens it.
+  faceGroup.add({ open: () => editorActions.setOpen && editorActions.setOpen(true) }, 'open').name('Open Face Editor ▸');
 
   const statsGroup = renderer.inspector.createParameters('VJ Layer / Render Stats');
   statsGroup.add(statsState, 'fps').name('FPS').listen();
@@ -1557,7 +1553,9 @@ function setFaceEditMode(on) {
 function buildEditHead(batch) {
   const src = batch.faceMask.geom;
   const g = new THREE.BufferGeometry();
-  g.setAttribute('position', src.getAttribute('position').clone());
+  const posAttr = src.getAttribute('position').clone();
+  g.setAttribute('position', posAttr);
+  faceEditor.bindPositions = Float32Array.from(posAttr.array); // bind copy for CPU preview deform
   if (src.index) g.setIndex(src.index.clone());
   g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(batch.faceMask.vertexCount * 3), 3));
   g.computeBoundingBox();
@@ -1708,6 +1706,110 @@ function onFaceEditMove(e) {
 
 function onFaceEditUp() {
   if (faceEditor.painting || !controls.enabled) { faceEditor.painting = false; controls.enabled = true; }
+}
+
+// CPU preview deform for the edit-head (T30 test-drive): apply the SAME jaw-hinge +
+// translates as the GPU path (faceDeformNode) to the static edit-head so the sliders
+// show the effect WYSIWYG while painting. Cheap (one mesh, recompute on change).
+const ZERO_EXPR = { jawOpen: 0, smile: 0, pucker: 0, blinkL: 0, blinkR: 0, browL: 0, browR: 0 };
+const _defAxis = new THREE.Vector3();
+function deformEditHead() {
+  const mesh = faceEditor.editHead; const batch = faceEditor.batch;
+  if (!mesh || !faceEditor.bindPositions || !batch) return;
+  const fm = batch.faceMask; const N = fm.vertexCount; const D = fm.mask.data;
+  const e = debugFaceOverride || ZERO_EXPR;
+  const bind = faceEditor.bindPositions;
+  const pos = mesh.geometry.getAttribute('position');
+  const h = fm.mask.hinge; const hh = fm.mask.headHeight || 1;
+  const ox = h.origin[0]; const oy = h.origin[1]; const oz = h.origin[2];
+  _defAxis.set(h.axis[0], h.axis[1], h.axis[2]);
+  if (_defAxis.lengthSq() < 1e-8) _defAxis.set(1, 0, 0); else _defAxis.normalize();
+  const kx = _defAxis.x; const ky = _defAxis.y; const kz = _defAxis.z;
+  const jawA = state.faceJawAngle; const lip = state.faceLipDrop * hh; const corner = state.faceCornerMove * hh;
+  const lid = state.faceLidDrop * hh; const brow = state.faceBrowRaise * hh;
+  for (let i = 0; i < N; i += 1) {
+    let x = bind[i * 3]; let y = bind[i * 3 + 1]; let z = bind[i * 3 + 2];
+    const theta = jawA * e.jawOpen * (D[i] / 255);
+    if (theta > 1e-5) { // Rodrigues rotate about the hinge axis through the origin
+      const vx = x - ox; const vy = y - oy; const vz = z - oz;
+      const c = Math.cos(theta); const sN = Math.sin(theta); const oneC = 1 - c;
+      const dot = kx * vx + ky * vy + kz * vz;
+      const crx = ky * vz - kz * vy; const cry = kz * vx - kx * vz; const crz = kx * vy - ky * vx;
+      x = ox + vx * c + crx * sN + kx * dot * oneC;
+      y = oy + vy * c + cry * sN + ky * dot * oneC;
+      z = oz + vz * c + crz * sN + kz * dot * oneC;
+    }
+    y -= lip * e.jawOpen * (D[N + i] / 255);
+    x += Math.sign(bind[i * 3] - ox) * corner * (e.smile - e.pucker) * (D[2 * N + i] / 255);
+    y -= lid * (e.blinkL * (D[3 * N + i] / 255) + e.blinkR * (D[4 * N + i] / 255));
+    y += brow * (e.browL * (D[5 * N + i] / 255) + e.browR * (D[6 * N + i] / 255));
+    pos.setXYZ(i, x, y, z);
+  }
+  pos.needsUpdate = true;
+}
+
+// Push the current model list + per-region painted-weight sums to the store (badges).
+function syncEditorStore() {
+  const models = crowdBatches.filter((b) => b.faceMask).map((b, i) => ({ index: i, name: b.mesh.name }));
+  setEditorState({ models, modelIndex: faceEditor.batchIndex });
+}
+
+// Editor camera presets around the edit head.
+function faceEditFrameView(preset) {
+  const mesh = faceEditor.editHead; if (!mesh) return;
+  const box = new THREE.Box3().setFromObject(mesh);
+  const c = new THREE.Vector3(); box.getCenter(c);
+  const sz = new THREE.Vector3(); box.getSize(sz);
+  const r = Math.max(sz.x, sz.y, sz.z) || 1;
+  const d = r * 2.4;
+  const off = { front: [0, 0, d], left: [-d, 0, 0.01], right: [d, 0, 0.01], '3q': [d * 0.6, r * 0.2, d * 0.7] }[preset] || [0, 0, d];
+  controls.target.copy(c);
+  camera.position.set(c.x + off[0], c.y + off[1], c.z + off[2]);
+  controls.update();
+}
+
+// Load a .bin override in the editor (decode → guard → upload → recolor + preview).
+function faceEditLoadMask(arrayBuffer) {
+  const batch = faceEditor.batch; if (!batch) return;
+  try {
+    const mask = assertMaskFits(decodeFaceMask(arrayBuffer), batch.faceMask.vertexCount);
+    batch.faceMask.mask = mask;
+    uploadMaskBuffer(mask, batch.faceMask.maskAttr);
+    applyHingeUniforms(batch);
+    recolorEditHead();
+    deformEditHead();
+    setEditorState({ status: 'Loaded .bin' });
+  } catch (err) {
+    setEditorState({ status: `Load failed: ${err.message}` });
+  }
+}
+
+// Register the editor actions the React UI calls (I.editorUI). main.js owns three;
+// React only reads the store + invokes these.
+function registerEditorActions() {
+  registerActions({
+    setOpen(v) { faceEditor.active = v; setFaceEditMode(v); if (v) syncEditorStore(); setEditorState({ open: v }); },
+    setModel(i) { faceEditor.batchIndex = i; setFaceEditMode(true); deformEditHead(); setEditorState({ modelIndex: i }); },
+    setRegion(r) { faceEditor.region = r; recolorEditHead(); setEditorState({ region: r }); },
+    setMode(m) { faceEditor.erase = m === 'erase'; faceEditor.hingeMode = m === 'hinge'; setEditorState({ mode: m }); },
+    setRadius(v) { faceEditor.radius = v; setEditorState({ radius: v }); },
+    setStrength(v) { faceEditor.strength = v; setEditorState({ strength: v }); },
+    setSymmetric(v) { faceEditor.symmetric = v; setEditorState({ symmetric: v }); },
+    reseed(flip) { faceEditReseed(flip); recolorEditHead(); deformEditHead(); },
+    clearRegion() { faceEditClearRegion(); deformEditHead(); },
+    save() { downloadFaceMasks(); },
+    loadMask(buf) { faceEditLoadMask(buf); },
+    setExpr(expr) { debugFaceOverride = expr; deformEditHead(); setEditorState({ expr }); },
+    resetExpr() { debugFaceOverride = null; deformEditHead(); setEditorState({ expr: { ...ZERO_EXPR } }); },
+    frameView(v) { faceEditFrameView(v); },
+    setOverlay(k, v) {
+      const o = { ...editorState.overlays, [k]: v };
+      if (k === 'wireframe' && faceEditor.editHead) faceEditor.editHead.material.wireframe = v;
+      if (k === 'maskCloud') { state.faceMaskDebug = v; refreshFaceMaskOverlays(); }
+      if (k === 'crowd') for (const b of crowdBatches) b.source.traverse((c) => { if (c.name?.endsWith('-gpu-instances')) c.visible = v; });
+      setEditorState({ overlays: o });
+    }
+  });
 }
 
 function createPerformerLightRig(index) {
@@ -2103,6 +2205,8 @@ function computePoseMatrices(batch) {
         jointLimitDeg: state.poseJointLimit,
         armLimit: state.poseArmLimit,
         follow: state.poseFollow,
+        dt: poseRenderDt,
+        smoothMs: state.poseSmoothTime,
         swingTwist: state.poseSwingTwist,
         headGain: state.poseHeadGain,
         planeFollow: state.poseTwistSmooth,
@@ -2329,6 +2433,7 @@ function drawFacingCompass(ctx, w, h, bodyYaw, headYaw) {
 let poseLoopActive = false;
 let poseLoopId = 0; // generation guard — only the latest loop runs (no stacking)
 let poseGen = 0; // start/stop generation — an in-flight startPose superseded by a stop/switch tears down its own provider (no leaked worker/WS)
+let poseRenderDt = 1 / 60; // last render-frame delta (s) → retarget's frame-rate-independent rig blend
 let latestCanonical = null;
 let lastPoseFrame = null; // most recent raw frame (calibration overlay skeleton)
 let lastGoodPoseAt = 0;
@@ -2872,6 +2977,7 @@ function render(timestamp) {
   timer.update(timestamp);
   const delta = Math.min(timer.getDelta(), 0.05);
   const elapsed = timer.getElapsed();
+  poseRenderDt = delta; // render frame time → the retarget's frame-rate-independent blend
 
   for (const walker of walkers) {
     updateCrowdMotion(walker, elapsed);
@@ -2960,6 +3066,8 @@ if (import.meta.env.DEV) {
     faceEditReseed,
     faceEditPaint,
     faceEditClearRegion,
+    editorActions,
+    editorState,
     THREE
   };
 }

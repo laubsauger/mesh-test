@@ -2,6 +2,8 @@ import { createRequire } from 'node:module';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, basename } from 'node:path';
 import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 // `base` is the path the site is served from. GitHub Pages project sites live at
 // https://<user>.github.io/<repo>/, so CI passes VITE_BASE=/<repo>/. Locally it
@@ -65,5 +67,5 @@ const serveOrt = {
 
 export default defineConfig({
   base: process.env.VITE_BASE ?? '/',
-  plugins: [crossOriginIsolation, serveOrt]
+  plugins: [crossOriginIsolation, serveOrt, react(), tailwindcss()]
 });
