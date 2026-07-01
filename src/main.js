@@ -1682,7 +1682,6 @@ function faceEditPaint(worldPoint, erase) {
 // Re-run auto-gen (optionally flipping the assumed +z forward), re-upload, recolor.
 function faceEditReseed(flipForward) {
   const batch = faceEditor.batch || editBatch(); if (!batch) return;
-  faceEditSnapshot('reseed');
   const fm = batch.faceMask;
   if (flipForward) fm.forwardSign = -(fm.forwardSign || 1);
   const geom = fm.geom;
@@ -1698,17 +1697,18 @@ function faceEditReseed(flipForward) {
   deformEditHead();
   pushRegionConfigToStore();
   if (batch.faceMaskOverlay) recolorFaceMaskOverlay(batch.faceMaskOverlay);
+  faceEditCommit('reseed');
   statusEl.textContent = `Re-seeded ${batch.mesh.name} (forward ${fm.forwardSign > 0 ? '+z' : '-z'}).`;
 }
 
 function faceEditClearRegion() {
   const batch = faceEditor.batch; if (!batch) return;
-  faceEditSnapshot('clear');
   const region = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
   const N = batch.faceMask.vertexCount;
   for (let i = 0; i < N; i += 1) setMaskWeight(batch, region, i, 0);
   batch.faceMask.maskAttr.needsUpdate = true;
   recolorEditHead();
+  faceEditCommit('clear');
 }
 
 function faceEditRaycast(e) {
@@ -1724,8 +1724,7 @@ function onFaceEditDown(e) {
   const hit = faceEditRaycast(e);
   if (!hit) return; // missed head → let OrbitControls handle it (orbit empty space)
   controls.enabled = false; // paint, don't orbit
-  if (faceEditor.hingeMode) { faceEditSnapshot('hinge'); faceEditSetHinge(hit.point); return; }
-  faceEditSnapshot('paint'); // one undo step per stroke
+  if (faceEditor.hingeMode) { faceEditSetHinge(hit.point); return; }
   faceEditor.painting = true;
   faceEditPaint(hit.point, e.button === 2 || faceEditor.erase);
 }
@@ -1737,7 +1736,8 @@ function onFaceEditMove(e) {
 }
 
 function onFaceEditUp() {
-  if (faceEditor.painting || !controls.enabled) { faceEditor.painting = false; controls.enabled = true; }
+  if (faceEditor.painting) { faceEditor.painting = false; controls.enabled = true; faceEditCommit('paint'); } // one undo/stroke
+  else if (!controls.enabled) { controls.enabled = true; }
 }
 
 // Two-click hinge editing (T30): 1st click sets the current region's hinge ORIGIN (and
@@ -1761,6 +1761,7 @@ function faceEditSetHinge(worldPoint) {
     statusEl.textContent = `${faceEditor.region}: hinge axis set.`;
   }
   syncConfigUniforms(batch); deformEditHead(); updateHingeGizmo(); pushRegionConfigToStore();
+  faceEditCommit('hinge');
 }
 
 // Cyan line showing the current region's hinge (origin ± axis). Visible when the region
@@ -1831,7 +1832,7 @@ function faceEditRedo() { if (faceEditor.histIndex < faceEditor.history.length -
 function updateUndoState() {
   setEditorState({ canUndo: faceEditor.histIndex > 0, canRedo: faceEditor.histIndex < faceEditor.history.length - 1 });
 }
-function faceEditResetHistory() { faceEditor.history = []; faceEditor.histIndex = -1; faceEditor.lastSnapTag = ''; faceEditSnapshot('init'); }
+function faceEditResetHistory() { faceEditor.history = []; faceEditor.histIndex = -1; faceEditor.lastSnapTag = ''; faceEditCommit('init'); }
 
 // CPU preview deform for the edit-head (T30 test-drive): the SAME config-driven form as
 // the GPU faceDeformNode, on the static edit-head so sliders show the effect WYSIWYG.
@@ -1900,7 +1901,6 @@ function faceEditFrameView(preset) {
 function faceEditLoadMask(arrayBuffer) {
   const batch = faceEditor.batch; if (!batch) return;
   try {
-    faceEditSnapshot('load');
     const mask = assertMaskFits(decodeFaceMask(arrayBuffer), batch.faceMask.vertexCount);
     batch.faceMask.mask = mask;
     uploadMaskBuffer(mask, batch.faceMask.maskAttr);
@@ -1909,6 +1909,7 @@ function faceEditLoadMask(arrayBuffer) {
     deformEditHead();
     updateHingeGizmo();
     pushRegionConfigToStore();
+    faceEditCommit('load');
     setEditorState({ status: 'Loaded .bin' });
   } catch (err) {
     setEditorState({ status: `Load failed: ${err.message}` });
@@ -1929,10 +1930,10 @@ function registerEditorActions() {
     // Patch the CURRENT region's deform config (driver/type/amount/dir/mirrorX) live.
     setRegionConfig(patch) {
       const batch = faceEditor.batch; if (!batch) return;
-      faceEditSnapshot('config');
       const r = Math.max(0, FACE_REGIONS.indexOf(faceEditor.region));
       Object.assign(batch.faceMask.mask.config[r], patch);
       syncConfigUniforms(batch); deformEditHead(); updateHingeGizmo(); pushRegionConfigToStore();
+      faceEditCommit('config');
     },
     reseed(flip) { faceEditReseed(flip); },
     clearRegion() { faceEditClearRegion(); deformEditHead(); },
