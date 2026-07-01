@@ -113,7 +113,7 @@ T30|x|**face phase 5 — proper editor UI**: React+Tailwind in-app editor mode (
 T31|x|**refactor 1 — extract face from main.js**: move to `src/face/deform.js` (`faceDeformNode`, config uniforms, `deformEditHead`, `syncConfigUniforms`, `writeFaceExpr`, `updateFaceUniforms`, expr/mask buffers) + `src/face/editor.js` (all `faceEditor.*` — paint/brush/tool/hinge/undo, edit-head build, `registerEditorActions`, pointer/key handlers). main.js imports + wires via explicit exports. Behaviour-preserving|V31,V34,I.faceModules
 T32|x|**refactor 2 — componentize editor UI**: split `EditorUI.jsx` → `src/editor/components/{Header,ToolPanel,RegionList,MarkerPanel,BrushPanel,ViewPanel,TestDrivePanel}` + `primitives.jsx` (Slider,MiniSlider,Btn,Section). `editor-store.js` stays sole glue; React ⊥ three|V32,V34,I.editorUI
 T33|x|**refactor 3 — TS prep (⊥ convert)**: JSDoc `@typedef` for `FaceMask`/`RegionConfig`/`FaceExpression`/`EditorState`/`EditorActions`; `jsconfig.json` `checkJs`; tighten exports; document `.js→.ts` order (data typedefs → face-mask/expression → deform → editor → UI). Dev bridge stays DEV-only|V33,V35
-T34|.|**refactor verify**: 65 vitest + build green; CDP smoke (open editor, paint stroke, undo/redo, config edit, texture, Move/Brush switch, brush ring) unchanged post-refactor|V34
+T34|x|**refactor verify**: 65 vitest + build green; CDP smoke (open editor, paint stroke, undo/redo, config edit, texture, Move/Brush switch, brush ring) unchanged post-refactor|V34
 
 ## §B BUGS
 id|date|cause|fix
