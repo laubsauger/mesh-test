@@ -42,13 +42,29 @@ export function drawOverlay(ctx, frame, vidW, vidH, { kptThresh = 0.3, mirror = 
     }
   }
 
-  // Dense face mesh (MediaPipe 478) — a separate dot cloud, not COCO-indexed. px coords.
+  // Dense face mesh (MediaPipe 478). Draw the TESSELLATION (edges) when available —
+  // the proper face-mesh look — else fall back to a dot cloud. px coords, mirrored.
   if (frame.faceLandmarks2D) {
-    ctx.fillStyle = '#ff5cf0';
-    for (const p of frame.faceLandmarks2D) {
+    const fl = frame.faceLandmarks2D;
+    if (frame.faceEdges) {
+      ctx.strokeStyle = 'rgba(0,229,255,0.45)';
+      ctx.lineWidth = 0.6;
       ctx.beginPath();
-      ctx.arc(X(p.x), p.y, 1, 0, Math.PI * 2);
-      ctx.fill();
+      for (const e of frame.faceEdges) {
+        const a = fl[e.start];
+        const b = fl[e.end];
+        if (!a || !b) continue;
+        ctx.moveTo(X(a.x), a.y);
+        ctx.lineTo(X(b.x), b.y);
+      }
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = '#ff5cf0';
+      for (const p of fl) {
+        ctx.beginPath();
+        ctx.arc(X(p.x), p.y, 1, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
   }
 }

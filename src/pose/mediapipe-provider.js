@@ -54,6 +54,9 @@ export class MediaPipeProvider {
         baseOptions: { modelAssetPath: MODELS.face, delegate: this.delegate },
         runningMode: 'VIDEO', numFaces: 1, outputFaceBlendshapes: true
       });
+      // Static tessellation connectivity (~2600 edges) for the face-mesh overlay — the
+      // proper mesh look (three-mediapipe-rig / DrawingUtils), not just dots.
+      this._faceEdges = FaceLandmarker.FACE_LANDMARKS_TESSELATION;
     }
     if (this.wantHands) {
       this._hand = await HandLandmarker.createFromOptions(vision, {
@@ -97,17 +100,28 @@ export class MediaPipeProvider {
         frame.faceBlendshapes = bs;
       }
       const fl = fr.faceLandmarks?.[0];
-      if (fl) frame.faceLandmarks2D = fl.map((p) => ({ x: p.x * w, y: p.y * h }));
+      if (fl) { frame.faceLandmarks2D = fl.map((p) => ({ x: p.x * w, y: p.y * h })); frame.faceEdges = this._faceEdges; }
     }
+    let handCount = 0;
     if (this._hand) {
       const hr = this._hand.detectForVideo(this.video, t);
-      // handedness[i] = 'Left'|'Right' (IMAGE space; selfie may swap vs anatomical — the
-      // downstream mirror handles it). worldLandmarks → 3D re-root; landmarks → 2D overlay.
-      (hr.handedness || []).forEach((hand, i) => {
-        const side = hand?.[0]?.categoryName;
-        if (side === 'Left') { frame.leftHand = hr.worldLandmarks?.[i]; fillHands2D(k2d, hr.landmarks?.[i], 91, w, h); }
-        else if (side === 'Right') { frame.rightHand = hr.worldLandmarks?.[i]; fillHands2D(k2d, hr.landmarks?.[i], 112, w, h); }
-      });
+      const lm = hr.landmarks || [];
+      const wl = hr.worldLandmarks || [];
+      const hd = hr.handedness || [];
+      handCount = lm.length;
+      // Assign by handedness NAME (image-space; selfie may swap — downstream mirror
+      // handles it), falling back to index so a missing/odd label can't drop the hand.
+      for (let i = 0; i < lm.length; i += 1) {
+        const name = (hd[i]?.[0]?.categoryName || '').toLowerCase();
+        const isLeft = name ? name.startsWith('l') : i === 0;
+        if (isLeft) { frame.leftHand = wl[i]; fillHands2D(k2d, lm[i], 91, w, h); }
+        else { frame.rightHand = wl[i]; fillHands2D(k2d, lm[i], 112, w, h); }
+      }
+    }
+
+    this._logN = (this._logN || 0) + 1;
+    if (this._logN % 30 === 0) {
+      console.log(`[mediapipe] pose:${!!world} face-bs:${frame.faceBlendshapes ? Object.keys(frame.faceBlendshapes).length : 0} hands:${handCount} (landmarker:${!!this._hand})`);
     }
 
     this.timings.inference = performance.now() - t;

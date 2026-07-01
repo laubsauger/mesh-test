@@ -2870,13 +2870,16 @@ async function startPose() {
   if (poseProvider) return;
   const myGen = ++poseGen; // claim this start; a later stop/switch bumps poseGen → we bail + tear down
   posePipEl.hidden = false;
-  // Sidecar backends load the model NATIVELY (nothing downloads in the browser); only
-  // the in-browser worker compiles the GLB/onnx here.
+  // Per-backend loading text (sidecar = native over WS; mediapipe = in-browser tasks;
+  // worker/main = onnxruntime-web compiling the rtmw3d model).
+  const mp = state.poseBackend === 'mediapipe';
   const nativeBackend = state.poseBackend.startsWith('sidecar');
-  posePipLabel.textContent = nativeBackend ? 'pose: connecting sidecar…' : 'pose: loading model…';
-  statusEl.textContent = nativeBackend
-    ? 'Connecting to native sidecar (ws://127.0.0.1:8787)…'
-    : 'Loading pose model (rtmw3d-l ~219MB) — first load compiles GPU shaders, may briefly stutter…';
+  posePipLabel.textContent = mp ? 'pose: loading MediaPipe…' : nativeBackend ? 'pose: connecting sidecar…' : 'pose: loading model…';
+  statusEl.textContent = mp
+    ? 'Loading MediaPipe (in-browser BlazePose + Face + Hands) — first load fetches WASM + models…'
+    : nativeBackend
+      ? 'Connecting to native sidecar (ws://127.0.0.1:8787)…'
+      : 'Loading pose model (rtmw3d-l ~219MB) — first load compiles GPU shaders, may briefly stutter…';
   const t0 = performance.now();
   // Build into a LOCAL — only adopt into module `poseProvider` AFTER start() succeeds and
   // only if still current. Otherwise a superseded start would leak its worker/WS/camera.
@@ -2899,7 +2902,11 @@ async function startPose() {
     await provider.start();
     if (myGen !== poseGen) { provider.stop(); return; } // superseded during start → tear down, no leak
     poseProvider = provider;
-    const label = state.poseBackend.startsWith('sidecar') ? `${state.poseBackend}/${poseProvider.ep}` : `${state.poseWorker ? 'worker' : 'main'}/${state.poseEP}`;
+    const label = state.poseBackend === 'mediapipe'
+      ? `mediapipe${state.poseMediaPipeHands ? '+hands' : ''}`
+      : state.poseBackend.startsWith('sidecar')
+        ? `${state.poseBackend}/${poseProvider.ep}`
+        : `${state.poseWorker ? 'worker' : 'main'}/${state.poseEP}`;
     console.info(`[pose] ready in ${((performance.now() - t0) / 1000).toFixed(1)}s (${label})`);
     statusEl.textContent = '';
     // Native mode has no browser camera → no stream to preview; the overlay+mesh are the feedback.
